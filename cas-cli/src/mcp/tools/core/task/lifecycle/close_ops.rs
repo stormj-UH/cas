@@ -194,8 +194,18 @@ impl CasCore {
         if task.task_type != TaskType::Epic && task.assignee.is_some() {
             // Resolve the parent epic's branch via the existing
             // ParentChild dependency. If no parent epic is recorded,
-            // fall back to "main" — the same default the rest of the
-            // close path uses when a target branch can't be derived.
+            // fall back to "main" — the modern default-branch name.
+            // (The epic-close path at line ~162 still defaults to
+            // "master" because that field predates the convention
+            // change. We deliberately do not align them here:
+            // worker tasks created in this codepath are universally
+            // attached to an epic with an explicit `branch` field,
+            // so the fallback is a defense-in-depth string for an
+            // already-pathological case. If that fallback string
+            // does not resolve locally, `git merge-base` fails and
+            // count_unmerged_factory_commits returns 0 — i.e., the
+            // gate degrades to Proceed, never to a false Reject.
+            // See cas-95ce notes for the rationale.)
             let parent_branch = task_store
                 .get_parent_epic(&req.id)
                 .ok()
@@ -1518,10 +1528,11 @@ pub(crate) fn run_factory_branch_merge_gate(
          Push the branch and merge a PR before closing. This guard cannot be \
          bypassed (use of bypass_code_review=true does not skip merge-state \
          checks — it is a data-state guard, not a review gate).\n\n\
-         Remediation:\n  \
-         1. Push {factory_branch} to its remote\n  \
-         2. Open a PR targeting {parent_branch}\n  \
-         3. Merge the PR\n  \
+         Remediation:\n\
+         1. Push {factory_branch} to its remote\n\
+         2. Open a PR targeting {parent_branch}\n\
+         3. Merge the PR (or `git fetch --prune` if it was already merged \
+         and your local ref is stale)\n\
          4. Retry mcp__cas__task action=close",
     ))
 }
@@ -1574,7 +1585,11 @@ pub(crate) fn count_unmerged_factory_commits(
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .trim()
             .parse::<u32>()
-            .unwrap_or(0),
+            // Saturate on overflow so an implausibly large count
+            // still maps to "stranded" (Reject), not 0 (Proceed).
+            // Unreachable in practice but the semantically correct
+            // direction for an unparseable count.
+            .unwrap_or(u32::MAX),
         _ => 0,
     }
 }
@@ -2765,8 +2780,9 @@ mod merge_state_gate_tests {
     //!   block, mirroring the cas-code-review gate at line ~815).
     //! - Bypass-immunity is enforced **structurally**: the gate
     //!   function does not consume the bypass flag, and it runs at
-    //!   line 183 — strictly upstream of the `bypass_code_review`
-    //!   evaluation at line ~1549. The test sets
+    //!   the merge-state insertion (currently `cas_task_close`
+    //!   ~line 184) — strictly upstream of the `bypass_code_review`
+    //!   evaluation inside `run_code_review_gate`. The test sets
     //!   `req.bypass_code_review = Some(true)` and confirms the gate
     //!   still rejects, demonstrating bypass cannot reach this layer.
     //!
@@ -2861,8 +2877,9 @@ mod merge_state_gate_tests {
                 );
                 assert!(msg.contains("main"), "missing parent branch name: {msg}");
                 assert!(
-                    msg.contains("2"),
-                    "expected stranded count of 2 in message: {msg}"
+                    msg.contains("2 commit"),
+                    "expected stranded count of 2 in message (anchored to 'commit' \
+                     to avoid weak digit-anywhere match): {msg}"
                 );
                 assert!(
                     msg.contains("bypass_code_review=true"),
