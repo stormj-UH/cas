@@ -1,6 +1,6 @@
 ---
 name: cas-code-review
-description: Multi-persona code review orchestrator. Runs as the pre-close quality gate for CAS factory workers and also on manual invocation. Dispatches 4 always-on reviewer personas (correctness, testing, maintainability, project-standards) plus any activated conditional personas (security, performance, adversarial) in parallel against the current diff, merges their structured findings through a deterministic pipeline, and routes results according to the invocation mode. Trigger automatically at `task.close` in `autofix` mode (the primary path), or manually for interactive review, report-only scans, or headless skill-to-skill calls.
+description: Multi-persona code review orchestrator. Runs as the pre-close quality gate for CAS factory workers and also on manual invocation. Dispatches 5 always-on reviewer personas (correctness, testing, maintainability, project-standards, fallow) plus any activated conditional personas (security, performance, adversarial) in parallel against the current diff, merges their structured findings through a deterministic pipeline, and routes results according to the invocation mode. Trigger automatically at `task.close` in `autofix` mode (the primary path), or manually for interactive review, report-only scans, or headless skill-to-skill calls.
 managed_by: cas
 ---
 
@@ -9,13 +9,13 @@ managed_by: cas
 This skill is the orchestrator for CAS's Phase 1 multi-persona code review pipeline. It does **not** perform the review itself — each reviewer persona is a separate Sonnet sub-agent with its own prompt under `references/personas/`. Your job in this skill is to:
 
 1. Figure out **what** is being reviewed (the diff + the author's intent).
-2. Decide **who** reviews it (the 4 always-on personas plus any activated conditional ones).
+2. Decide **who** reviews it (the 5 always-on personas plus any activated conditional ones).
 3. Run them in **parallel**, collect their structured output envelopes.
 4. Hand the merged findings to the merge pipeline (Unit 5) and then route them according to the invocation mode.
 
 Everything in this document is the orchestrator's responsibility. The personas themselves are authoritative on *what counts as a finding in their lane* — you do not second-guess their judgment here, you just marshal their inputs and outputs.
 
-**Model tier:** The orchestrator and merge logic run on Opus. All 7 reviewer personas run on Sonnet. The fixer sub-agent (Unit 7) also runs on Opus. Do not inherit model choice from the caller — these are fixed per R13.
+**Model tier:** The orchestrator and merge logic run on Opus. All 8 reviewer personas run on Sonnet. The fixer sub-agent (Unit 7) also runs on Opus. Do not inherit model choice from the caller — these are fixed per R13.
 
 ## Purpose
 
@@ -61,7 +61,7 @@ Keep it tight. Personas use this to calibrate severity, not to learn the problem
 
 ## Step 2: Conditional persona selection (LLM-judged, not path pattern matching)
 
-The **4 always-on personas always run**: `correctness`, `testing`, `maintainability`, `project-standards`. No conditions, no exceptions.
+The **5 always-on personas always run**: `correctness`, `testing`, `maintainability`, `project-standards`, `fallow`. No conditions, no exceptions. The `fallow` persona is a thin wrapper around the deterministic `fallow audit` CLI — it self-skips on non-JS/TS repos / diffs and on missing-binary; it is "always-on" in the sense that the orchestrator always dispatches it and lets the persona's internal skip rules decide whether to emit findings. See `references/personas/fallow.md` for the skip contract.
 
 The **3 conditional personas** — `security`, `performance`, `adversarial` — activate based on the R2 heuristics below. **Critically: you activate them by reading the diff and judging whether the heuristic applies. This is an LLM judgment, LLM-judged, not path pattern matching.** Do not grep for `/auth/` in paths and call it security activation. Do not count lines with `regex`. Read the diff, understand what it does, decide whether the heuristic fires.
 
@@ -77,7 +77,7 @@ Record your activation decision explicitly in the output envelope so a reader ca
 
 ## Step 3: Parallel dispatch
 
-Spawn all activated personas in parallel via the Task tool. This is a single message with one Task tool call per persona — **not** a sequential loop. Opus can issue all 4–7 Task calls in a single response; do so.
+Spawn all activated personas in parallel via the Task tool. This is a single message with one Task tool call per persona — **not** a sequential loop. Opus can issue all 5–8 Task calls in a single response; do so.
 
 For each persona, the Task tool call passes:
 
