@@ -182,6 +182,40 @@ impl CasCore {
             }
         }
 
+        // cas-95ce: per-task close-time merge-state guard. Mirrors the
+        // shape of the epic check above, but at the worker scope: when
+        // a non-epic task with an assignee is being closed, reject if
+        // `factory/<assignee>` carries commits that haven't landed on
+        // the parent epic branch. Runs BEFORE the verification policy
+        // and the cas-code-review bypass — `bypass_code_review=true`
+        // cannot skip this guard because it is a data-state check, not
+        // a review gate. See `run_factory_branch_merge_gate` for the
+        // full skip matrix and EPIC cas-754b for context.
+        if task.task_type != TaskType::Epic && task.assignee.is_some() {
+            // Resolve the parent epic's branch via the existing
+            // ParentChild dependency. If no parent epic is recorded,
+            // fall back to "main" — the same default the rest of the
+            // close path uses when a target branch can't be derived.
+            let parent_branch = task_store
+                .get_parent_epic(&req.id)
+                .ok()
+                .flatten()
+                .and_then(|p| p.branch)
+                .unwrap_or_else(|| "main".to_string());
+            let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
+            match run_factory_branch_merge_gate(
+                &task,
+                &req,
+                &parent_branch,
+                close_project_root,
+            ) {
+                MergeStateGateOutcome::Proceed => {}
+                MergeStateGateOutcome::Reject(msg) => {
+                    return Ok(Self::tool_error(msg));
+                }
+            }
+        }
+
         // Check verification status if enabled
         let config = self.load_config();
         let policy = verification_policy(supervisor_harness_from_env(), worker_harness_from_env());
@@ -1460,14 +1494,36 @@ pub(crate) enum MergeStateGateOutcome {
 /// [`run_code_review_gate`] and the structural placement (this gate
 /// sits upstream of any bypass evaluation) is self-documenting.
 pub(crate) fn run_factory_branch_merge_gate(
-    _task: &Task,
+    task: &Task,
     _req: &TaskCloseRequest,
-    _parent_branch: &str,
-    _repo_path: &std::path::Path,
+    parent_branch: &str,
+    repo_path: &std::path::Path,
 ) -> MergeStateGateOutcome {
-    // cas-95ce step 1 (test-first): stub. Tests in `merge_state_gate_tests`
-    // exercise the contract; the real implementation lands in step 2.
-    MergeStateGateOutcome::Proceed
+    if task.task_type == TaskType::Epic {
+        return MergeStateGateOutcome::Proceed;
+    }
+    let Some(assignee) = task.assignee.as_deref() else {
+        return MergeStateGateOutcome::Proceed;
+    };
+    let factory_branch = format!("factory/{assignee}");
+    let stranded =
+        count_unmerged_factory_commits(repo_path, &factory_branch, parent_branch);
+    if stranded == 0 {
+        return MergeStateGateOutcome::Proceed;
+    }
+    MergeStateGateOutcome::Reject(format!(
+        "⚠️ MERGE REQUIRED\n\n\
+         task close rejected: {factory_branch} has {stranded} commit(s) not on \
+         {parent_branch}.\n\n\
+         Push the branch and merge a PR before closing. This guard cannot be \
+         bypassed (use of bypass_code_review=true does not skip merge-state \
+         checks — it is a data-state guard, not a review gate).\n\n\
+         Remediation:\n  \
+         1. Push {factory_branch} to its remote\n  \
+         2. Open a PR targeting {parent_branch}\n  \
+         3. Merge the PR\n  \
+         4. Retry mcp__cas__task action=close",
+    ))
 }
 
 /// Count commits reachable from `factory_branch` but not from
@@ -1483,13 +1539,44 @@ pub(crate) fn run_factory_branch_merge_gate(
 /// Mirrors the shell-out style of
 /// [`check_additive_only_branch_violations`] — no external git crate.
 pub(crate) fn count_unmerged_factory_commits(
-    _repo_path: &std::path::Path,
-    _factory_branch: &str,
-    _parent_branch: &str,
+    repo_path: &std::path::Path,
+    factory_branch: &str,
+    parent_branch: &str,
 ) -> u32 {
-    // cas-95ce step 1 (test-first): stub returning 0 (= treat as merged).
-    // Tests will exercise the real branching scenarios in step 2.
-    0
+    use std::process::Command;
+
+    // Resolve merge-base explicitly so we get a clean failure signal
+    // when either ref can't be resolved (vs. silently comparing
+    // against the wrong base via the `a..b` revspec).
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", parent_branch, factory_branch])
+        .current_dir(repo_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => return 0,
+    };
+    if merge_base.is_empty() {
+        return 0;
+    }
+
+    let count_out = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{merge_base}..{factory_branch}"),
+        ])
+        .current_dir(repo_path)
+        .output();
+    match count_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
