@@ -2350,10 +2350,31 @@ async fn test_close_forwards_persisted_review_envelope_after_jail() {
 /// this test — we need the verification-tools authz path to see
 /// `agent.role == AgentRole::Supervisor`.
 ///
+/// Mirrors `support::setup_cas`'s factory-env-clearing block (it briefly
+/// holds `env_test_lock()` for the mutation, matching the support.rs
+/// ordering contract). Callers should `let _env_lock = env_test_lock();`
+/// **after** this returns to hold the lock for the test body — std `Mutex`
+/// is not re-entrant, so taking it before would deadlock.
+///
 /// Returns the temp dir guard, the core (used by tests as `service` —
 /// MCP tool methods are defined directly on `CasCore`), and the supervisor
 /// session id.
 fn setup_cas_with_supervisor_session() -> (TempDir, cas::mcp::CasCore, String) {
+    // Clear factory env vars under the shared env lock so a parallel
+    // sibling test cannot observe a torn read. Match the four vars
+    // `support::setup_cas` clears so the two helpers do not drift.
+    {
+        let _env_guard = env_test_lock();
+        // SAFETY: we hold the process-wide env lock for the duration of
+        // this block; no other test thread can observe a torn env read.
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+            std::env::remove_var("CAS_FACTORY_MODE");
+            std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
+            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+        }
+    }
+
     let temp = TempDir::new().expect("temp dir");
     let cas_root = init_cas_dir(temp.path()).expect("init_cas_dir");
 
@@ -2383,19 +2404,14 @@ fn setup_cas_with_supervisor_session() -> (TempDir, cas::mcp::CasCore, String) {
 ///      epics may always be verified by supervisors
 #[tokio::test]
 async fn test_verification_add_supervisor_active_assignee_error_message() {
-    let _env_lock = env_test_lock();
-    // Tests are sensitive to leaked factory env vars; clear them so
-    // `worker_harness_from_env()` falls back to Claude (subagents=true) and
-    // the supervisor authz branch actually runs.
-    // SAFETY: we hold the process-wide env lock for the test body.
-    unsafe {
-        std::env::remove_var("CAS_AGENT_ROLE");
-        std::env::remove_var("CAS_FACTORY_MODE");
-        std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
-        std::env::remove_var("CAS_FACTORY_WORKER_CLI");
-    }
-
+    // Per support.rs ordering contract: setup helper FIRST (it briefly
+    // grabs the lock to clear factory env vars), then acquire the lock
+    // for the test body. std `Mutex` is not re-entrant — reversing the
+    // order would deadlock. Clearing the factory env vars ensures
+    // `worker_harness_from_env()` falls back to Claude (subagents=true)
+    // and the supervisor authz branch actually runs.
     let (temp, service, _supervisor_id) = setup_cas_with_supervisor_session();
+    let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let agent_store = open_agent_store(&cas_dir).expect("open agent store");
     let task_store = open_task_store(&cas_dir).expect("open task store");
@@ -2454,6 +2470,15 @@ async fn test_verification_add_supervisor_active_assignee_error_message() {
         }))
         .await
         .expect_err("verification.add must reject supervisor while worker is alive");
+
+    // (0) The error must remain a client-side INVALID_PARAMS, not an
+    //     INTERNAL_ERROR — the latter changes MCP client retry semantics
+    //     and operator-facing surfacing.
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "rejection must remain a client error, not server error"
+    );
 
     let msg = err.message.to_string();
 

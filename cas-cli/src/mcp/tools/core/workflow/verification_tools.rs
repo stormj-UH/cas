@@ -75,8 +75,7 @@ impl CasCore {
                                 Epics may always be verified by supervisors.\n\n\
                                 Remediation:\n\
                                   - Ask {assignee_id} to verify and close the task themselves:\n\
-                                    mcp__cas__coordination action=message target={assignee_id} \\\n\
-                                      message=\"Please verify and close task {task_id}\"\n\
+                                    mcp__cas__coordination action=message target={assignee_id} message=\"Please verify and close task {task_id}\"\n\
                                   - Or release their lease and take over:\n\
                                     mcp__cas__task action=release id={task_id}\n\
                                   - Or wait for the assignee to disconnect (heartbeat expires after 5min).",
