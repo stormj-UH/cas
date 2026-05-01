@@ -1,8 +1,11 @@
 use crate::support::*;
 use cas::mcp::tools::*;
-use cas::store::{open_agent_store, open_task_store, open_verification_store, open_worktree_store};
+use cas::store::{
+    init_cas_dir, open_agent_store, open_task_store, open_verification_store, open_worktree_store,
+};
 use cas::types::{Verification, VerificationType, Worktree};
 use rmcp::handler::server::wrapper::Parameters;
+use tempfile::TempDir;
 
 // cas-3bd4: env_test_lock() now lives in `support.rs` so `setup_cas()`
 // can hold it while clearing factory env vars. Tests that need to set
@@ -2324,4 +2327,213 @@ async fn test_close_forwards_persisted_review_envelope_after_jail() {
 
     let closed = task_store.get(&id).expect("task exists");
     assert_eq!(closed.status, cas::types::TaskStatus::Closed);
+}
+
+// =============================================================================
+// cas-a90f3: verification.add supervisor authz error message clarity
+//
+// The original rejection — "Supervisors can only verify epics, not individual
+// tasks" — was misleading. Field-confirmed in gabber-studio logs: the rule
+// actually depends on whether the task has a *currently live* assignee at
+// call time. Several supervisor calls on individual tasks succeed (orphaned,
+// dead/expired assignee, supervisor-is-assignee, task-verifier subagent
+// context); the rejection only fires for the active-assignee case.
+//
+// This test pins the new error wording: it must name the rule (active
+// assignee), include the offending assignee id, list the three supervisor
+// exemptions, and give a concrete remediation path.
+// =============================================================================
+
+/// Minimal CasCore rooted in `temp` with a *Supervisor-role* agent
+/// pre-set as the current session. `support::setup_cas` always registers a
+/// Standard-role agent and pins it via OnceLock, so we can't reuse it for
+/// this test — we need the verification-tools authz path to see
+/// `agent.role == AgentRole::Supervisor`.
+///
+/// Mirrors `support::setup_cas`'s factory-env-clearing block (it briefly
+/// holds `env_test_lock()` for the mutation, matching the support.rs
+/// ordering contract). Callers should `let _env_lock = env_test_lock();`
+/// **after** this returns to hold the lock for the test body — std `Mutex`
+/// is not re-entrant, so taking it before would deadlock.
+///
+/// Returns the temp dir guard, the core (used by tests as `service` —
+/// MCP tool methods are defined directly on `CasCore`), and the supervisor
+/// session id.
+fn setup_cas_with_supervisor_session() -> (TempDir, cas::mcp::CasCore, String) {
+    // Clear factory env vars under the shared env lock so a parallel
+    // sibling test cannot observe a torn read. Match the four vars
+    // `support::setup_cas` clears so the two helpers do not drift.
+    {
+        let _env_guard = env_test_lock();
+        // SAFETY: we hold the process-wide env lock for the duration of
+        // this block; no other test thread can observe a torn env read.
+        unsafe {
+            std::env::remove_var("CAS_AGENT_ROLE");
+            std::env::remove_var("CAS_FACTORY_MODE");
+            std::env::remove_var("CAS_FACTORY_SUPERVISOR_CLI");
+            std::env::remove_var("CAS_FACTORY_WORKER_CLI");
+        }
+    }
+
+    let temp = TempDir::new().expect("temp dir");
+    let cas_root = init_cas_dir(temp.path()).expect("init_cas_dir");
+
+    let agent_store = open_agent_store(&cas_root).expect("open agent store");
+    let supervisor_id = format!("supervisor-test-cas-a90f3-{}", std::process::id());
+    let mut supervisor =
+        cas::types::Agent::new(supervisor_id.clone(), "alpha-supervisor".to_string());
+    supervisor.role = cas::types::AgentRole::Supervisor;
+    supervisor.heartbeat();
+    agent_store
+        .register(&supervisor)
+        .expect("register supervisor");
+
+    let core = cas::mcp::CasCore::with_daemon(cas_root, None, None);
+    core.set_agent_id_for_testing(supervisor_id.clone());
+
+    (temp, core, supervisor_id)
+}
+
+/// Supervisor calls `verification.add` on a task held by a live worker. The
+/// rejection error must:
+///   1. Not echo the old "Supervisors can only verify epics" wording
+///   2. Name the actual rule (active-assignee precondition)
+///   3. Embed the offending assignee id and the task id
+///   4. List the three supervisor exemptions (orphaned / inactive / self)
+///   5. Provide a concrete remediation (release lease) and clarify that
+///      epics may always be verified by supervisors
+#[tokio::test]
+async fn test_verification_add_supervisor_active_assignee_error_message() {
+    // Per support.rs ordering contract: setup helper FIRST (it briefly
+    // grabs the lock to clear factory env vars), then acquire the lock
+    // for the test body. std `Mutex` is not re-entrant — reversing the
+    // order would deadlock. Clearing the factory env vars ensures
+    // `worker_harness_from_env()` falls back to Claude (subagents=true)
+    // and the supervisor authz branch actually runs.
+    let (temp, service, _supervisor_id) = setup_cas_with_supervisor_session();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    let task_store = open_task_store(&cas_dir).expect("open task store");
+
+    // Register a fresh, alive worker — distinct from the supervisor session
+    // and freshly heartbeated so `is_alive() && !is_heartbeat_expired(300)`.
+    let worker_id = format!("fresh-worker-cas-a90f3-{}", std::process::id());
+    let mut worker = cas::types::Agent::new(worker_id.clone(), "wild-cheetah-29".to_string());
+    worker.agent_type = cas::types::AgentType::Worker;
+    worker.role = cas::types::AgentRole::Worker;
+    worker.heartbeat();
+    agent_store.register(&worker).expect("register worker");
+
+    // Create a regular (non-Epic) task and assign the live worker to it.
+    let create_req = TaskCreateRequest {
+        title: "Live worker task — supervisor must not verify behind their back".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let id = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(create_req))
+            .await
+            .expect("task_create should succeed"),
+    ))
+    .expect("task id")
+    .to_string();
+
+    let mut task = task_store.get(&id).expect("task exists");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some(worker_id.clone());
+    task_store.update(&task).expect("update task");
+
+    // Supervisor attempts to add a verification for the worker's task.
+    let err = service
+        .cas_verification_add(Parameters(VerificationAddRequest {
+            task_id: id.clone(),
+            status: "approved".to_string(),
+            summary: "supervisor trying to verify behind worker's back".to_string(),
+            confidence: None,
+            issues: None,
+            files_reviewed: None,
+            duration_ms: None,
+            verification_type: None,
+        }))
+        .await
+        .expect_err("verification.add must reject supervisor while worker is alive");
+
+    // (0) The error must remain a client-side INVALID_PARAMS, not an
+    //     INTERNAL_ERROR — the latter changes MCP client retry semantics
+    //     and operator-facing surfacing.
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "rejection must remain a client error, not server error"
+    );
+
+    let msg = err.message.to_string();
+
+    // (1) Old misleading wording must be gone.
+    assert!(
+        !msg.contains("Supervisors can only verify epics, not individual tasks"),
+        "rejection must not use the old misleading wording: {msg}"
+    );
+    // (2) New wording must name the actual rule.
+    assert!(
+        msg.contains("active assignee"),
+        "rejection must describe the active-assignee rule: {msg}"
+    );
+    // (3) Embed task + assignee identifiers so the operator knows *which* task
+    //     and *who* is blocking.
+    assert!(
+        msg.contains(&worker_id),
+        "rejection must include the offending assignee id ({worker_id}): {msg}"
+    );
+    assert!(
+        msg.contains(&id),
+        "rejection must include the task id ({id}): {msg}"
+    );
+    // (4) List the three exemptions.
+    assert!(
+        msg.contains("orphaned"),
+        "rejection must mention the orphaned-task exemption: {msg}"
+    );
+    assert!(
+        msg.contains("inactive"),
+        "rejection must mention the inactive-assignee exemption: {msg}"
+    );
+    assert!(
+        msg.contains("self-implemented") || msg.contains("supervisor IS the assignee"),
+        "rejection must mention the supervisor-is-assignee exemption: {msg}"
+    );
+    // (5) Concrete remediation + epic clarification.
+    assert!(
+        msg.contains("release") || msg.contains("Release"),
+        "rejection must mention the release-lease remediation: {msg}"
+    );
+    assert!(
+        msg.contains("Epics may always be verified"),
+        "rejection must clarify that epics are always verifiable by supervisors: {msg}"
+    );
+
+    // The check is the only thing we touched; the underlying authz behavior
+    // — rejecting the call — must still hold. No verification row should
+    // have been written.
+    let verification_store = open_verification_store(&cas_dir).expect("verification store");
+    let row = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification lookup");
+    assert!(
+        row.is_none(),
+        "rejected verification.add must NOT persist a verification row: {row:?}"
+    );
 }

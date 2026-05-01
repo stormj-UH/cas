@@ -5,6 +5,47 @@
         "serve"
       ],
       "command": "cas"
+    },
+    "context7": {
+      "headers": {
+        "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}"
+      },
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    },
+    "github": {
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "neon": {
+      "args": [
+        "-y",
+        "@neondatabase/mcp-server-neon@0.6.5",
+        "start",
+        "${NEON_API_KEY}"
+      ],
+      "command": "npx"
+    },
+    "playwright": {
+      "args": [
+        "-y",
+        "@playwright/mcp@0.0.70",
+        "--user-data-dir",
+        "/home/pippenz/.playwright-mcp-profile",
+        "--browser",
+        "chrome"
+      ],
+      "command": "npx"
+    },
+    "vercel": {
+      "headers": {
+        "Authorization": "Bearer ${VERCEL_TOKEN}"
+      },
+      "type": "http",
+      "url": "https://mcp.vercel.com"
     }
   }
 }

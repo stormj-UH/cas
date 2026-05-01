@@ -41,8 +41,12 @@ impl CasCore {
                     let supervisor_is_assignee =
                         task.assignee.as_deref() == Some(agent_id.as_str());
 
-                    // Check if task assignee is inactive (orphaned)
-                    let assignee_inactive = task
+                    // Check if task assignee is inactive (orphaned).
+                    // `unwrap_or(true)` semantics: missing assignee, missing
+                    // agent record, dead agent, or stale heartbeat all count
+                    // as "inactive_or_absent" — the rejection only fires
+                    // when there is a *currently live* assignee.
+                    let assignee_inactive_or_absent = task
                         .assignee
                         .as_deref()
                         .map(|aid| {
@@ -55,17 +59,29 @@ impl CasCore {
 
                     if !is_verifier_subagent
                         && !supervisor_is_assignee
-                        && !assignee_inactive
+                        && !assignee_inactive_or_absent
                     {
+                        // Safe: assignee_inactive_or_absent is false here,
+                        // which requires task.assignee to be Some(_).
+                        let assignee_id = task.assignee.as_deref().unwrap_or("<unknown>");
                         return Err(McpError {
                             code: ErrorCode::INVALID_PARAMS,
-                            message: Cow::from(
-                                "Supervisors can only verify epics, not individual tasks.\n\n\
-                                Workers are responsible for verifying their own tasks before closing.\n\
-                                Supervisors verify epics after all subtasks are complete and merged.\n\n\
-                                If a worker's task needs review, message them to verify and close it:\n\
-                                mcp__cas__coordination action=message target=<worker> message=\"Please verify and close task <task_id>\"",
-                            ),
+                            message: Cow::from(format!(
+                                "Cannot verify task {task_id}: it has an active assignee ({assignee_id}).\n\n\
+                                Supervisors may verify individual tasks only when:\n\
+                                  - the task has no assignee (orphaned), OR\n\
+                                  - the assignee is inactive (dead session or heartbeat expired >5min ago), OR\n\
+                                  - the supervisor IS the assignee (self-implemented task).\n\n\
+                                Epics may always be verified by supervisors.\n\n\
+                                Remediation:\n\
+                                  - Ask {assignee_id} to verify and close the task themselves:\n\
+                                    mcp__cas__coordination action=message target={assignee_id} message=\"Please verify and close task {task_id}\"\n\
+                                  - Or release their lease and take over:\n\
+                                    mcp__cas__task action=release id={task_id}\n\
+                                  - Or wait for the assignee to disconnect (heartbeat expires after 5min).",
+                                task_id = req.task_id,
+                                assignee_id = assignee_id,
+                            )),
                             data: None,
                         });
                     }

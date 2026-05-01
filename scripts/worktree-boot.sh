@@ -6,7 +6,7 @@
 #
 # This script:
 # 1. Generates .env.worktree from template with assigned SLOT
-# 2. Starts services via overmind
+# 2. Exports the variables for subsequent commands in this shell
 
 set -euo pipefail
 
@@ -29,6 +29,5 @@ if [[ -f "$OUTPUT" ]]; then
     set +a
 fi
 
-# Start services
-echo "Starting services with mise run dev..."
-mise run dev
+echo "Environment prepared from $OUTPUT"
+echo "Run your project-specific dev command next."
