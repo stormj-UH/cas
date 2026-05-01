@@ -12,7 +12,8 @@
 - `site/` — static landing page (`index.html`, PDF)
 - `vendor/` — vendored upstream sources (`ghostty/`)
 - `target/` — cargo build output (skip)
-- `.claude/`, `.cas/` — harness config + agent state for this repo
+- `.claude/` — harness config (`settings.json`), `.claude/agents/` project-local subagents (e.g., `macos-onboarding-reviewer`), `.claude/skills/` project-local skill surface (sync output of `cas integrate`)
+- `.cas/` — agent state, factory config, codemap-pending tracker
 
 ## Workspace / packages
 Top-level `Cargo.toml` defines a workspace. The binary lives in `cas-cli`; everything else is a library crate consumed by it.
@@ -86,8 +87,9 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `factory/` — multi-pane factory TUI (the `cas` binary launches into this)
   - `components/`, `widgets/`, `markdown/`, `theme/`
 - `builtins.rs` + `builtins/` — embedded skills, agents, and content
-  - `builtins/skills/` — claude-variant SKILL.md files (cas-* skills, codemap, project-overview, fallow)
+  - `builtins/skills/` — claude-variant SKILL.md files (cas-* skills, codemap, project-overview, fallow); each cas-code-review/references/personas/ now includes fallow.md (5th always-on persona)
   - `builtins/codex/skills/` — codex-variant mirror
+  - `cas-cli/.cursor/skills/` — Cursor IDE skill mirror (subset of builtins for editor sessions)
   - `builtins/agents/` — task-verifier, learning-reviewer, rule-reviewer, duplicate-detector, etc.
   - `BUILTIN_SKILLS` / `CODEX_BUILTIN_SKILLS` arrays drive `cas sync`
   - `supervisor_guidance()` / `worker_guidance()` — SessionStart bundles
