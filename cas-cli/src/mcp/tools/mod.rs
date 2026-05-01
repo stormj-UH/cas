@@ -308,7 +308,7 @@ pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-mod core;
+pub(crate) mod core;
 
 #[cfg(test)]
 mod mod_tests;

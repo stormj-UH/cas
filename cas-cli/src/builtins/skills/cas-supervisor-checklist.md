@@ -85,9 +85,11 @@ mcp__cas__memory action=remember title="..." content="..." tags="decision"
 
 ## Before Closing an EPIC
 
-- Verify all worker branches are merged into the epic branch
+- Run `mcp__cas__coordination action=epic_status id=<epic-id>` — confirms every child task's `factory/<assignee>` branch is merged into the epic branch (this check is now also enforced automatically at `mcp__cas__task action=close` for Epic-type tasks; bypass-immune)
 - Confirm task deliverables exist on the epic branch
 - Run full test suite on epic branch
+
+The `epic_status` action is a defense-in-depth diagnostic: the close-time gate (cas-8f8f) refuses to close an epic with stranded child branches regardless of `bypass_code_review=true`, but running `epic_status` mid-flight surfaces the same data so you can resolve merges without chasing a close-time error.
 
 ## Session End
 

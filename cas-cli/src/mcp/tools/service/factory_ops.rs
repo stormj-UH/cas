@@ -859,6 +859,78 @@ impl CasService {
         Ok(Self::success(out))
     }
 
+    /// cas-8f8f: read-only diagnostic that walks an epic's children
+    /// and reports per-worker `factory/<assignee>` merge state vs.
+    /// the epic's parent branch. Mirrors the `factory_gc_report`
+    /// pattern: pure read, returns markdown via `Self::success`.
+    ///
+    /// Uses the same `count_unmerged_factory_commits` /
+    /// `last_commit_unix` helpers that back the close-time gates in
+    /// `close_ops.rs`, so the report can never disagree with what
+    /// the gate actually enforces.
+    pub(super) async fn factory_epic_status(
+        &self,
+        req: FactoryRequest,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::mcp::tools::core::task::lifecycle::close_ops::{
+            collect_epic_branch_statuses, render_epic_status_report,
+        };
+        use crate::store::open_task_store;
+        use cas_types::TaskType;
+
+        let epic_id = req.id.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+            Self::error(
+                ErrorCode::INVALID_PARAMS,
+                "epic_status requires `id`: mcp__cas__coordination action=epic_status id=<epic-id>",
+            )
+        })?;
+
+        let task_store = open_task_store(&self.inner.cas_root).map_err(|e| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to open task store: {e}"),
+            )
+        })?;
+
+        let epic = task_store.get(epic_id).map_err(|e| {
+            Self::error(
+                ErrorCode::INVALID_PARAMS,
+                format!("Task not found: {epic_id}: {e}"),
+            )
+        })?;
+
+        if epic.task_type != TaskType::Epic {
+            return Err(Self::error(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "epic_status: task {epic_id} is not an Epic (task_type={:?}). \
+                     This action only operates on Epic-type tasks.",
+                    epic.task_type
+                ),
+            ));
+        }
+
+        // The parent branch the gate compares against: the epic's
+        // own `branch` field (set by epic creation), falling back to
+        // "master" to match the epic-close path's existing default.
+        let parent_branch = epic.branch.as_deref().unwrap_or("master");
+
+        let subtasks = task_store.get_subtasks(epic_id).map_err(|e| {
+            Self::error(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Failed to walk subtasks of {epic_id}: {e}"),
+            )
+        })?;
+
+        let close_project_root =
+            self.inner.cas_root.parent().unwrap_or(&self.inner.cas_root);
+        let statuses =
+            collect_epic_branch_statuses(&subtasks, parent_branch, close_project_root);
+        let report = render_epic_status_report(epic_id, parent_branch, &statuses);
+
+        Ok(Self::success(report))
+    }
+
     pub(super) async fn factory_gc_cleanup(
         &self,
         req: FactoryRequest,

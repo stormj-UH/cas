@@ -1,5 +1,5 @@
 mod dependencies;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod notes;
 mod query;
 mod update;

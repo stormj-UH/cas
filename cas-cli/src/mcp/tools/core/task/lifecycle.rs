@@ -1,7 +1,7 @@
 use crate::harness_policy::is_worker_without_subagents_from_env;
 use crate::mcp::tools::core::imports::*;
 
-mod close_ops;
+pub(crate) mod close_ops;
 
 impl CasCore {
     pub async fn cas_task_create(

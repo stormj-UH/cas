@@ -7,7 +7,7 @@ mod rules;
 mod search;
 mod skills;
 mod system;
-mod task;
+pub(crate) mod task;
 mod task_extensions;
 mod workflow;
 
