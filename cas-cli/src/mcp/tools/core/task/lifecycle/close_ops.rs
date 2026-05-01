@@ -1409,6 +1409,90 @@ pub(crate) fn check_additive_only_branch_violations(
 }
 
 // ---------------------------------------------------------------------------
+// cas-95ce: per-task close-time merge-state guard
+// ---------------------------------------------------------------------------
+
+/// Outcome of the cas-95ce factory-branch merge-state close gate.
+///
+/// Mirrors [`CodeReviewGateOutcome`] in shape so the call site is a
+/// uniform pattern-match. The gate exposes only `Proceed` / `Reject`
+/// because, unlike the cas-code-review gate, this one has no
+/// supervisor override path — bypass cannot skip a data-state guard.
+#[derive(Debug)]
+pub(crate) enum MergeStateGateOutcome {
+    /// Close may proceed — factory branch is merged into the parent
+    /// epic branch (or the guard is structurally skipped: epic-type
+    /// task, no assignee, branch missing locally, or git history
+    /// unknowable).
+    Proceed,
+    /// Close must be rejected with this user-facing error message.
+    Reject(String),
+}
+
+/// Per-task close-time guard: reject `task.close` when the worker's
+/// `factory/<assignee>` branch carries commits not present on the
+/// parent epic branch.
+///
+/// Runs BEFORE [`run_code_review_gate`]; consequently
+/// `bypass_code_review=true` cannot skip it. This is a data-state
+/// guard, not a review gate — a reviewed-but-unmerged branch is
+/// still stranded work, and the entire point of the cas-95ce/cas-754b
+/// scoping decision is that there is no escape hatch (an escape
+/// hatch would let the same workaround pattern persist that motivated
+/// the EPIC).
+///
+/// Skipped (Proceed) when:
+/// - `task.task_type == Epic` — epic close is already covered by
+///   [`check_unmerged_epic_branches`] at the epic-id branch namespace.
+/// - `task.assignee.is_none()` — orphaned task; nothing to check.
+/// - `factory/<assignee>` does not exist locally and merge-base
+///   computation fails — graceful pass. We do not false-reject when
+///   the worktree predates the convention or the branch was already
+///   pruned post-merge.
+///
+/// Rejects (Reject) when the factory branch has > 0 commits not on
+/// `parent_branch`. The error message includes the stranded count,
+/// the factory branch name, the parent branch name, and explicit
+/// remediation steps.
+///
+/// `_req` is intentionally unused — the bypass flag does not affect
+/// this guard. It is carried through so the call signature mirrors
+/// [`run_code_review_gate`] and the structural placement (this gate
+/// sits upstream of any bypass evaluation) is self-documenting.
+pub(crate) fn run_factory_branch_merge_gate(
+    _task: &Task,
+    _req: &TaskCloseRequest,
+    _parent_branch: &str,
+    _repo_path: &std::path::Path,
+) -> MergeStateGateOutcome {
+    // cas-95ce step 1 (test-first): stub. Tests in `merge_state_gate_tests`
+    // exercise the contract; the real implementation lands in step 2.
+    MergeStateGateOutcome::Proceed
+}
+
+/// Count commits reachable from `factory_branch` but not from
+/// `parent_branch`, within the git repository rooted at `repo_path`.
+///
+/// Returns 0 (treated as "merged" by [`run_factory_branch_merge_gate`])
+/// when:
+/// - The factory branch ref does not resolve locally (worker may
+///   have pushed-and-pruned, or never pushed in this checkout).
+/// - The merge-base between the two refs cannot be computed.
+/// - `git rev-list --count` fails or returns an unparseable value.
+///
+/// Mirrors the shell-out style of
+/// [`check_additive_only_branch_violations`] — no external git crate.
+pub(crate) fn count_unmerged_factory_commits(
+    _repo_path: &std::path::Path,
+    _factory_branch: &str,
+    _parent_branch: &str,
+) -> u32 {
+    // cas-95ce step 1 (test-first): stub returning 0 (= treat as merged).
+    // Tests will exercise the real branching scenarios in step 2.
+    0
+}
+
+// ---------------------------------------------------------------------------
 // cas-3086 + cas-fef4: epic subtask receipts bypass helper
 // ---------------------------------------------------------------------------
 
@@ -2574,6 +2658,269 @@ mod code_review_gate_tests {
         assert!(
             !epic_subtask_receipts_are_clean(&subtasks),
             "malformed envelope on any subtask must disqualify the bypass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_state_gate_tests {
+    //! Unit tests for the cas-95ce factory-branch merge-state close
+    //! gate ([`run_factory_branch_merge_gate`]). The gate sits at
+    //! `cas_task_close` line ~183, immediately after the existing
+    //! [`check_unmerged_epic_branches`] guard for epic-type tasks, and
+    //! BEFORE the cas-code-review gate / `bypass_code_review` plumbing.
+    //!
+    //! Why these tests are pure-helper instead of end-to-end
+    //! `cas_task_close` calls:
+    //!
+    //! - The integration call site is mechanical (one
+    //!   `pattern-match { Proceed => {} | Reject(msg) => return tool_error(msg) }`
+    //!   block, mirroring the cas-code-review gate at line ~815).
+    //! - Bypass-immunity is enforced **structurally**: the gate
+    //!   function does not consume the bypass flag, and it runs at
+    //!   line 183 — strictly upstream of the `bypass_code_review`
+    //!   evaluation at line ~1549. The test sets
+    //!   `req.bypass_code_review = Some(true)` and confirms the gate
+    //!   still rejects, demonstrating bypass cannot reach this layer.
+    //!
+    //! Test layout mirrors `code_review_gate_tests` above.
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Build a repo with `main` carrying one seed commit, branch off
+    /// into `factory/<worker>`, and return the tempdir on the worker
+    /// branch. Caller adds whatever commits it wants on top.
+    fn init_factory_repo(worker: &str) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", &format!("factory/{worker}")]);
+        dir
+    }
+
+    fn worker_task(assignee: &str) -> Task {
+        Task {
+            id: "cas-test1".to_string(),
+            title: "worker task".to_string(),
+            status: TaskStatus::InProgress,
+            assignee: Some(assignee.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn epic_task(assignee: Option<&str>) -> Task {
+        Task {
+            id: "cas-epic".to_string(),
+            title: "the epic".to_string(),
+            status: TaskStatus::InProgress,
+            task_type: TaskType::Epic,
+            assignee: assignee.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn base_req(id: &str) -> TaskCloseRequest {
+        TaskCloseRequest {
+            id: id.to_string(),
+            reason: None,
+            bypass_code_review: None,
+            code_review_findings: None,
+        }
+    }
+
+    // --- The 6 named tests (per cas-95ce design / acceptance criteria) ----
+
+    #[test]
+    fn worker_task_close_rejects_when_factory_branch_unmerged() {
+        // Worker committed two new files on factory/worker that never
+        // landed on main. The gate must reject with stranded count + remediation.
+        let dir = init_factory_repo("worker");
+        std::fs::write(dir.path().join("a.rs"), "// a\n").unwrap();
+        git(dir.path(), &["add", "a.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: a"]);
+        std::fs::write(dir.path().join("b.rs"), "// b\n").unwrap();
+        git(dir.path(), &["add", "b.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: b"]);
+
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(msg.contains("MERGE REQUIRED"), "missing header: {msg}");
+                assert!(
+                    msg.contains("factory/worker"),
+                    "missing factory branch name: {msg}"
+                );
+                assert!(msg.contains("main"), "missing parent branch name: {msg}");
+                assert!(
+                    msg.contains("2"),
+                    "expected stranded count of 2 in message: {msg}"
+                );
+                assert!(
+                    msg.contains("bypass_code_review=true"),
+                    "remediation must call out bypass-immunity: {msg}"
+                );
+            }
+            other => panic!("expected Reject for stranded factory branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_task_close_succeeds_when_factory_branch_merged() {
+        // factory/worker has no commits beyond main → 0 stranded → Proceed.
+        let dir = init_factory_repo("worker");
+        let task = worker_task("worker");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "fully-merged factory branch must allow close, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn worker_task_close_with_bypass_still_rejects_on_unmerged() {
+        // Confirms `bypass_code_review=true` does NOT skip the
+        // merge-state guard. Demonstrated at the type level — the
+        // gate function does not consume the bypass flag — and at
+        // the behavioral level by setting bypass=Some(true) on the
+        // request and asserting the gate still rejects.
+        let dir = init_factory_repo("worker");
+        std::fs::write(dir.path().join("evil.rs"), "// stranded\n").unwrap();
+        git(dir.path(), &["add", "evil.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: stranded"]);
+
+        let task = worker_task("worker");
+        let mut req = base_req(&task.id);
+        req.bypass_code_review = Some(true);
+        req.reason = Some("supervisor wants to skip review".to_string());
+
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        match out {
+            MergeStateGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("bypass_code_review=true"),
+                    "rejection message must spell out bypass-immunity policy: {msg}"
+                );
+            }
+            other => panic!(
+                "bypass_code_review must NOT skip merge-state guard, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn worker_task_close_skipped_for_epic_type() {
+        // The epic-close path is owned by check_unmerged_epic_branches
+        // (line 161-182) which works at the epic-id branch namespace.
+        // This per-task guard MUST NOT fire on epic-type tasks even
+        // if their `assignee` field happens to be set (e.g.,
+        // supervisor self-assigned an epic).
+        let dir = init_factory_repo("worker");
+        std::fs::write(dir.path().join("c.rs"), "// c\n").unwrap();
+        git(dir.path(), &["add", "c.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: c"]);
+
+        let task = epic_task(Some("worker"));
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "epic-type task must skip the per-task guard, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn worker_task_close_skipped_for_no_assignee() {
+        // Orphan tasks have no factory branch convention to resolve.
+        // The guard must Proceed (covered by NoAssignee verification
+        // skip elsewhere; here we just need it not to false-reject).
+        let dir = init_factory_repo("worker");
+        // Stranded commits exist on factory/worker, but our task has no assignee.
+        std::fs::write(dir.path().join("d.rs"), "// d\n").unwrap();
+        git(dir.path(), &["add", "d.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: d"]);
+
+        let mut task = worker_task("worker");
+        task.assignee = None;
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "no-assignee task must skip the guard, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn worker_task_close_handles_missing_factory_branch() {
+        // Worker convention is `factory/<assignee>`, but for a fresh
+        // repo where no such branch ref exists, the guard must
+        // Proceed (treat-as-merged) instead of false-rejecting. This
+        // mirrors check_additive_only_branch_violations' graceful
+        // degradation when git can't reason about history.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        // Note: no `factory/ghost` branch is created.
+
+        let task = worker_task("ghost");
+        let req = base_req(&task.id);
+        let out = run_factory_branch_merge_gate(&task, &req, "main", dir.path());
+        assert!(
+            matches!(out, MergeStateGateOutcome::Proceed),
+            "missing factory branch must be treated as merged (graceful pass), got {out:?}"
+        );
+    }
+
+    // --- Lower-level coverage on count_unmerged_factory_commits -------------
+
+    #[test]
+    fn count_returns_zero_for_non_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            count_unmerged_factory_commits(dir.path(), "factory/x", "main"),
+            0,
+            "non-git dir must degrade to 0"
+        );
+    }
+
+    #[test]
+    fn count_matches_committed_delta() {
+        let dir = init_factory_repo("worker");
+        // 3 commits on factory/worker beyond main.
+        for (i, name) in ["x.rs", "y.rs", "z.rs"].iter().enumerate() {
+            std::fs::write(dir.path().join(name), format!("// {i}\n")).unwrap();
+            git(dir.path(), &["add", name]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("feat: {name}")]);
+        }
+        assert_eq!(
+            count_unmerged_factory_commits(dir.path(), "factory/worker", "main"),
+            3,
+            "count must equal commits on factory/worker beyond main"
         );
     }
 }
