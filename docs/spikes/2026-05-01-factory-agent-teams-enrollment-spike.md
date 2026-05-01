@@ -52,7 +52,6 @@ Recommend a follow-on EPIC to execute the drop. Sketch in §7.
 | [#42999](https://github.com/anthropics/claude-code/issues/42999) | 2026-04-03 | SendMessage silently fails when using agent name — only agent ID works | Silent-fail mode hidden behind our hook interceptor. |
 | [#48160](https://github.com/anthropics/claude-code/issues/48160) | 2026-04-14 | Spawned subagents cannot originate SendMessage | Asymmetry; means our agent-teams plumbing is doubly bridged. |
 | [#27555](https://github.com/anthropics/claude-code/issues/27555) | 2026-03 | Teammate messages render with `⏺ Human:` prefix | UX bug; teammates can't tell teammate messages from user input. |
-| [#51959](https://github.com/anthropics/claude-code/issues/51959) | 2026-04-22 | Lead agent requires manual stdin to process teammate notifications | Same flakiness as `bba7685` but called out as a fresh bug 14 days ago. |
 | [#51431](https://github.com/anthropics/claude-code/issues/51431) | 2026-04-21 | [Hooks] Missing hook events for inter-teammate notifications | Hook surface incomplete. |
 | [#52251](https://github.com/anthropics/claude-code/issues/52251) | 2026-04-23 | Agent-Teams sub-agents with model:opus cannot call SendMessage / TaskCreate / TaskUpdate (tmux backend) | Tool gating regressions on the exact backend we use. |
 | [#53896](https://github.com/anthropics/claude-code/issues/53896) | 2026-04-27 | SendMessage concurrent writes lose messages via array rewrite | Same bug class as our cas-7f57 inbox-replay fix — i.e. we are forking + carrying CC's inbox bugs. |
