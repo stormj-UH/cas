@@ -354,9 +354,17 @@ pub struct TeamRequest {
 pub struct FactoryRequest {
     /// Action to perform
     #[schemars(
-        description = "Action: 'spawn_workers', 'shutdown_workers', 'worker_status', 'worker_activity', 'clear_context', 'my_context', 'sync_all_workers', 'gc_report', 'gc_cleanup', 'remind' (create reminder), 'remind_list' (list reminders), 'remind_cancel' (cancel a reminder)"
+        description = "Action: 'spawn_workers', 'shutdown_workers', 'worker_status', 'worker_activity', 'clear_context', 'my_context', 'sync_all_workers', 'gc_report', 'gc_cleanup', 'epic_status' (per-child branch merge state), 'remind' (create reminder), 'remind_list' (list reminders), 'remind_cancel' (cancel a reminder)"
     )]
     pub action: String,
+
+    /// Generic id field — used by `epic_status` to identify the
+    /// target epic, and forwarded from the unified
+    /// `CoordinationRequest.id` so callers can write
+    /// `mcp__cas__coordination action=epic_status id=cas-754b`.
+    #[schemars(description = "ID for actions that target a specific entity (e.g., epic_id for epic_status)")]
+    #[serde(default)]
+    pub id: Option<String>,
 
     /// Number of workers to spawn/shutdown
     #[schemars(
@@ -727,6 +735,7 @@ impl CoordinationRequest {
     pub fn to_factory_request(&self) -> super::FactoryRequest {
         super::FactoryRequest {
             action: self.action.clone(),
+            id: self.id.clone(),
             count: self.count,
             worker_names: self.worker_names.clone(),
             target: self.target.clone(),
