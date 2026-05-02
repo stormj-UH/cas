@@ -134,6 +134,7 @@ impl FactoryCore {
         // Create mux with no panes initially
         let mut mux = Mux::new(rows, cols);
         mux.set_worker_cli(config.worker_cli);
+        mux.set_worker_model(config.worker_model.clone());
         mux.set_worker_effort(config.worker_effort.clone());
 
         // Initialize recording if enabled
