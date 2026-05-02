@@ -124,6 +124,8 @@ impl FactoryApp {
             worker_cli: config.worker_cli,
             supervisor_model: config.supervisor_model.clone(),
             worker_model: config.worker_model.clone(),
+            supervisor_effort: config.supervisor_effort.clone(),
+            worker_effort: config.worker_effort.clone(),
             include_director: false,
             rows,
             cols,

@@ -197,7 +197,6 @@ impl Pane {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn worker(
         name: &str,
         cwd: PathBuf,
@@ -205,6 +204,7 @@ impl Pane {
         supervisor_name: &str,
         cli: SupervisorCli,
         model: Option<&str>,
+        effort: Option<&str>,
         rows: u16,
         cols: u16,
         teams: Option<&TeamsSpawnConfig>,
@@ -219,6 +219,7 @@ impl Pane {
                     Some(supervisor_name),
                     None,
                     model,
+                    effort,
                     teams,
                 );
                 let pty = Pty::spawn(name, config)?;
@@ -233,6 +234,7 @@ impl Pane {
                     Some(supervisor_name),
                     None,
                     model,
+                    effort,
                     teams,
                 );
                 let pty = Pty::spawn(name, config)?;
@@ -252,6 +254,7 @@ impl Pane {
         worker_cli: SupervisorCli,
         worker_names: &[String],
         model: Option<&str>,
+        effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
     ) -> Result<Self> {
         let worker_cli_str = worker_cli.as_str();
@@ -271,6 +274,7 @@ impl Pane {
                     None,
                     Some(worker_cli_str),
                     model,
+                    effort,
                     teams,
                 );
                 Self::push_supervisor_env(&mut config.env, cli, &worker_names_csv);
@@ -286,6 +290,7 @@ impl Pane {
                     None,
                     Some(worker_cli_str),
                     model,
+                    effort,
                     teams,
                 );
                 Self::push_supervisor_env(&mut config.env, cli, &worker_names_csv);

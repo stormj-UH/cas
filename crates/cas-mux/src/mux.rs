@@ -37,6 +37,10 @@ pub struct MuxConfig {
     pub supervisor_model: Option<String>,
     /// Model for workers (passed as --model flag)
     pub worker_model: Option<String>,
+    /// Reasoning effort for supervisor (passed as --effort flag; defaults to "high")
+    pub supervisor_effort: Option<String>,
+    /// Reasoning effort for workers (passed as --effort flag; defaults to "medium")
+    pub worker_effort: Option<String>,
     /// Include director pane
     pub include_director: bool,
     /// Terminal size
@@ -60,6 +64,8 @@ impl Default for MuxConfig {
             worker_cli: SupervisorCli::Claude,
             supervisor_model: None,
             worker_model: None,
+            supervisor_effort: None,
+            worker_effort: None,
             include_director: true,
             rows: 24,
             cols: 80,
@@ -107,6 +113,8 @@ pub struct Mux {
     worker_cli: SupervisorCli,
     /// Worker model used for dynamic worker spawns
     worker_model: Option<String>,
+    /// Worker reasoning effort used for dynamic worker spawns
+    worker_effort: Option<String>,
 }
 
 impl Mux {
@@ -122,6 +130,7 @@ impl Mux {
             cols,
             worker_cli: SupervisorCli::Claude,
             worker_model: None,
+            worker_effort: None,
         }
     }
 
@@ -135,11 +144,17 @@ impl Mux {
         self.worker_model = model;
     }
 
+    /// Set reasoning effort used for worker pane spawns.
+    pub fn set_worker_effort(&mut self, effort: Option<String>) {
+        self.worker_effort = effort;
+    }
+
     /// Create a multiplexer with factory configuration
     pub fn factory(config: MuxConfig) -> Result<Self> {
         let mut mux = Self::new(config.rows, config.cols);
         mux.set_worker_cli(config.worker_cli);
         mux.set_worker_model(config.worker_model.clone());
+        mux.set_worker_effort(config.worker_effort.clone());
 
         // Calculate pane sizes based on layout
         // Layout: [Workers] [Supervisor] [Director]
@@ -171,6 +186,7 @@ impl Mux {
                 &config.supervisor_name,
                 config.worker_cli,
                 config.worker_model.as_deref(),
+                config.worker_effort.as_deref(),
                 pane_rows,
                 pane_cols,
                 teams,
@@ -190,6 +206,7 @@ impl Mux {
             config.worker_cli,
             &worker_names,
             config.supervisor_model.as_deref(),
+            config.supervisor_effort.as_deref(),
             sup_teams,
         )?;
         mux.add_pane(supervisor);
@@ -419,6 +436,7 @@ impl Mux {
             supervisor_name,
             self.worker_cli,
             self.worker_model.as_deref(),
+            self.worker_effort.as_deref(),
             self.rows,
             self.cols,
             teams,

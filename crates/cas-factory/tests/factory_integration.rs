@@ -186,6 +186,8 @@ fn test_config() -> FactoryConfig {
         worker_cli: SupervisorCli::Claude,
         supervisor_model: None,
         worker_model: None,
+        supervisor_effort: None,
+        worker_effort: None,
         enable_worktrees: false,
         worktree_root: None,
         notify: NotifyConfig::default(),
