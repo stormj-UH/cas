@@ -1019,6 +1019,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pty_config_claude_custom_effort() {
+        let config = PtyConfig::claude(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            Some("low"),  // effort override
+            None,  // teams
+        );
+        let effort_idx = config
+            .args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort must be present");
+        assert_eq!(
+            config.args[effort_idx + 1], "low",
+            "custom effort should override hardcoded default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_supervisor_default_effort() {
+        // When effort is None and role is supervisor, must default to "high"
+        let config = PtyConfig::claude(
+            "sup",
+            "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            None,  // no effort — should fall back to "high"
+            None,  // teams
+        );
+        let effort_idx = config
+            .args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort must be present");
+        assert_eq!(config.args[effort_idx + 1], "high");
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_worker_default_effort() {
+        // When effort is None and role is worker, must default to "medium"
+        let config = PtyConfig::claude(
+            "wrk",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            None,  // no effort — should fall back to "medium"
+            None,  // teams
+        );
+        let effort_idx = config
+            .args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort must be present");
+        assert_eq!(config.args[effort_idx + 1], "medium");
+    }
+
+    #[tokio::test]
     async fn test_pty_config_claude_with_teams_lead() {
         let teams = TeamsSpawnConfig {
             team_name: "test-team".to_string(),
