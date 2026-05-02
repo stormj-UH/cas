@@ -102,6 +102,7 @@ impl PtyConfig {
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
+        effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
     ) -> Self {
         // Use the lead_session_id for the team lead so leadSessionId in the
@@ -181,15 +182,12 @@ impl PtyConfig {
         }
         // Supervisors need deeper reasoning for planning/coordination;
         // workers execute well-defined tasks where high effort suffices.
+        // Config-provided effort takes precedence; role-based defaults preserve
+        // backward compatibility when no config value is set.
+        let resolved_effort =
+            effort.unwrap_or(if role == "supervisor" { "xhigh" } else { "high" });
         args.push("--effort".to_string());
-        args.push(
-            if role == "supervisor" {
-                "xhigh"
-            } else {
-                "high"
-            }
-            .to_string(),
-        );
+        args.push(resolved_effort.to_string());
 
         // Add native Agent Teams CLI flags.
         // All agents (including the supervisor) get --teammate-mode tmux
@@ -257,6 +255,7 @@ impl PtyConfig {
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
+        _effort: Option<&str>,
         _teams: Option<&TeamsSpawnConfig>,
     ) -> Self {
         // Native Agent Teams is Claude Code-only; Codex CLI does not support it.
@@ -805,8 +804,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         assert_eq!(config.command, "claude");
         assert!(
@@ -840,8 +840,9 @@ mod tests {
             Some(&cas_root),
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         assert!(
             config
@@ -860,8 +861,9 @@ mod tests {
             None,
             Some("test-supervisor"),
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         assert!(
             config
@@ -880,8 +882,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         assert!(
             config
@@ -901,7 +904,8 @@ mod tests {
             None,
             None,
             Some("claude-opus-4-6"),
-            None,
+            None,  // effort
+            None,  // teams
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"claude-opus-4-6".to_string()));
@@ -916,8 +920,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         assert!(!config.args.contains(&"--model".to_string()));
     }
@@ -932,7 +937,8 @@ mod tests {
             None,
             None,
             Some("gpt-5.3-codex"),
-            None,
+            None,  // effort
+            None,  // teams
         );
         assert!(config.args.contains(&"--model".to_string()));
         assert!(config.args.contains(&"gpt-5.3-codex".to_string()));
@@ -947,8 +953,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         let all_args = config.args.join(" ");
         assert!(
@@ -966,8 +973,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            None,  // model
+            None,  // effort
+            None,  // teams
         );
         let all_args = config.args.join(" ");
         assert!(
@@ -995,7 +1003,8 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None,  // model
+            None,  // effort
             Some(&teams),
         );
         assert!(config.args.contains(&"--team-name".to_string()));
@@ -1044,10 +1053,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_pty_config_claude_supervisor_default_effort() {
-        // When effort is None and role is supervisor, must default to "high"
+        // When effort is None and role is supervisor, must default to "xhigh"
         let config = PtyConfig::claude(
             "sup",
             "supervisor",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            None,  // no effort — should fall back to "xhigh"
+            None,  // teams
+        );
+        let effort_idx = config
+            .args
+            .iter()
+            .position(|a| a == "--effort")
+            .expect("--effort must be present");
+        assert_eq!(config.args[effort_idx + 1], "xhigh");
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_claude_worker_default_effort() {
+        // When effort is None and role is worker, must default to "high"
+        let config = PtyConfig::claude(
+            "wrk",
+            "worker",
             PathBuf::from("/tmp"),
             None,
             None,
@@ -1062,28 +1093,6 @@ mod tests {
             .position(|a| a == "--effort")
             .expect("--effort must be present");
         assert_eq!(config.args[effort_idx + 1], "high");
-    }
-
-    #[tokio::test]
-    async fn test_pty_config_claude_worker_default_effort() {
-        // When effort is None and role is worker, must default to "medium"
-        let config = PtyConfig::claude(
-            "wrk",
-            "worker",
-            PathBuf::from("/tmp"),
-            None,
-            None,
-            None,
-            None,  // model
-            None,  // no effort — should fall back to "medium"
-            None,  // teams
-        );
-        let effort_idx = config
-            .args
-            .iter()
-            .position(|a| a == "--effort")
-            .expect("--effort must be present");
-        assert_eq!(config.args[effort_idx + 1], "medium");
     }
 
     #[tokio::test]
@@ -1105,7 +1114,8 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None,  // model
+            None,  // effort
             Some(&teams),
         );
         // Lead also gets --teammate-mode so it polls its inbox

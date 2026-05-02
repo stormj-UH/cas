@@ -894,6 +894,8 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         worker_cli: preflight.worker_cli,
         supervisor_model: llm.model_for_role("supervisor").map(String::from),
         worker_model: llm.model_for_role("worker").map(String::from),
+        supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
+        worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
         enable_worktrees: preflight.enable_worktrees,
         worktree_root: args.worktree_root.clone(),
         notify: notify_config,

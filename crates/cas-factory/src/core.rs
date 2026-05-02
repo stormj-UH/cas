@@ -134,6 +134,7 @@ impl FactoryCore {
         // Create mux with no panes initially
         let mut mux = Mux::new(rows, cols);
         mux.set_worker_cli(config.worker_cli);
+        mux.set_worker_effort(config.worker_effort.clone());
 
         // Initialize recording if enabled
         let recording = if config.record {
@@ -203,6 +204,7 @@ impl FactoryCore {
             self.config.worker_cli,
             &self.worker_names,
             self.config.supervisor_model.as_deref(),
+            self.config.supervisor_effort.as_deref(),
             None, // teams: cas-factory doesn't use native Agent Teams yet
         )
         .map_err(|e| FactoryError::Mux(e.to_string()))?;
@@ -461,6 +463,8 @@ mod tests {
             worker_cli: cas_mux::SupervisorCli::Claude,
             supervisor_model: None,
             worker_model: None,
+            supervisor_effort: None,
+            worker_effort: None,
             enable_worktrees: false,
             worktree_root: None,
             notify: Default::default(),

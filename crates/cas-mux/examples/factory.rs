@@ -33,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
         worker_cli: SupervisorCli::Claude,
         supervisor_model: None,
         worker_model: None,
+        supervisor_effort: None,
+        worker_effort: None,
         include_director: false, // No director for this demo
         rows: 24,
         cols: 120,

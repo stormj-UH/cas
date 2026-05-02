@@ -88,6 +88,8 @@ pub(super) fn execute_daemon(
         worker_cli,
         supervisor_model: llm.model_for_role("supervisor").map(String::from),
         worker_model: llm.model_for_role("worker").map(String::from),
+        supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
+        worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
         enable_worktrees: !no_worktrees,
         worktree_root,
         notify: NotifyConfig {

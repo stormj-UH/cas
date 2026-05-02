@@ -330,6 +330,8 @@ impl DaemonInitPhase {
             worker_cli: self.factory_config.worker_cli,
             supervisor_model: self.factory_config.supervisor_model.clone(),
             worker_model: self.factory_config.worker_model.clone(),
+            supervisor_effort: self.factory_config.supervisor_effort.clone(),
+            worker_effort: self.factory_config.worker_effort.clone(),
             include_director: false,
             rows,
             cols,
