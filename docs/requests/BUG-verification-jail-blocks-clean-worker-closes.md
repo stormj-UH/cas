@@ -23,7 +23,7 @@ The cas-worker recovery guidance explicitly tells the worker NOT to spawn a task
 3. Manually close + merge
 4. Reply to the worker confirming the close
 
-This is **fully repeatable** and creates supervisor toil that the worker-side close should be able to handle on its own. The pattern occurred **12 times across all 4 workers in a single 2-hour factory session** (gabber-studio, 2026-05-03 PM, EPICs cas-2dfa + cas-0c8b):
+This is **fully repeatable** and creates supervisor toil that the worker-side close should be able to handle on its own. The pattern occurred **11 times across all 4 workers in a single ~3-hour factory session** (gabber-studio, 2026-05-03 PM, EPICs cas-2dfa + cas-0c8b):
 
 | Worker | Task | Epic | Outcome |
 |---|---|---|---|
@@ -35,14 +35,19 @@ This is **fully repeatable** and creates supervisor toil that the worker-side cl
 | noble-falcon-40 | cas-5556 (I4 — public audit viewer) | cas-2dfa | jail-blocked → forwarded → supervisor verified+closed+merged |
 | noble-falcon-40 | cas-789a (I5 — completion SMS) | cas-2dfa | jail-blocked → forwarded → supervisor verified+closed+merged |
 | noble-newt-22 | cas-8f6a (I8 — credit gate on capture) | cas-2dfa | jail-blocked → forwarded → supervisor verified+closed+merged |
-| noble-newt-22 | cas-9b87 | (per supervisor report) | jail-blocked → forwarded → supervisor verified+closed+merged |
 | noble-newt-22 | cas-e2b0 (I9 — sms-responder constants) | cas-2dfa | jail-blocked → forwarded → supervisor verified+closed+merged |
-| witty-marten-42 | cas-9791 (B2 — invoice.paid grant fix) | cas-0c8b | jail-blocked → forwarded → supervisor verified+closed+merged |
-| witty-marten-42 | cas-17de (B10 — free_trial grant fix) | cas-0c8b | jail-blocked → forwarded → supervisor verified+closed+merged |
+| witty-marten-42 | cas-9b87 | cas-0c8b | jail-blocked → forwarded → supervisor verified+closed+merged |
+| witty-marten-42 | cas-35fd | cas-0c8b | jail-blocked → forwarded → supervisor verified+closed+merged |
 
-**Every close required supervisor intervention.** The work was clean each time — the verification step itself approved it without any P0 corrections needed. **Zero of the 12 closes had a legitimate gating reason.** The jail is firing as a default-on policy on tasks that should never have hit it.
+**Per-worker breakdown:** ready-finch-99 ×5, noble-falcon-40 ×2, noble-newt-22 ×2, witty-marten-42 ×2.
 
-The toil scales linearly with worker output: a 4-worker session produces N×forwards + N×manual verifies + N×ack messages where N is the supervisor's task throughput, multiplying the supervisor's time-to-close per task by ~5×. With 12 closes in this session, that's ≈30 minutes of supervisor toil that didn't need to happen.
+**Every close required supervisor intervention.** The work was clean each time — the verification step itself approved it without any P0 corrections needed. **Zero of the 11 closes had a legitimate gating reason.** The jail is firing as a default-on policy on tasks that should never have hit it.
+
+The toil scales linearly with worker output: a 4-worker session produces N×forwards + N×manual verifies + N×ack messages where N is the supervisor's task throughput, multiplying the supervisor's time-to-close per task by ~5×. With 11 closes in this session, that's ≈30 minutes of supervisor toil that didn't need to happen.
+
+### Sibling concern (out of scope for this report)
+
+Two other tasks in the same session (cas-9791 invoice.paid grant fix, cas-17de free_trial grant fix — both witty-marten-42) hit a **different** close gate: `MERGE_REQUIRED: factory/<branch> has N commits not on epic/<branch>`. That guard explicitly says "cannot be bypassed" — different mechanism from verification-jail (which CAN be bypassed via `bypass_code_review=true`). The merge gate is arguably acting more correctly (it forces actual data-state convergence) while the verification-jail blocks on a self-fulfilling prophecy (the close requires verification but won't accept the worker's own ReviewOutcome JSON). **This report is scoped to the verification-jail behavior only; the merge-gate may warrant a separate report or may turn out to be a positive design choice we just don't appreciate yet.**
 
 ## Environment
 
@@ -114,9 +119,9 @@ If `code_review_findings` arrives with `residual.findings.severity ∉ {P0}`, tr
 
 ## Severity rationale
 
-**Bumped to P1 (was P2 in initial filing) on the strength of the 12-instance dataset.** Not data-loss, not blocking work indefinitely (workaround exists), but the failure rate is **100% on clean closes** in a 4-worker, 2-hour session — the workaround IS the workflow at this point. The supervisor toil:
+**Bumped to P1 (was P2 in initial filing) on the strength of the 11-instance dataset.** Not data-loss, not blocking work indefinitely (workaround exists), but the failure rate is **100% on clean closes** in a 4-worker, ~3-hour session — the workaround IS the workflow at this point. The supervisor toil:
 
-- **Linear scaling:** 1 forward + 1 manual verify + 1 ack message per worker close. 12 closes in this session = ≈36 messages exchanged, ≈30 min of supervisor wall-clock that should have been zero.
+- **Linear scaling:** 1 forward + 1 manual verify + 1 ack message per worker close. 11 closes in this session = ≈33 messages exchanged, ≈30 min of supervisor wall-clock that should have been zero.
 - **Stalls parallelism:** while supervisor is verifying worker A's close, workers B/C/D are sitting on their own jail-blocked closes waiting their turn.
 - **Confidence cost:** workers re-receive their own task assignments via the director (message-lag pattern, see msg-lag entries in this session) because the system thinks the task is still in-progress. Twice in this session a worker had to rebuild context to confirm "yes, I already shipped this; the close is just stuck."
 - **Misleading error guidance:** the error message tells workers to spawn `task-verifier` themselves, but the cas-worker skill documentation explicitly bars that path. New workers will burn time trying to follow the error literally before discovering the recovery doc.
@@ -126,4 +131,4 @@ If `code_review_findings` arrives with `residual.findings.severity ∉ {P0}`, tr
 - Worker recovery doc: `cas-worker/references/recovery.md` (the "Forward once, then trust the DB" guidance)
 - Sister `task-verifier` agent definition: marked "Internal agent ... Do not invoke directly" — confirms the error message's suggested workaround is wrong
 - Affected session messages from `ready-finch-99`: 1106 (cas-c52c), 1118 (cas-e531), 1131 (cas-6532), 1140 (cas-db7a), 1166 (cas-894f) — all forwarded close blockers
-- Cross-worker close blocks confirmed by supervisor `mighty-puma-25` for: `noble-falcon-40` (cas-5556, cas-789a), `noble-newt-22` (cas-8f6a, cas-9b87, cas-e2b0), `witty-marten-42` (cas-9791, cas-17de) — same session, same pattern, every worker
+- Cross-worker close blocks confirmed by supervisor `mighty-puma-25` for: `noble-falcon-40` (cas-5556, cas-789a), `noble-newt-22` (cas-8f6a, cas-e2b0), `witty-marten-42` (cas-9b87, cas-35fd) — same session, same pattern, every worker
