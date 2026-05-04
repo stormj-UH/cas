@@ -1827,9 +1827,16 @@ async fn test_factory_worker_close_hits_narrowed_jail() {
         msg.contains("VERIFICATION_JAIL_BLOCKED"),
         "narrowed jail must return VERIFICATION_JAIL_BLOCKED, got: {msg}"
     );
+    // cas-778a: factory workers cannot spawn task-verifier themselves.
+    // The jail error for factory workers must recommend forwarding to supervisor
+    // via mcp__cas__coordination, NOT the Task() spawn syntax.
     assert!(
-        msg.contains("Task(subagent_type=\"task-verifier\""),
-        "jail error must include explicit Task() spawn syntax, got: {msg}"
+        msg.contains("mcp__cas__coordination"),
+        "factory worker jail error must recommend mcp__cas__coordination, got: {msg}"
+    );
+    assert!(
+        !msg.contains("Task(subagent_type=\"task-verifier\""),
+        "factory worker jail error must NOT instruct spawning task-verifier (workers can't), got: {msg}"
     );
 }
 
@@ -2535,5 +2542,298 @@ async fn test_verification_add_supervisor_active_assignee_error_message() {
     assert!(
         row.is_none(),
         "rejected verification.add must NOT persist a verification row: {row:?}"
+    );
+}
+
+// =============================================================================
+// cas-778a: Worker-owned verification via clean ReviewOutcome envelope
+//
+// Factory workers call cas-code-review (mode=autofix) before closing. The
+// resulting ReviewOutcome envelope is the worker's verification step. When the
+// envelope is structurally valid and has no P0 in residual or pre_existing,
+// close_ops should short-circuit the verification gate and write a Skipped row
+// instead of arming the jail (pending_verification=true). Tests go through
+// service.cas_task_close directly (bypassing the MCP jail) to isolate close_ops
+// behavior.
+// =============================================================================
+
+/// A valid ReviewOutcome JSON with empty residual — what a clean cas-code-review
+/// run returns after the autofix loop resolves every finding.
+const CLEAN_ENVELOPE: &str = r#"{"residual":[],"pre_existing":[],"mode":"autofix"}"#;
+
+/// A ReviewOutcome JSON with a P0 finding in residual — the autofix loop could
+/// not resolve a blocker. The verification gate must still arm the jail.
+const P0_RESIDUAL_ENVELOPE: &str = r#"{
+    "residual": [{
+        "title": "Critical security vulnerability",
+        "severity": "P0",
+        "file": "src/foo.rs",
+        "line": 1,
+        "why_it_matters": "Allows authentication bypass on the close path",
+        "autofix_class": "manual",
+        "owner": "human",
+        "confidence": 0.95,
+        "evidence": ["unsafe { std::mem::transmute(user_id) }"],
+        "pre_existing": false
+    }],
+    "pre_existing": [],
+    "mode": "autofix"
+}"#;
+
+/// cas-778a AC1: factory worker calling cas_task_close with a structurally
+/// valid, empty-residual envelope closes successfully without the verification
+/// jail being armed.
+///
+/// Specifically:
+/// - The close returns "Closed task:" (not "VERIFICATION REQUIRED")
+/// - task.pending_verification is false (jail NOT armed)
+/// - A Verification row with status=Skipped and the expected summary is written
+/// - The task status is Closed
+#[tokio::test]
+async fn test_worker_close_with_clean_review_envelope_proceeds() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let _env = FactoryWorkerEnv::enter();
+
+    // Create a task.
+    let req = TaskCreateRequest {
+        title: "cas-778a: worker-owned verification happy path".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    );
+    let id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    // Start the task (sets InProgress + active lease).
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // Close with a clean ReviewOutcome envelope. The verification gate
+    // should short-circuit, write a Skipped row, and proceed with close.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("All acceptance criteria met. cas-code-review autofix returned clean envelope.".to_string()),
+        bypass_code_review: None,
+        code_review_findings: Some(CLEAN_ENVELOPE.to_string()),
+    };
+    let result = service
+        .cas_task_close(Parameters(close_req))
+        .await
+        .expect("task_close should return a result");
+    let text = extract_text(result);
+
+    assert!(
+        text.contains("Closed task:"),
+        "close with clean envelope must succeed: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "clean envelope must not trigger VERIFICATION REQUIRED: {text}"
+    );
+
+    // Jail must NOT have been armed.
+    let task = task_store.get(&id).expect("task should exist");
+    assert!(
+        !task.pending_verification,
+        "pending_verification must be false — jail must not be armed for clean envelope"
+    );
+    assert_eq!(
+        task.status,
+        cas::types::TaskStatus::Closed,
+        "task must be Closed after worker-owned verification close"
+    );
+
+    // A Skipped verification row must have been written for the audit trail.
+    let ver = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification store lookup should succeed")
+        .expect("a Skipped verification row must exist after worker-owned verification close");
+    assert_eq!(
+        ver.status,
+        cas::types::VerificationStatus::Skipped,
+        "verification row status must be Skipped, got: {:?}",
+        ver.status
+    );
+    assert!(
+        ver.summary.contains("Worker-owned verification"),
+        "Skipped row summary must mention 'Worker-owned verification': {}",
+        ver.summary
+    );
+}
+
+/// cas-778a AC2: factory worker close with a P0 in residual is NOT short-
+/// circuited — the verification gate must still arm the jail and return
+/// VERIFICATION REQUIRED, just as before the fix.
+#[tokio::test]
+async fn test_worker_close_with_p0_residual_still_blocked() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let _env = FactoryWorkerEnv::enter();
+
+    let req = TaskCreateRequest {
+        title: "cas-778a: worker P0 residual must still block".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    );
+    let id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // Close with an envelope that has a P0 in residual. The gate must
+    // NOT short-circuit — verification is required.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("Done (but has P0 issue)".to_string()),
+        bypass_code_review: None,
+        code_review_findings: Some(P0_RESIDUAL_ENVELOPE.to_string()),
+    };
+    let result = service
+        .cas_task_close(Parameters(close_req))
+        .await
+        .expect("task_close should return a result");
+    let text = extract_text(result);
+
+    assert!(
+        text.contains("VERIFICATION REQUIRED"),
+        "P0-in-residual envelope must still require verification: {text}"
+    );
+    assert!(
+        !text.contains("Closed task:"),
+        "close with P0 envelope must NOT succeed: {text}"
+    );
+
+    // Jail must be armed (pending_verification=true).
+    let task = task_store.get(&id).expect("task should exist");
+    assert!(
+        task.pending_verification,
+        "pending_verification must be true — jail must be armed for P0 envelope"
+    );
+    assert_ne!(
+        task.status,
+        cas::types::TaskStatus::Closed,
+        "task must NOT be Closed when verification is required"
+    );
+}
+
+/// cas-778a AC3: factory worker close with a malformed (non-JSON) envelope is
+/// NOT short-circuited — the verification gate must still arm the jail.
+#[tokio::test]
+async fn test_worker_close_with_malformed_envelope_still_blocked() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let _env = FactoryWorkerEnv::enter();
+
+    let req = TaskCreateRequest {
+        title: "cas-778a: worker malformed envelope must still block".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    );
+    let id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // Close with malformed JSON. The gate must NOT short-circuit.
+    let close_req = TaskCloseRequest {
+        id: id.clone(),
+        reason: Some("Done (but envelope is garbage)".to_string()),
+        bypass_code_review: None,
+        code_review_findings: Some("{not valid json at all".to_string()),
+    };
+    let result = service
+        .cas_task_close(Parameters(close_req))
+        .await
+        .expect("task_close should return a result");
+    let text = extract_text(result);
+
+    assert!(
+        text.contains("VERIFICATION REQUIRED"),
+        "malformed envelope must still require verification: {text}"
+    );
+    assert!(
+        !text.contains("Closed task:"),
+        "close with malformed envelope must NOT succeed: {text}"
+    );
+
+    // Jail must be armed.
+    let task = task_store.get(&id).expect("task should exist");
+    assert!(
+        task.pending_verification,
+        "pending_verification must be true — jail must be armed for malformed envelope"
+    );
+    assert_ne!(
+        task.status,
+        cas::types::TaskStatus::Closed,
+        "task must NOT be Closed when verification is required"
     );
 }

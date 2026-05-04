@@ -478,162 +478,256 @@ impl CasCore {
                         )));
                     }
                     Ok(None) | Ok(Some(_)) => {
-                        // No verification or pending/error status
-                        // Only auto-claim if the closing agent is the task's assignee.
-                        // If a supervisor closes a worker's task, skip the lease to avoid
-                        // locking the task to the supervisor.
-                        let is_assignee = self
-                            .get_agent_id()
-                            .ok()
-                            .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
-                            .unwrap_or(false);
-                        if is_assignee {
-                            self.auto_claim_for_verification(&req.id, task_store.as_ref())?;
-                        }
+                        // No verification or pending/error status.
+                        //
+                        // cas-778a: factory-worker-owned verification short-circuit.
+                        // If the factory worker provides a structurally valid
+                        // ReviewOutcome envelope with no P0 in residual or
+                        // pre_existing, the cas-code-review autofix pipeline IS the
+                        // worker's verification step. Skip task-verifier dispatch —
+                        // write a Skipped row for the audit trail and fall through
+                        // to let the close proceed. The downstream code_review_gate
+                        // (below) independently re-validates the envelope, so the
+                        // predicate is enforced twice. Workers without a clean
+                        // envelope (or without any envelope) continue to the
+                        // existing jail-arming path below.
+                        let worker_owns_verification = is_factory_worker
+                            && req
+                                .code_review_findings
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .is_some_and(worker_review_envelope_is_clean);
 
-                        // Set pending_verification flag to enable verification jail
-                        let mut task_to_update = task.clone();
-                        task_to_update.pending_verification = true;
-                        if task_to_update.assignee.is_none() {
-                            if let Ok(agent_id) = self.get_agent_id() {
-                                task_to_update.assignee = Some(agent_id);
+                        if worker_owns_verification {
+                            // Persist the envelope to task deliverables so the
+                            // downstream code_review_gate can re-validate it
+                            // independently (second-line defence).
+                            if let Some(envelope) = req
+                                .code_review_findings
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                let mut task_to_update = task.clone();
+                                task_to_update.deliverables.review_envelope =
+                                    Some(envelope.to_string());
+                                task_to_update.updated_at = chrono::Utc::now();
+                                if let Err(e) = task_store.update(&task_to_update) {
+                                    tracing::warn!(
+                                        task_id = %req.id,
+                                        error = %e,
+                                        "failed to persist review envelope on worker self-verify"
+                                    );
+                                }
                             }
-                        }
-                        // cas-3086: persist the worker's ReviewOutcome envelope on
-                        // the task deliverables so a subsequent supervisor close
-                        // (once verification approves) can forward the prior review
-                        // receipt into the P0 gate instead of re-running the
-                        // multi-persona reviewer or requiring `bypass_code_review`.
-                        // We persist only non-empty envelopes; validation happens
-                        // later in `run_code_review_gate`, which rejects malformed
-                        // persisted envelopes so bad input cannot silently bypass
-                        // the gate.
-                        if let Some(envelope) = req
-                            .code_review_findings
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            task_to_update.deliverables.review_envelope =
-                                Some(envelope.to_string());
-                        }
-                        task_to_update.updated_at = chrono::Utc::now();
-                        if let Err(e) = task_store.update(&task_to_update) {
-                            tracing::warn!(task_id = %req.id, error = %e, "failed to set pending_verification on task");
-                        }
-
-                        // Include close reason in the message so verifier can check it
-                        let close_reason_section = if let Some(ref reason) = req.reason {
-                            format!(
-                                "\n\n## Proposed Close Reason\n\
-                                ```\n{reason}\n```\n\n\
-                                IMPORTANT: The {verifier_agent} MUST validate this close reason.\n\
-                                Reject if it admits incomplete work (e.g., 'remaining items', 'beyond scope', 'will need to')."
-                            )
-                        } else {
-                            String::new()
-                        };
-
-                        let verification_desc = if is_epic {
-                            "Epic verification runs on master to verify the complete merged implementation.\n\
-                            The agent will check that all subtask implementations integrate correctly.\n\
-                            The verifier MUST record verification_type=epic."
-                        } else {
-                            "The agent will check for TODO comments, stubs, incomplete implementations,\n\
-                            AND validate the close reason doesn't admit incomplete work."
-                        };
-
-                        // Send verification blocked activity event (for supervisor visibility)
-                        if let Ok(agent_id) = self.get_agent_id() {
-                            let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
-                                session_id: agent_id,
-                                event_type: "worker_verification_blocked".to_string(),
-                                description: format!("Awaiting verification: {}", req.id),
-                                entity_id: Some(req.id.clone()),
-                            };
-                            let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
-                        }
-
-                        // Persist a durable dispatch-request row so the close
-                        // attempt is observable (in tests, in the UI, and in
-                        // audit trails) instead of fire-and-forget text. The
-                        // task-verifier subagent will later write its verdict
-                        // as a newer row; get_latest_for_task returns the
-                        // newest, so behavior on retry is unchanged. Only
-                        // create the row on the first attempt — don't
-                        // duplicate on repeated close calls.
-                        if !had_prior_verification {
+                            // Write a Skipped verification row for the audit trail
+                            // so the bypass reason is permanently recorded and the
+                            // MCP jail's check_pending_verification sees a
+                            // satisfying row on any retry.
                             if let Ok(ver_id) = verification_store.generate_id() {
-                                let mut dispatch_row =
-                                    Verification::new(ver_id, req.id.clone());
-                                dispatch_row.verification_type = verification_type;
-                                dispatch_row.status = VerificationStatus::Error;
+                                let mut skipped_row =
+                                    Verification::skipped(
+                                        ver_id,
+                                        req.id.clone(),
+                                        "Worker-owned verification: cas-code-review autofix \
+                                         returned clean ReviewOutcome envelope"
+                                            .to_string(),
+                                    );
+                                skipped_row.verification_type = verification_type;
                                 if let Ok(agent_id) = self.get_agent_id() {
-                                    dispatch_row.agent_id = Some(agent_id);
+                                    skipped_row.agent_id = Some(agent_id);
                                 }
-                                dispatch_row.summary = format!(
-                                    "Dispatch requested — task-verifier subagent must be spawned via \
-                                     Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\"). \
-                                     This row will be superseded by the subagent's verdict.",
-                                    req.id
-                                );
-                                if let Err(e) = verification_store.add(&dispatch_row) {
-                                    tracing::warn!(task_id = %req.id, error = %e, "failed to persist verification dispatch row");
+                                if let Err(e) = verification_store.add(&skipped_row) {
+                                    tracing::warn!(
+                                        task_id = %req.id,
+                                        error = %e,
+                                        "failed to persist worker-owned verification Skipped row"
+                                    );
                                 }
                             }
-                        }
-
-                        let verification_gate = if is_factory_worker {
-                            format!(
-                                "🔒 Factory worker verification gate: this close will only succeed after a task-verifier records a verdict.\n\n\
-                                 Spawn the verifier now (other tools remain available while it runs):\n\n\
-                                 Task(subagent_type=\"{}\", prompt=\"Verify task {}\")",
-                                verifier_agent, req.id
-                            )
-                        } else if supervisor_is_assignee {
-                            format!(
-                                "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
-                                 Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
-                                 Or record verification directly:\n\
-                                 mcp__cas__verification action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
-                                verifier_agent, req.id, req.id
-                            )
+                            // Emit activity event for supervisor visibility.
+                            if let Ok(agent_id) = self.get_agent_id() {
+                                let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                    session_id: agent_id,
+                                    event_type: "worker_verification_self_certified".to_string(),
+                                    description: format!(
+                                        "Worker-owned verification passed: {}",
+                                        req.id
+                                    ),
+                                    entity_id: Some(req.id.clone()),
+                                };
+                                let _ =
+                                    crate::mcp::socket::send_event(&self.cas_root, &event);
+                            }
+                            // Fall through — do NOT arm jail, do NOT return error.
                         } else {
-                            format!(
-                                "🔒 VERIFICATION JAIL ACTIVE: You cannot use other tools until you verify this task.\n\n\
-                                 Use the Task tool to spawn a task-verifier subagent: \
-                                 Task(subagent_type=\"{}\", prompt=\"Verify task {}\")",
-                                verifier_agent, req.id
-                            )
-                        };
+                            // No clean envelope from a factory worker: proceed with
+                            // the standard verification-jail path.
 
-                        return Ok(Self::tool_error(format!(
-                            "⚠️ VERIFICATION REQUIRED\n\n\
-                            Task {} requires verification before closing.\n\n\
-                            {}{}\n\n\
-                            {}{}\n\n\
-                            {}",
-                            req.id,
-                            verification_gate,
-                            verification_desc,
-                            close_reason_section.as_str(),
-                            if is_worker_without_subagents {
+                            // Only auto-claim if the closing agent is the task's assignee.
+                            // If a supervisor closes a worker's task, skip the lease to avoid
+                            // locking the task to the supervisor.
+                            let is_assignee = self
+                                .get_agent_id()
+                                .ok()
+                                .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
+                                .unwrap_or(false);
+                            if is_assignee {
+                                self.auto_claim_for_verification(
+                                    &req.id,
+                                    task_store.as_ref(),
+                                )?;
+                            }
+
+                            // Set pending_verification flag to enable verification jail
+                            let mut task_to_update = task.clone();
+                            task_to_update.pending_verification = true;
+                            if task_to_update.assignee.is_none() {
+                                if let Ok(agent_id) = self.get_agent_id() {
+                                    task_to_update.assignee = Some(agent_id);
+                                }
+                            }
+                            // cas-3086: persist the worker's ReviewOutcome envelope on
+                            // the task deliverables so a subsequent supervisor close
+                            // (once verification approves) can forward the prior review
+                            // receipt into the P0 gate instead of re-running the
+                            // multi-persona reviewer or requiring `bypass_code_review`.
+                            // We persist only non-empty envelopes; validation happens
+                            // later in `run_code_review_gate`, which rejects malformed
+                            // persisted envelopes so bad input cannot silently bypass
+                            // the gate.
+                            if let Some(envelope) = req
+                                .code_review_findings
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                task_to_update.deliverables.review_envelope =
+                                    Some(envelope.to_string());
+                            }
+                            task_to_update.updated_at = chrono::Utc::now();
+                            if let Err(e) = task_store.update(&task_to_update) {
+                                tracing::warn!(task_id = %req.id, error = %e, "failed to set pending_verification on task");
+                            }
+
+                            // Include close reason in the message so verifier can check it
+                            let close_reason_section = if let Some(ref reason) = req.reason {
                                 format!(
-                                    "Ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close task {} on your behalf.",
-                                    req.id
+                                    "\n\n## Proposed Close Reason\n\
+                                    ```\n{reason}\n```\n\n\
+                                    IMPORTANT: The {verifier_agent} MUST validate this close reason.\n\
+                                    Reject if it admits incomplete work (e.g., 'remaining items', 'beyond scope', 'will need to')."
                                 )
                             } else {
                                 String::new()
-                            },
-                            if is_worker_without_subagents {
+                            };
+
+                            let verification_desc = if is_epic {
+                                "Epic verification runs on master to verify the complete merged implementation.\n\
+                                The agent will check that all subtask implementations integrate correctly.\n\
+                                The verifier MUST record verification_type=epic."
+                            } else {
+                                "The agent will check for TODO comments, stubs, incomplete implementations,\n\
+                                AND validate the close reason doesn't admit incomplete work."
+                            };
+
+                            // Send verification blocked activity event (for supervisor visibility)
+                            if let Ok(agent_id) = self.get_agent_id() {
+                                let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                    session_id: agent_id,
+                                    event_type: "worker_verification_blocked".to_string(),
+                                    description: format!("Awaiting verification: {}", req.id),
+                                    entity_id: Some(req.id.clone()),
+                                };
+                                let _ =
+                                    crate::mcp::socket::send_event(&self.cas_root, &event);
+                            }
+
+                            // Persist a durable dispatch-request row so the close
+                            // attempt is observable (in tests, in the UI, and in
+                            // audit trails) instead of fire-and-forget text. The
+                            // task-verifier subagent will later write its verdict
+                            // as a newer row; get_latest_for_task returns the
+                            // newest, so behavior on retry is unchanged. Only
+                            // create the row on the first attempt — don't
+                            // duplicate on repeated close calls.
+                            if !had_prior_verification {
+                                if let Ok(ver_id) = verification_store.generate_id() {
+                                    let mut dispatch_row =
+                                        Verification::new(ver_id, req.id.clone());
+                                    dispatch_row.verification_type = verification_type;
+                                    dispatch_row.status = VerificationStatus::Error;
+                                    if let Ok(agent_id) = self.get_agent_id() {
+                                        dispatch_row.agent_id = Some(agent_id);
+                                    }
+                                    dispatch_row.summary = format!(
+                                        "Dispatch requested — task-verifier subagent must be spawned via \
+                                         Task(subagent_type=\"task-verifier\", prompt=\"Verify task {}\"). \
+                                         This row will be superseded by the subagent's verdict.",
+                                        req.id
+                                    );
+                                    if let Err(e) = verification_store.add(&dispatch_row) {
+                                        tracing::warn!(task_id = %req.id, error = %e, "failed to persist verification dispatch row");
+                                    }
+                                }
+                            }
+
+                            let verification_gate = if is_factory_worker {
                                 format!(
-                                    "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct mcp__cas__verification) and close it if approved.\"",
-                                    req.id
+                                    "🔒 Factory worker verification gate: this close will only succeed after a task-verifier records a verdict.\n\n\
+                                     Forward to supervisor (workers cannot spawn task-verifier directly):\n\n\
+                                     mcp__cas__coordination action=message target=supervisor \
+                                     summary=\"Ready to close {id}\" \
+                                     message=\"Task {id} is ready to close. Please verify and close on my behalf.\"",
+                                    id = req.id
+                                )
+                            } else if supervisor_is_assignee {
+                                format!(
+                                    "You implemented this task yourself. Spawn a task-verifier to review your work:\n\n\
+                                     Task(subagent_type=\"{}\", prompt=\"Verify task {}\")\n\n\
+                                     Or record verification directly:\n\
+                                     mcp__cas__verification action=add task_id={} status=approved summary=\"Self-verified: <reason>\"",
+                                    verifier_agent, req.id, req.id
                                 )
                             } else {
-                                "After verification passes, call cas_task_close again.".to_string()
-                            }
-                        )));
+                                format!(
+                                    "🔒 VERIFICATION JAIL ACTIVE: You cannot use other tools until you verify this task.\n\n\
+                                     Use the Task tool to spawn a task-verifier subagent: \
+                                     Task(subagent_type=\"{}\", prompt=\"Verify task {}\")",
+                                    verifier_agent, req.id
+                                )
+                            };
+
+                            return Ok(Self::tool_error(format!(
+                                "⚠️ VERIFICATION REQUIRED\n\n\
+                                Task {} requires verification before closing.\n\n\
+                                {}{}\n\n\
+                                {}{}\n\n\
+                                {}",
+                                req.id,
+                                verification_gate,
+                                verification_desc,
+                                close_reason_section.as_str(),
+                                if is_worker_without_subagents {
+                                    format!(
+                                        "Ask supervisor to run verification (task-verifier or direct mcp__cas__verification) and close task {} on your behalf.",
+                                        req.id
+                                    )
+                                } else {
+                                    String::new()
+                                },
+                                if is_worker_without_subagents {
+                                    format!(
+                                        "Suggested message: mcp__cas__coordination action=message target=supervisor message=\"Please verify task {} (task-verifier or direct mcp__cas__verification) and close it if approved.\"",
+                                        req.id
+                                    )
+                                } else {
+                                    "After verification passes, call cas_task_close again."
+                                        .to_string()
+                                }
+                            )));
+                        }
                     }
                     Err(_) => {
                         // Verification store error, proceed anyway
@@ -1861,8 +1955,46 @@ pub(crate) fn run_epic_close_merge_gate(
 }
 
 // ---------------------------------------------------------------------------
-// cas-3086 + cas-fef4: epic subtask receipts bypass helper
+// cas-778a + cas-3086 + cas-fef4: clean-envelope predicate and epic bypass
 // ---------------------------------------------------------------------------
+
+/// Returns `true` iff `envelope` is a structurally valid, semantically-
+/// validated [`cas_types::ReviewOutcome`] with:
+///   * no PR-introduced P0 in `residual` (cas-3086), and
+///   * no P0 reclassified into `pre_existing` (cas-fef4 forgery defence).
+///
+/// Used in two call sites:
+///   1. The factory-worker-owned verification short-circuit in
+///      `cas_task_close` (cas-778a): before arming the verification jail,
+///      check whether the worker supplied a clean envelope; if so, write a
+///      `Skipped` row and let the close proceed without task-verifier
+///      dispatch.
+///   2. [`epic_subtask_receipts_are_clean`]: the epic-level bypass that
+///      skips the union-diff multi-persona gate when every subtask already
+///      holds a clean per-task receipt.
+///
+/// Keeping both call sites on the same predicate ensures they evolve
+/// together — a tightening here (e.g., adding a SHA-anchor staleness
+/// check) automatically applies to both.
+pub(crate) fn worker_review_envelope_is_clean(envelope: &str) -> bool {
+    use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
+    use cas_types::FindingSeverity;
+
+    let Ok(outcome) = serde_json::from_str::<cas_types::ReviewOutcome>(envelope) else {
+        return false;
+    };
+    if outcome.validate().is_err() {
+        return false;
+    }
+    // cas-3086: no PR-introduced P0 in residual.
+    let residual_clean = matches!(evaluate_gate(&outcome.residual), GateDecision::Allow);
+    // cas-fef4: no P0 smuggled through pre_existing.
+    let pre_existing_clean = outcome
+        .pre_existing
+        .iter()
+        .all(|f| f.severity != FindingSeverity::P0);
+    residual_clean && pre_existing_clean
+}
 
 /// Decide whether an epic's subtasks collectively carry clean review
 /// receipts that justify skipping the multi-persona close gate on the
@@ -1870,10 +2002,8 @@ pub(crate) fn run_epic_close_merge_gate(
 ///
 /// Returns `true` iff every subtask:
 ///   * has a non-empty `deliverables.review_envelope`,
-///   * whose JSON deserializes into a [`cas_types::ReviewOutcome`],
-///   * passes `ReviewOutcome::validate()`,
-///   * has **no PR-introduced P0** in `residual` (cas-3086 defense-in-depth), and
-///   * has **no P0 reclassified into `pre_existing`** (cas-fef4 forgery defense).
+///   * that passes [`worker_review_envelope_is_clean`] (deserialises,
+///     validates, no P0 in residual, no P0 in pre_existing).
 ///
 /// Returns `false` when the subtask list is empty — there is nothing to
 /// "cover" the union diff, so fall through to the normal gate.
@@ -1901,9 +2031,6 @@ pub(crate) fn run_epic_close_merge_gate(
 /// commits). That is tracked separately (cas-cc1d staleness follow-up)
 /// and needs a diff-SHA anchor in the envelope schema to close cleanly.
 pub(crate) fn epic_subtask_receipts_are_clean(subtasks: &[Task]) -> bool {
-    use cas_store::code_review::close_gate::{GateDecision, evaluate_gate};
-    use cas_types::FindingSeverity;
-
     if subtasks.is_empty() {
         return false;
     }
@@ -1912,19 +2039,7 @@ pub(crate) fn epic_subtask_receipts_are_clean(subtasks: &[Task]) -> bool {
         t.deliverables
             .review_envelope
             .as_deref()
-            .and_then(|e| serde_json::from_str::<cas_types::ReviewOutcome>(e).ok())
-            .filter(|o| o.validate().is_ok())
-            .map(|o| {
-                // cas-3086: no PR-introduced P0 in residual.
-                let residual_clean =
-                    matches!(evaluate_gate(&o.residual), GateDecision::Allow);
-                // cas-fef4: no P0 smuggled through pre_existing.
-                let pre_existing_clean = o
-                    .pre_existing
-                    .iter()
-                    .all(|f| f.severity != FindingSeverity::P0);
-                residual_clean && pre_existing_clean
-            })
+            .map(worker_review_envelope_is_clean)
             .unwrap_or(false)
     })
 }

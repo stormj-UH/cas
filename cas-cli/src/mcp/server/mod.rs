@@ -674,16 +674,36 @@ impl CasCore {
         };
 
         match self.check_pending_verification(&agent_id)? {
-            Some((task_id, task_title)) => Err(McpError {
-                code: ErrorCode::INVALID_REQUEST,
-                message: Cow::from(format!(
-                    "VERIFICATION_JAIL_BLOCKED: Mutating operation {tool}.{action} blocked. \
-                     Task {task_id} ({task_title}) requires verification before any mutations are allowed. \
-                     Use the Task tool to spawn a task-verifier subagent: \
-                     Task(subagent_type=\"task-verifier\", prompt=\"Verify task {task_id}\")."
-                )),
-                data: None,
-            }),
+            Some((task_id, task_title)) => {
+                // cas-778a: factory workers cannot spawn task-verifier themselves
+                // (it's an internal agent). Give them the correct escalation path
+                // (forward to supervisor) instead of an impossible instruction.
+                // Non-worker callers (supervisors, non-factory contexts) retain
+                // the existing Task() spawn suggestion which is correct for them.
+                let guidance = if is_factory_worker {
+                    format!(
+                        "Forward to supervisor via: \
+                         mcp__cas__coordination action=message target=supervisor \
+                         summary=\"Ready to close {task_id}\" \
+                         message=\"Task {task_id} is ready to close. \
+                         Please verify and close on my behalf.\""
+                    )
+                } else {
+                    format!(
+                        "Use the Task tool to spawn a task-verifier subagent: \
+                         Task(subagent_type=\"task-verifier\", prompt=\"Verify task {task_id}\")."
+                    )
+                };
+                Err(McpError {
+                    code: ErrorCode::INVALID_REQUEST,
+                    message: Cow::from(format!(
+                        "VERIFICATION_JAIL_BLOCKED: Mutating operation {tool}.{action} blocked. \
+                         Task {task_id} ({task_title}) requires verification before any mutations \
+                         are allowed. {guidance}"
+                    )),
+                    data: None,
+                })
+            }
             None => Ok(()),
         }
     }
