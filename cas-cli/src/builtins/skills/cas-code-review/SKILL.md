@@ -132,14 +132,25 @@ With merged findings in hand, branch on `mode`:
 
 In every mode, the output envelope includes the activation decision from Step 2 and a per-persona status table so the caller can tell which reviewers ran, which succeeded, and which errored.
 
+## Review ownership model (cas-b51a)
+
+CAS supports two review ownership modes, configured via `[code_review] owner = "worker" | "supervisor"` in `.cas/config.toml`:
+
+| `owner` | Worker behavior at close | Supervisor responsibility |
+|---|---|---|
+| `worker` (default) | Runs the full `autofix` pipeline inline; close blocks until review completes (~14 min) | None — workers self-certify |
+| `supervisor` | Runs lightweight structural lint (<1s); task transitions to `pending_supervisor_review` | Supervisor runs `/cas-code-review mode=interactive` on queued tasks and delivers findings via coordination message |
+
+The default is `worker` for backwards compatibility. Stage 2 (flip the default to `supervisor`) is a follow-on task.
+
 ## Mode reference
 
 The four invocation modes, per brainstorm R8 + R5 + R9–R11:
 
 | Mode | Trigger | Edits files? | Creates tasks? | Gates close? | Fix loop | Notes |
 |---|---|---|---|---|---|---|
-| `autofix` | Automatic at factory worker `task.close` (primary) | Yes, via fixer sub-agent on `safe_auto` | Yes, residual non-`safe_auto` → CAS tasks with `P0→0…P3→3` | Yes — any P0 hard-blocks; supervisor override required to downgrade | Bounded `max_rounds=2` | R5, R9, R10, R11. This is the primary path; everything else is secondary. |
-| `interactive` | Manual human invocation | Only via fixer if user accepts the offered loop | Only if user accepts | No | Bounded 2-round on user consent | R8. Full UX; show findings, let the human drive. |
+| `autofix` | Automatic at factory worker `task.close` (primary, `owner=worker` only) | Yes, via fixer sub-agent on `safe_auto` | Yes, residual non-`safe_auto` → CAS tasks with `P0→0…P3→3` | Yes — any P0 hard-blocks; supervisor override required to downgrade | Bounded `max_rounds=2` | R5, R9, R10, R11. This is the primary path; everything else is secondary. |
+| `interactive` | Manual human or supervisor invocation; also used by supervisor in `owner=supervisor` mode | Only via fixer if user accepts the offered loop | Only if user accepts | No | Bounded 2-round on user consent | R8. Full UX; show findings, let the human drive. |
 | `report-only` | Manual or scheduled | No | No | No | None | R8. Safe for parallel runs; strictly read-only. |
 | `headless` | Skill-to-skill call | No (orchestrator itself does not edit) | No | No | None | R8. Returns merged envelope as structured text; caller decides next steps. |
 

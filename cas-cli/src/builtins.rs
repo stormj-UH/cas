@@ -170,6 +170,12 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         content: include_str!("builtins/skills/cas-supervisor/references/reference.md"),
     },
     BuiltinFile {
+        path: "skills/cas-supervisor/references/code-review-queue.md",
+        content: include_str!(
+            "builtins/skills/cas-supervisor/references/code-review-queue.md"
+        ),
+    },
+    BuiltinFile {
         path: "skills/cas-supervisor-checklist/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor-checklist.md"),
     },

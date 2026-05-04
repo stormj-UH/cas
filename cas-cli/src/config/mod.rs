@@ -98,6 +98,12 @@ pub struct Config {
     /// banner gates for vercel/neon/github auto-integration. Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrations: Option<IntegrationsConfig>,
+
+    /// Code-review ownership configuration (cas-b51a).
+    /// Controls whether the full cas-code-review skill runs in the worker close
+    /// gate or is deferred to the supervisor's review queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_review: Option<CodeReviewConfig>,
 }
 
 impl Config {
@@ -131,6 +137,7 @@ impl Config {
         merge_option!(logging);
         merge_option!(llm);
         merge_option!(integrations);
+        merge_option!(code_review);
         changed
     }
 }

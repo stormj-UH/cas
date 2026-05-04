@@ -228,6 +228,7 @@ impl WizardConfig {
             logging: None,
             llm: None,
             integrations: None,
+            code_review: None,
         }
     }
 }

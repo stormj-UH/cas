@@ -162,6 +162,8 @@ impl CasCore {
                                 TaskStatus::InProgress => "●",
                                 TaskStatus::Blocked => "◉",
                                 TaskStatus::Closed => "✓",
+                                // cas-b51a: awaiting supervisor code-review
+                                TaskStatus::PendingSupervisorReview => "⏳",
                             };
                             output.push_str(&format!(
                                 "  {} {} [P{}] {}\n",
@@ -331,9 +333,12 @@ impl CasCore {
         let mut filtered: Vec<_> = tasks
             .into_iter()
             .filter(|task| {
-                // Status filter
+                // Status filter — use Display (snake_case) for matching so
+                // "pending_supervisor_review", "in_progress", etc. all round-trip
+                // correctly. Previously used Debug (PascalCase) which would not
+                // match snake_case filter strings for multi-word status values.
                 if let Some(ref status_filter) = req.status {
-                    let task_status = format!("{:?}", task.status).to_lowercase();
+                    let task_status = task.status.to_string(); // snake_case via Display
                     if !task_status.contains(&status_filter.to_lowercase()) {
                         return false;
                     }

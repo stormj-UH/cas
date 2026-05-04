@@ -76,6 +76,7 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 - **[workflow.md](cas-supervisor/references/workflow.md)** — Worker modes, count strategy, Phase 1–4, merge/sync, blocker handling.
 - **[worker-recovery.md](cas-supervisor/references/worker-recovery.md)** — `is-wedged` triage, dead/silent worker, garbage output, verification jail, resource-contention crashes.
 - **[reference.md](cas-supervisor/references/reference.md)** — Exact valid actions and field names, dispatch two-step pattern, `update` vs `transfer`, message field requirements.
+- **[code-review-queue.md](cas-supervisor/references/code-review-queue.md)** — Supervisor-owned code review mode: queue monitoring, running full review, delivering verdict (cas-b51a).
 
 ## When to open which reference
 
@@ -87,3 +88,4 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 | Workers running, coordinating their work | workflow |
 | A worker pane looks broken or stuck | worker-recovery |
 | Hit "No active lease" / "missing field" / dispatch confusion | reference |
+| Tasks in `pending_supervisor_review`; running code review queue | code-review-queue |

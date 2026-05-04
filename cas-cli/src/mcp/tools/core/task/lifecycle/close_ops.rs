@@ -1048,6 +1048,111 @@ impl CasCore {
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
 
+        // cas-b51a: supervisor-owned review mode.
+        //
+        // When `[code_review] owner = "supervisor"` AND the caller is a
+        // factory worker AND the task has reviewable code changes, skip the
+        // full 14-min multi-persona dispatch and instead:
+        //   1. Run the lightweight structural lint (<1s).
+        //   2. On lint pass, flip the task to `PendingSupervisorReview` and
+        //      return success. The supervisor picks up the review queue at
+        //      their own pace.
+        //   3. On lint fail, return an error so the worker fixes the basics
+        //      before the branch reaches the review queue.
+        //
+        // Bypass conditions (fall through to normal close):
+        //   * `bypass_code_review=true` by a supervisor — they can always
+        //     force-close regardless of mode.
+        //   * Epic tasks — the subtask-receipts gate handles epics; the
+        //     supervisor-owned path is for individual worker tasks.
+        //   * Additive-only tasks — already skipped by the gate below.
+        //   * `has_reviewable_changes` returns false — docs-only or empty
+        //     diff; normal close path is appropriate.
+        //   * `owner=worker` (default) — legacy path, unchanged.
+        let supervisor_review_mode = config
+            .code_review
+            .as_ref()
+            .map(|cr| cr.supervisor_owned())
+            .unwrap_or(false);
+
+        if supervisor_review_mode
+            && is_factory_worker
+            && task.task_type != TaskType::Epic
+            && task.execution_note.as_deref() != Some("additive-only")
+            && !bypass_close_gates
+            && has_reviewable_changes(close_project_root)
+        {
+            // Run the lightweight structural lint.
+            match run_lightweight_structural_lint(close_project_root) {
+                LightweightLintOutcome::Fail(msg) => {
+                    return Ok(Self::tool_error(format!(
+                        "⚠️ LIGHTWEIGHT LINT FAILED\n\n\
+                        Worker close (supervisor-review mode) rejected by structural lint.\n\n\
+                        {msg}\n\n\
+                        Fix the violations above and retry close."
+                    )));
+                }
+                LightweightLintOutcome::Pass => {
+                    // Transition to PendingSupervisorReview.
+                    let mut task_to_pend = task.clone();
+                    let now = chrono::Utc::now();
+                    task_to_pend.status = TaskStatus::PendingSupervisorReview;
+                    task_to_pend.updated_at = now;
+                    // Persist the close reason so the supervisor can see it.
+                    if let Some(ref reason) = req.reason {
+                        task_to_pend.close_reason = Some(reason.clone());
+                        let timestamp = now.format("%Y-%m-%d %H:%M");
+                        let note = format!(
+                            "[{timestamp}] Pending supervisor review — close reason: {reason}"
+                        );
+                        if task_to_pend.notes.is_empty() {
+                            task_to_pend.notes = note;
+                        } else {
+                            task_to_pend.notes =
+                                format!("{}\n\n{}", task_to_pend.notes, note);
+                        }
+                    }
+                    if let Err(e) = task_store.update(&task_to_pend) {
+                        tracing::warn!(
+                            task_id = %req.id,
+                            error = %e,
+                            "failed to transition task to pending_supervisor_review"
+                        );
+                        return Ok(Self::tool_error(format!(
+                            "Internal error: failed to update task status: {e}"
+                        )));
+                    }
+
+                    // Emit activity event so the supervisor TUI shows the
+                    // new review item immediately.
+                    if let Ok(agent_id) = self.get_agent_id() {
+                        let event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+                            session_id: agent_id,
+                            event_type: "worker_pending_supervisor_review".to_string(),
+                            description: format!(
+                                "Task ready for supervisor review: {}",
+                                req.id
+                            ),
+                            entity_id: Some(req.id.clone()),
+                        };
+                        let _ = crate::mcp::socket::send_event(&self.cas_root, &event);
+                    }
+
+                    return Ok(Self::success(format!(
+                        "Task {} queued for supervisor review\n\n\
+                        Lightweight structural lint passed (<1s). The full \
+                        cas-code-review skill will be dispatched by the supervisor.\n\n\
+                        Status: pending_supervisor_review\n\n\
+                        You can now pick up the next task immediately. \
+                        The supervisor will either:\n\
+                        - Approve → closes + merges your branch\n\
+                        - Reject → sends P0 findings back via coordination message",
+                        req.id
+                    )));
+                }
+            }
+        }
+
         // cas-3086: Epic-close should not re-gate on the union diff
         // when every subtask already carries a valid ReviewOutcome
         // receipt (persisted on deliverables.review_envelope). The
@@ -2792,6 +2897,295 @@ mod additive_only_tests {
         assert!(
             v.is_empty(),
             "committed work must pass the gate: {v:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cas-b51a: Lightweight structural lint (supervisor-owned review mode)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the lightweight structural lint run at worker close-time when
+/// `[code_review] owner = "supervisor"`.
+///
+/// The full multi-persona `cas-code-review` skill is deferred to the
+/// supervisor; this gate only catches the most egregious anti-patterns
+/// (leftover debug statements, `unimplemented!`, large commented-out
+/// blocks) that should never leave a worker branch regardless of who
+/// reviews.
+#[derive(Debug)]
+pub(crate) enum LightweightLintOutcome {
+    /// Lint passed — proceed to `PendingSupervisorReview` transition.
+    Pass,
+    /// Lint found violations — worker must fix before close.
+    Fail(String),
+}
+
+/// Run the lightweight structural lint used in supervisor-owned review mode.
+///
+/// Scans the git diff (commits since merge-base with parent, or HEAD diff)
+/// for patterns that must never reach a review queue:
+///
+/// - `unimplemented!()` / `todo!()` macros (incomplete stubs)
+/// - `dbg!` macro calls (leftover debug instrumentation)
+/// - Commented-out code blocks larger than 5 consecutive lines
+///
+/// This lint is intentionally cheap — it runs on raw diff text without
+/// language-aware parsing. False positives in multi-line string literals
+/// are accepted in exchange for zero external dependencies and <1s latency.
+///
+/// The scan is scoped to the same `project_root` the full code review gate
+/// uses. If git is unavailable or the diff is empty, the lint passes
+/// (graceful degradation — same rule as `has_reviewable_changes`).
+pub(crate) fn run_lightweight_structural_lint(
+    project_root: &std::path::Path,
+) -> LightweightLintOutcome {
+    use std::process::Command;
+
+    // Collect the diff text. Try `HEAD` (committed + staged vs last commit)
+    // first; fall back to `--cached` (staged only) when HEAD fails (e.g.
+    // fresh repo with no commits). We use `--unified=0` to get minimal
+    // context so the consecutive-comment heuristic below is not confused by
+    // context lines from the surrounding diff. Only one diff source is used
+    // to avoid duplicating added-lines counts.
+    let diff_text = {
+        let mut text = String::new();
+        for args in [
+            &["diff", "--unified=0", "HEAD"][..],
+            &["diff", "--unified=0", "--cached"][..],
+        ] {
+            if let Ok(output) = Command::new("git")
+                .args(args)
+                .current_dir(project_root)
+                .output()
+            {
+                if output.status.success() && !output.stdout.is_empty() {
+                    text = String::from_utf8_lossy(&output.stdout).into_owned();
+                    break; // use the first non-empty diff; don't append both
+                }
+            }
+        }
+        text
+    };
+
+    if diff_text.is_empty() {
+        return LightweightLintOutcome::Pass;
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+
+    // Scan added lines only (prefixed with '+' but not '++' file header).
+    let added_lines: Vec<&str> = diff_text
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| &l[1..]) // strip the leading '+'
+        .collect();
+
+    // Check 1: unimplemented!() or todo!() macro calls anywhere on the line.
+    // Use `contains("macro!(")` to catch both `macro!()` (no args) and
+    // `macro!("msg")` forms, regardless of where they appear on the line.
+    for (i, line) in added_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains("unimplemented!(") {
+            violations.push(format!(
+                "Line +{}: `unimplemented!()` — replace with a real implementation",
+                i + 1
+            ));
+        }
+        if trimmed.contains("todo!(") {
+            violations.push(format!(
+                "Line +{}: `todo!()` — replace with a real implementation",
+                i + 1
+            ));
+        }
+    }
+
+    // Check 2: dbg! macro calls
+    for (i, line) in added_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("dbg!(") || trimmed.contains(" dbg!(") || trimmed.contains("\tdbg!(") {
+            violations.push(format!(
+                "Line +{}: `dbg!()` call — remove debug instrumentation before review",
+                i + 1
+            ));
+        }
+    }
+
+    // Check 3: commented-out code blocks > 5 consecutive comment lines.
+    // Heuristic: 6 or more consecutive lines that (a) start with '//'
+    // and (b) are not doc comments ('///') or copyright headers.
+    {
+        let mut run = 0usize;
+        let mut run_start = 0usize;
+        for (i, line) in added_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let is_code_comment = trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+                && !trimmed.starts_with("//!");
+            if is_code_comment {
+                if run == 0 {
+                    run_start = i + 1;
+                }
+                run += 1;
+            } else {
+                if run > 5 {
+                    violations.push(format!(
+                        "Lines +{}–+{}: {} consecutive commented-out lines — \
+                         remove or restore the code before review (>5-line threshold)",
+                        run_start,
+                        i,
+                        run
+                    ));
+                }
+                run = 0;
+            }
+        }
+        // Trailing run
+        if run > 5 {
+            violations.push(format!(
+                "Lines +{}–end: {} consecutive commented-out lines — \
+                 remove or restore the code before review (>5-line threshold)",
+                run_start, run
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        LightweightLintOutcome::Pass
+    } else {
+        let vlist = violations
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("  {}. {}", i + 1, v))
+            .collect::<Vec<_>>()
+            .join("\n");
+        LightweightLintOutcome::Fail(format!(
+            "Lightweight structural lint found {} violation(s):\n\n{}\n\n\
+             Fix these before retrying close. The full cas-code-review skill \
+             will be run by the supervisor once these basics are clean.",
+            violations.len(),
+            vlist
+        ))
+    }
+}
+
+#[cfg(test)]
+mod lightweight_lint_tests {
+    //! Unit tests for the cas-b51a lightweight structural lint gate.
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_repo_with_diff(added_lines: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        // init git
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        // initial commit so HEAD exists
+        std::fs::write(dir.path().join("base.rs"), "fn main() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        // write changed file
+        std::fs::write(dir.path().join("changed.rs"), added_lines).unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn lint_passes_for_clean_code() {
+        let dir = init_repo_with_diff("fn foo() { 42 }\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "clean code should pass lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_unimplemented() {
+        let dir = init_repo_with_diff("fn foo() { unimplemented!() }\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "unimplemented!() should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_todo() {
+        let dir = init_repo_with_diff("fn bar() { todo!(\"later\") }\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "todo!() should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_dbg() {
+        let dir = init_repo_with_diff("let x = dbg!(foo);\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "dbg!() should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_large_commented_block() {
+        let code = "// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n// line 6\n";
+        let dir = init_repo_with_diff(code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "6-line comment block should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_allows_five_line_comment_block() {
+        let code = "// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n";
+        let dir = init_repo_with_diff(code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "5-line comment block should pass lint (threshold is >5)"
+        );
+    }
+
+    #[test]
+    fn lint_passes_on_empty_repo() {
+        let dir = TempDir::new().unwrap();
+        // no git init at all — graceful degradation
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "no-git directory should pass (graceful degradation)"
         );
     }
 }
