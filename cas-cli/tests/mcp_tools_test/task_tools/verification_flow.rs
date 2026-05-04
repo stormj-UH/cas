@@ -3120,10 +3120,17 @@ async fn test_worker_self_cert_blocked_when_fresh_dispatch_row_exists() {
 /// must return "Closed task:" and the verifications table must remain empty
 /// (confirming the insert was blocked and the error was handled gracefully).
 ///
+/// Coverage scope: this test exercises the `add()` failure path (the `Err(e)` branch
+/// inside the `Ok(ver_id)` arm). The `generate_id()` failure path (the outer
+/// `Err(e)` arm) is NOT covered here because the BEFORE INSERT trigger cannot
+/// affect `generate_id()` — that function performs no DB call. Tracking open
+/// in cas-eeab.
+///
 /// Note: DaemonEvent emission via `send_event` is fire-and-forget over a Unix
 /// socket; no daemon is running in unit tests so the event is silently discarded.
-/// The observable invariant (close succeeds, no row written) is sufficient to
-/// cover the failure-mode behaviour codified by Option B.
+/// The observable invariant (close succeeds, no row written) covers the fall-through
+/// behaviour; event-emission fidelity requires an in-process event sink (out of
+/// scope, tracked in cas-eeab).
 #[tokio::test]
 async fn test_worker_close_succeeds_when_skipped_row_write_fails_option_b() {
     let (temp, service) = setup_cas();

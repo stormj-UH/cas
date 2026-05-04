@@ -75,6 +75,10 @@ pub enum EventType {
     VerificationStarted,
     /// Verification result recorded
     VerificationAdded,
+
+    // Audit / integrity events
+    /// Worker-owned verification Skipped row could not be written — audit trail gap
+    AuditTrailGap,
 }
 
 impl fmt::Display for EventType {
@@ -107,6 +111,7 @@ impl fmt::Display for EventType {
             EventType::EpicSubtasksComplete => write!(f, "epic_subtasks_complete"),
             EventType::VerificationStarted => write!(f, "verification_started"),
             EventType::VerificationAdded => write!(f, "verification_added"),
+            EventType::AuditTrailGap => write!(f, "audit_trail_gap"),
         }
     }
 }
@@ -143,6 +148,7 @@ impl FromStr for EventType {
             "epic_subtasks_complete" => Ok(EventType::EpicSubtasksComplete),
             "verification_started" => Ok(EventType::VerificationStarted),
             "verification_added" => Ok(EventType::VerificationAdded),
+            "audit_trail_gap" => Ok(EventType::AuditTrailGap),
             _ => Err(TypeError::Parse(format!("invalid event type: {s}"))),
         }
     }
@@ -277,6 +283,7 @@ impl Event {
             EventType::EpicSubtasksComplete => "🎉",       // Party (all subtasks done)
             EventType::VerificationStarted => "🔍",       // Magnifying glass (verifying)
             EventType::VerificationAdded => "📋",         // Clipboard (result recorded)
+            EventType::AuditTrailGap => "⚠",             // Warning (audit gap)
         }
     }
 }

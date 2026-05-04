@@ -258,6 +258,7 @@ impl DirectorData {
             EventType::WorkerVerificationBlocked,
             EventType::VerificationStarted,
             EventType::VerificationAdded,
+            EventType::AuditTrailGap,
         ];
         let mut agent_latest_activity: HashMap<String, (String, chrono::DateTime<chrono::Utc>)> =
             HashMap::new();

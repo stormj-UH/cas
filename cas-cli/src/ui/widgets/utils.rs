@@ -103,6 +103,8 @@ pub fn event_type_color(event_type: &cas_types::EventType, palette: &Palette) ->
         // Verification lifecycle events
         EventType::VerificationStarted => palette.status_info,
         EventType::VerificationAdded => palette.status_success,
+        // Audit / integrity events
+        EventType::AuditTrailGap => palette.status_error,
     }
 }
 
