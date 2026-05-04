@@ -1,6 +1,10 @@
+# =============================================================================
+# CAS server (cas → cs rename for Codex harness; harness.rs maps mcp__cs__*
+# back to mcp__cas__* so worker prompts use the same tool names as Claude)
+# =============================================================================
 [mcp_servers.cs]
-args = ["serve"]
 command = "cas"
+args = ["serve"]
 env_vars = [
     "PATH",
     "HOME",
@@ -9,3 +13,67 @@ env_vars = [
 
 [mcp_servers.cs.env]
 CAS_CODEX_FALLBACK_SESSION = "1"
+
+# =============================================================================
+# context7 — HTTP, custom header CONTEXT7_API_KEY (not Bearer).
+# env_http_headers maps header-name → env-var-name; Codex resolves at startup.
+# Requires: CONTEXT7_API_KEY set in the environment.
+# =============================================================================
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+env_http_headers = { CONTEXT7_API_KEY = "CONTEXT7_API_KEY" }
+
+# =============================================================================
+# github — HTTP, Bearer auth via GITHUB_TOKEN.
+# bearer_token_env_var sends `Authorization: Bearer ${GITHUB_TOKEN}`.
+# Requires: GITHUB_TOKEN set in the environment.
+# =============================================================================
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+bearer_token_env_var = "GITHUB_TOKEN"
+
+# =============================================================================
+# neon — stdio (npx). API key forwarded via env var.
+# Note: .mcp.json passes NEON_API_KEY as a positional arg (${NEON_API_KEY}),
+# but Codex does not expand ${VAR} in TOML args[]. The neon MCP server also
+# accepts the key via the NEON_API_KEY env var, so we forward it that way.
+# Requires: NEON_API_KEY set in the environment.
+# =============================================================================
+[mcp_servers.neon]
+command = "npx"
+args = ["-y", "@neondatabase/mcp-server-neon@0.6.5", "start"]
+env_vars = [
+    "PATH",
+    "HOME",
+    "USER",
+    "NEON_API_KEY",
+]
+
+# =============================================================================
+# playwright — stdio (npx). No auth required; profile path is hardcoded.
+# =============================================================================
+[mcp_servers.playwright]
+command = "npx"
+args = [
+    "-y",
+    "@playwright/mcp@0.0.70",
+    "--user-data-dir",
+    "/home/pippenz/.playwright-mcp-profile",
+    "--browser",
+    "chrome",
+]
+env_vars = [
+    "PATH",
+    "HOME",
+    "USER",
+    "DISPLAY",
+]
+
+# =============================================================================
+# vercel — HTTP, Bearer auth via VERCEL_TOKEN.
+# bearer_token_env_var sends `Authorization: Bearer ${VERCEL_TOKEN}`.
+# Requires: VERCEL_TOKEN set in the environment.
+# =============================================================================
+[mcp_servers.vercel]
+url = "https://mcp.vercel.com"
+bearer_token_env_var = "VERCEL_TOKEN"
