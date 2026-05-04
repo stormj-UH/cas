@@ -6,6 +6,29 @@ fn bool_prop(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+/// Resolve the current worker harness from the live on-disk `LlmConfig`.
+///
+/// Called before every dynamic worker spawn so that `cas config set
+/// llm.worker.harness codex` takes effect on the next spawn without
+/// requiring a daemon restart (fix for cas-9bc6: the harness was
+/// previously cached at daemon boot and never re-read).
+///
+/// Falls back to `SupervisorCli::Claude` when the config file is absent
+/// or unparseable — degraded but not broken.
+pub(super) fn resolve_live_worker_harness(
+    cas_dir: &std::path::Path,
+) -> cas_mux::SupervisorCli {
+    use std::str::FromStr;
+    Config::load(cas_dir)
+        .ok()
+        .map(|c| c.llm())
+        .as_ref()
+        .and_then(|llm| {
+            cas_mux::SupervisorCli::from_str(llm.harness_for_role("worker")).ok()
+        })
+        .unwrap_or(cas_mux::SupervisorCli::Claude)
+}
+
 /// Metadata key written on the agent record when shutdown preserved a dirty
 /// worktree. The daemon reaper (Unit 3) reads this to drive TTL-based salvage.
 const DIRTY_ON_SHUTDOWN_KEY: &str = "dirty_on_shutdown";
@@ -140,6 +163,50 @@ impl FactoryApp {
         self.epic_state = EpicState::Idle;
     }
 
+    /// Re-read the live `LlmConfig` from disk and update the mux's worker CLI,
+    /// model, and effort before a dynamic spawn.
+    ///
+    /// This ensures that `cas config set llm.worker.harness codex` is picked up
+    /// on the **next** `spawn_workers` call without restarting the daemon
+    /// (cas-9bc6 fix: the harness was previously cached at daemon boot).
+    ///
+    /// Also updates `self.worker_cli` on `FactoryApp` so the per-worker intro
+    /// prompt (`queue_codex_worker_intro_prompt`) uses the correct harness.
+    ///
+    /// On I/O or parse failure the existing cached values are retained —
+    /// degraded but not broken.
+    fn sync_worker_config_from_live_settings(&mut self) {
+        use std::str::FromStr;
+
+        let config = match Config::load(self.cas_dir()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "cas-9bc6: failed to re-read live config before spawn; \
+                     cached worker harness retained: {}",
+                    e
+                );
+                return;
+            }
+        };
+        let llm = config.llm();
+
+        // Harness — the field that was previously cached and never refreshed.
+        let live_cli = cas_mux::SupervisorCli::from_str(llm.harness_for_role("worker"))
+            .unwrap_or(cas_mux::SupervisorCli::Claude);
+        self.mux.set_worker_cli(live_cli);
+        // Keep FactoryApp's own field in sync so queue_codex_worker_intro_prompt
+        // and generate_prompt pick up the updated harness as well.
+        self.worker_cli = live_cli;
+
+        // Re-read model and effort for consistency; these were already correct
+        // at startup but can drift if config changes mid-session.
+        self.mux
+            .set_worker_model(llm.model_for_role("worker").map(ToOwned::to_owned));
+        self.mux
+            .set_worker_effort(llm.reasoning_effort_for_role("worker").map(ToOwned::to_owned));
+    }
+
     /// Add a new worker at runtime (synchronous - blocks during worktree creation).
     ///
     /// Creates a worktree (if isolate is true and worktrees enabled) and spawns a Claude instance.
@@ -266,6 +333,10 @@ impl FactoryApp {
         result: WorkerSpawnResult,
         teams: Option<cas_mux::TeamsSpawnConfig>,
     ) -> anyhow::Result<String> {
+        // cas-9bc6: re-read live LlmConfig so harness/model/effort changes made
+        // via `cas config set` after daemon boot are reflected in this spawn.
+        self.sync_worker_config_from_live_settings();
+
         let worker_name = result.worker_name;
         let cwd = result.cwd;
         let cas_root = result.cas_root;
@@ -509,6 +580,10 @@ impl FactoryApp {
         name: &str,
         teams: Option<cas_mux::TeamsSpawnConfig>,
     ) -> anyhow::Result<()> {
+        // cas-9bc6: re-read live LlmConfig so harness/model/effort changes made
+        // via `cas config set` after daemon boot are reflected in this respawn.
+        self.sync_worker_config_from_live_settings();
+
         crate::telemetry::track(
             "factory_worker_respawn_requested",
             vec![("worktrees_enabled", bool_prop(self.worktrees_enabled()))],
@@ -737,5 +812,86 @@ mod tests {
             .unwrap();
 
         assert!(!worker_has_open_tasks(&cas_dir, "agent-d"));
+    }
+
+    // --- cas-9bc6: resolve_live_worker_harness reads from disk, not cache ----
+
+    fn cas_dir_with_config(config_toml: &str) -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let cas_dir = temp.path().join(".cas");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        std::fs::write(cas_dir.join("config.toml"), config_toml).unwrap();
+        (temp, cas_dir)
+    }
+
+    /// AC4 anchor — spawn handler reads live LlmConfig, not the cached field.
+    ///
+    /// After writing `llm.worker.harness = "codex"` to disk, calling
+    /// `resolve_live_worker_harness` must return `Codex`, proving the function
+    /// reads the current on-disk config rather than a stale in-memory value.
+    #[test]
+    fn resolve_live_worker_harness_returns_codex_after_config_change() {
+        let (_temp, cas_dir) =
+            cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
+        let harness = resolve_live_worker_harness(&cas_dir);
+        assert_eq!(
+            harness,
+            cas_mux::SupervisorCli::Codex,
+            "live config with worker.harness=codex must yield SupervisorCli::Codex"
+        );
+    }
+
+    /// Absent config (no config.toml) falls back to Claude — the safe default.
+    #[test]
+    fn resolve_live_worker_harness_defaults_to_claude_when_config_absent() {
+        let temp = TempDir::new().unwrap();
+        let empty_cas_dir = temp.path().join(".cas");
+        std::fs::create_dir_all(&empty_cas_dir).unwrap();
+        // No config.toml written.
+        let harness = resolve_live_worker_harness(&empty_cas_dir);
+        assert_eq!(
+            harness,
+            cas_mux::SupervisorCli::Claude,
+            "missing config must fall back to SupervisorCli::Claude"
+        );
+    }
+
+    /// Simulates the round-trip in the bug report:
+    /// boot with claude → `cas config set codex` → next spawn sees codex
+    /// → `cas config set claude` → next spawn reverts to claude.
+    #[test]
+    fn resolve_live_worker_harness_reflects_config_rewrites() {
+        let (_temp, cas_dir) =
+            cas_dir_with_config("[llm.worker]\nharness = \"codex\"\n");
+        assert_eq!(
+            resolve_live_worker_harness(&cas_dir),
+            cas_mux::SupervisorCli::Codex,
+            "first read: codex"
+        );
+
+        // Rewrite config to claude (simulates `cas config set llm.worker.harness claude`)
+        std::fs::write(
+            cas_dir.join("config.toml"),
+            "[llm.worker]\nharness = \"claude\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_live_worker_harness(&cas_dir),
+            cas_mux::SupervisorCli::Claude,
+            "after revert: claude"
+        );
+    }
+
+    /// Unknown/garbage harness string falls back to Claude.
+    #[test]
+    fn resolve_live_worker_harness_falls_back_on_unknown_harness_string() {
+        let (_temp, cas_dir) =
+            cas_dir_with_config("[llm.worker]\nharness = \"chatgpt\"\n");
+        let harness = resolve_live_worker_harness(&cas_dir);
+        assert_eq!(
+            harness,
+            cas_mux::SupervisorCli::Claude,
+            "unknown harness string must fall back to SupervisorCli::Claude"
+        );
     }
 }
