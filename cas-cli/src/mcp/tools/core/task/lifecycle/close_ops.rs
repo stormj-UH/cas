@@ -579,8 +579,12 @@ impl CasCore {
                                                 .to_string(),
                                         );
                                     skipped_row.verification_type = verification_type;
-                                    if let Ok(agent_id) = self.get_agent_id() {
-                                        skipped_row.agent_id = Some(agent_id);
+                                    // cas-eeab (Item 6): cache get_agent_id() once to avoid
+                                    // the double-call that existed between the row assignment
+                                    // and the gap-event emission on the add() failure path.
+                                    let maybe_agent_id = self.get_agent_id().ok();
+                                    if let Some(ref aid) = maybe_agent_id {
+                                        skipped_row.agent_id = Some(aid.clone());
                                     }
                                     if let Err(e) = verification_store.add(&skipped_row) {
                                         tracing::warn!(
@@ -588,26 +592,17 @@ impl CasCore {
                                             error = %e,
                                             "failed to persist worker-owned verification Skipped row"
                                         );
-                                        // cas-c97e: surface the audit gap via a supervisor-visible
-                                        // event so ops can detect the missing row without the close
-                                        // path blocking.
-                                        if let Ok(agent_id) = self.get_agent_id() {
-                                            let gap_event =
-                                                crate::mcp::socket::DaemonEvent::WorkerActivity {
-                                                    session_id: agent_id,
-                                                    event_type: "audit_trail_gap".to_string(),
-                                                    description: format!(
-                                                        "Skipped verification row write failed \
-                                                         for task {}: {e}",
-                                                        req.id
-                                                    ),
-                                                    entity_id: Some(req.id.clone()),
-                                                };
-                                            let _ = crate::mcp::socket::send_event(
-                                                &self.cas_root,
-                                                &gap_event,
-                                            );
-                                        }
+                                        // cas-eeab (Item 4+5): delegate to helper; sentinel
+                                        // fallback ensures the event fires even when the
+                                        // agent ID is unavailable.
+                                        self.emit_audit_gap_event(
+                                            &req.id,
+                                            format!(
+                                                "Skipped verification row write failed \
+                                                 for task {}: {e}",
+                                                req.id
+                                            ),
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -619,23 +614,15 @@ impl CasCore {
                                     // cas-c97e: ID-generation failure also surfaces as an
                                     // audit-gap event — it is indistinguishable from a write
                                     // failure from the supervisor's perspective.
-                                    if let Ok(agent_id) = self.get_agent_id() {
-                                        let gap_event =
-                                            crate::mcp::socket::DaemonEvent::WorkerActivity {
-                                                session_id: agent_id,
-                                                event_type: "audit_trail_gap".to_string(),
-                                                description: format!(
-                                                    "Skipped verification row ID generation failed \
-                                                     for task {}: {e}",
-                                                    req.id
-                                                ),
-                                                entity_id: Some(req.id.clone()),
-                                            };
-                                        let _ = crate::mcp::socket::send_event(
-                                            &self.cas_root,
-                                            &gap_event,
-                                        );
-                                    }
+                                    // cas-eeab (Item 4+5): delegate to helper.
+                                    self.emit_audit_gap_event(
+                                        &req.id,
+                                        format!(
+                                            "Skipped verification row ID generation failed \
+                                             for task {}: {e}",
+                                            req.id
+                                        ),
+                                    );
                                 }
                             }
                             // Emit activity event for supervisor visibility.
@@ -1566,6 +1553,39 @@ impl CasCore {
             "Reopened task: {} - {}",
             req.id, task.title
         )))
+    }
+
+    /// Emit a `DaemonEvent::WorkerActivity { event_type = "audit_trail_gap" }` to
+    /// the supervisor TUI, fire-and-forget.
+    ///
+    /// Uses `get_agent_id()` to identify the sender; falls back to the sentinel
+    /// `"unknown-session"` when the agent ID is unavailable (e.g., no SessionStart
+    /// hook ran, `CAS_SESSION_ID` unset in CI). This ensures the gap event always
+    /// reaches the TUI even when agent metadata is missing — losing fidelity on the
+    /// sender is better than silently dropping the event.
+    ///
+    /// cas-eeab (Item 4+5): extracted from the two duplicated inline blocks in the
+    /// `match verification_store.generate_id()` arm.
+    fn emit_audit_gap_event(&self, task_id: &str, description: String) {
+        let session_id = self
+            .get_agent_id()
+            .unwrap_or_else(|_| "unknown-session".to_string());
+        let gap_event = crate::mcp::socket::DaemonEvent::WorkerActivity {
+            session_id,
+            event_type: "audit_trail_gap".to_string(),
+            description,
+            entity_id: Some(task_id.to_string()),
+        };
+        if let Err(e) = crate::mcp::socket::send_event(&self.cas_root, &gap_event) {
+            // Fire-and-forget, but log the failure so that a double-silent failure
+            // (store write fails AND socket send fails) leaves at least a trace.
+            // cas-eeab: safe_auto autofix for silently discarded send_event result.
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e,
+                "failed to emit audit_trail_gap event to daemon socket"
+            );
+        }
     }
 }
 

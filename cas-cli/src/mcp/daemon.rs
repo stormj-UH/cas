@@ -679,6 +679,7 @@ impl EmbeddedDaemon {
                         "verification_started" => CasEventType::VerificationStarted,
                         "verification_added" => CasEventType::VerificationAdded,
                         "epic_subtasks_complete" => CasEventType::EpicSubtasksComplete,
+                        "audit_trail_gap" => CasEventType::AuditTrailGap,
                         _ => CasEventType::WorkerSubagentSpawned, // Fallback
                     };
 
