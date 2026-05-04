@@ -130,6 +130,7 @@ impl FactoryApp {
             rows,
             cols,
             teams_configs: config.teams_configs,
+            resolved_worker_specs: config.resolved_worker_specs,
         };
 
         // Cache store handles for efficient periodic refresh

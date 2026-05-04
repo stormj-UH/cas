@@ -336,6 +336,7 @@ impl DaemonInitPhase {
             rows,
             cols,
             teams_configs: self.factory_config.teams_configs.clone(),
+            resolved_worker_specs: self.factory_config.resolved_worker_specs.clone(),
         };
 
         // Send supervisor progress (clone to avoid borrow conflicts)

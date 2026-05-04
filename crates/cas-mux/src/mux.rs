@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::harness::SupervisorCli;
 use crate::pane::{Pane, PaneId, PaneKind};
 use crate::pty::{PtyConfig, PtyEvent, TeamsSpawnConfig};
+use crate::spec::WorkerSpec;
 use cas_factory_protocol::ServerMessage;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -49,6 +50,14 @@ pub struct MuxConfig {
     /// Per-agent Teams spawn configs (agent_name -> config).
     /// When set, agents are spawned with native Agent Teams CLI flags.
     pub teams_configs: HashMap<String, TeamsSpawnConfig>,
+    /// Resolved per-worker specs from the cascade resolver.
+    ///
+    /// When non-empty, each named worker in this list overrides the singular
+    /// `worker_cli/worker_model/worker_effort` for that specific worker slot.
+    /// Workers without a matching entry fall back to the singular fields.
+    /// Populated by `cas_factory::spec_resolver::resolve_specs` and passed
+    /// through to `Mux::factory` / `Mux::factory_pane_configs`.
+    pub resolved_worker_specs: Vec<WorkerSpec>,
 }
 
 impl Default for MuxConfig {
@@ -70,6 +79,7 @@ impl Default for MuxConfig {
             rows: 24,
             cols: 80,
             teams_configs: HashMap::new(),
+            resolved_worker_specs: vec![],
         }
     }
 }
@@ -109,12 +119,14 @@ pub struct Mux {
     /// Terminal size
     rows: u16,
     cols: u16,
-    /// Worker CLI used for dynamic worker spawns
-    worker_cli: SupervisorCli,
-    /// Worker model used for dynamic worker spawns
-    worker_model: Option<String>,
-    /// Worker reasoning effort used for dynamic worker spawns
-    worker_effort: Option<String>,
+    /// Default spec applied to all dynamic worker spawns that have no per-worker
+    /// override. Mutated by the deprecated `set_worker_cli/model/effort` setters
+    /// (preserved for callers that haven't switched to `set_worker_spec` yet).
+    default_worker_spec: WorkerSpec,
+    /// Per-worker spec overrides, keyed by worker name.
+    /// Populated by `Mux::factory` from `MuxConfig.resolved_worker_specs`.
+    /// Also settable at runtime via `set_worker_spec`.
+    worker_specs: HashMap<String, WorkerSpec>,
 }
 
 impl Mux {
@@ -128,25 +140,117 @@ impl Mux {
             event_rx,
             rows,
             cols,
-            worker_cli: SupervisorCli::Claude,
-            worker_model: None,
-            worker_effort: None,
+            default_worker_spec: WorkerSpec::builtin_default(),
+            worker_specs: HashMap::new(),
         }
     }
 
     /// Set CLI used for worker pane spawns.
+    ///
+    /// # Deprecated
+    /// Prefer [`set_default_worker_spec`][Self::set_default_worker_spec] or
+    /// [`set_worker_spec`][Self::set_worker_spec]. This setter is kept only
+    /// for backwards-compatibility with callers that pass `worker_cli` as a
+    /// scalar flag.
+    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
     pub fn set_worker_cli(&mut self, worker_cli: SupervisorCli) {
-        self.worker_cli = worker_cli;
+        self.default_worker_spec.cli = worker_cli;
     }
 
     /// Set model used for worker pane spawns.
+    ///
+    /// # Deprecated
+    /// Prefer [`set_default_worker_spec`][Self::set_default_worker_spec] or
+    /// [`set_worker_spec`][Self::set_worker_spec].
+    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
     pub fn set_worker_model(&mut self, model: Option<String>) {
-        self.worker_model = model;
+        self.default_worker_spec.model = model;
     }
 
     /// Set reasoning effort used for worker pane spawns.
+    ///
+    /// # Deprecated
+    /// Prefer [`set_default_worker_spec`][Self::set_default_worker_spec] or
+    /// [`set_worker_spec`][Self::set_worker_spec].
+    ///
+    /// The effort string is parsed to an [`Effort`][crate::spec::Effort] enum;
+    /// unrecognised values are silently cleared (effort falls back to the
+    /// backend default).
+    #[deprecated(since = "0.1.0", note = "use set_default_worker_spec or set_worker_spec")]
     pub fn set_worker_effort(&mut self, effort: Option<String>) {
-        self.worker_effort = effort;
+        self.default_worker_spec.effort = effort
+            .as_deref()
+            .and_then(|s| s.parse::<crate::spec::Effort>().ok());
+    }
+
+    /// Replace the default spec applied to all worker spawns that have no
+    /// per-worker override.
+    pub fn set_default_worker_spec(&mut self, spec: WorkerSpec) {
+        self.default_worker_spec = spec;
+    }
+
+    /// Set (or replace) the per-worker spec for a specific worker name.
+    ///
+    /// Takes effect for any subsequent `add_worker` / `factory` spawn for that
+    /// name. Does not retroactively affect already-running panes.
+    pub fn set_worker_spec(&mut self, name: &str, spec: WorkerSpec) {
+        self.worker_specs.insert(name.to_string(), spec);
+    }
+
+    /// Resolve the effective `WorkerSpec` for a dynamic spawn.
+    ///
+    /// Priority (first match wins):
+    /// 1. Explicitly supplied `spec` argument.
+    /// 2. Per-worker entry in `self.worker_specs` keyed by `name`.
+    /// 3. `self.default_worker_spec` (the Mux-wide fallback).
+    pub fn effective_worker_spec(&self, name: &str, explicit: Option<WorkerSpec>) -> WorkerSpec {
+        explicit
+            .or_else(|| self.worker_specs.get(name).cloned())
+            .unwrap_or_else(|| self.default_worker_spec.clone())
+    }
+
+    /// Resolve the worker names for a [`MuxConfig`].
+    ///
+    /// If `config.worker_names` is non-empty those names are used as-is.
+    /// Otherwise names are auto-generated as `worker-1`, `worker-2`, … up to
+    /// `config.workers`.  Extracted to eliminate the identical block that
+    /// previously appeared in both `factory_pane_configs` and `factory`.
+    fn resolve_worker_names(config: &MuxConfig) -> Vec<String> {
+        if config.worker_names.is_empty() {
+            (0..config.workers)
+                .map(|i| format!("worker-{}", i + 1))
+                .collect()
+        } else {
+            config.worker_names.clone()
+        }
+    }
+
+    /// Resolve the CLI, model string, and effort string for a named worker
+    /// from a [`MuxConfig`].
+    ///
+    /// Checks `config.resolved_worker_specs` first (cascade resolver output),
+    /// then falls back to the singular `worker_cli/worker_model/worker_effort`
+    /// fields.  Extracted to eliminate the identical block that previously
+    /// appeared in both `factory_pane_configs` and `factory`.
+    fn resolve_worker_spec_from_config(
+        name: &str,
+        config: &MuxConfig,
+    ) -> (SupervisorCli, Option<String>, Option<String>) {
+        config
+            .resolved_worker_specs
+            .iter()
+            .find(|s| s.name.as_deref() == Some(name))
+            .map(|spec| {
+                let effort_str = spec.effort.map(|e| e.as_claude_arg().to_string());
+                (spec.cli, spec.model.clone(), effort_str)
+            })
+            .unwrap_or_else(|| {
+                (
+                    config.worker_cli,
+                    config.worker_model.clone(),
+                    config.worker_effort.clone(),
+                )
+            })
     }
 
     /// Build the `PtyConfig`s that `factory()` would spawn for each worker and
@@ -159,13 +263,7 @@ impl Mux {
     /// flow from `MuxConfig` all the way to the CLI subprocess arguments,
     /// without requiring a real `claude` or `codex` binary.
     pub fn factory_pane_configs(config: &MuxConfig) -> Vec<(String, PtyConfig)> {
-        let worker_names: Vec<String> = if config.worker_names.is_empty() {
-            (0..config.workers)
-                .map(|i| format!("worker-{}", i + 1))
-                .collect()
-        } else {
-            config.worker_names.clone()
-        };
+        let worker_names = Self::resolve_worker_names(config);
 
         let mut result = Vec::with_capacity(worker_names.len() + 1);
 
@@ -176,14 +274,19 @@ impl Mux {
                 .cloned()
                 .unwrap_or_else(|| config.cwd.clone());
             let teams = config.teams_configs.get(name);
+
+            // Resolve per-worker spec via the shared helper.
+            let (cli, model_opt, effort_opt) =
+                Self::resolve_worker_spec_from_config(name, config);
+
             let pty_config = Pane::build_worker_config(
                 name,
                 worker_cwd,
                 config.cas_root.as_ref(),
                 &config.supervisor_name,
-                config.worker_cli,
-                config.worker_model.as_deref(),
-                config.worker_effort.as_deref(),
+                cli,
+                model_opt.as_deref(),
+                effort_opt.as_deref(),
                 teams,
             );
             result.push((name.clone(), pty_config));
@@ -209,9 +312,28 @@ impl Mux {
     /// Create a multiplexer with factory configuration
     pub fn factory(config: MuxConfig) -> Result<Self> {
         let mut mux = Self::new(config.rows, config.cols);
-        mux.set_worker_cli(config.worker_cli);
-        mux.set_worker_model(config.worker_model.clone());
-        mux.set_worker_effort(config.worker_effort.clone());
+
+        // Build the default spec from singular fields (backward compat with
+        // callers that only pass worker_cli/worker_model/worker_effort).
+        let default_effort = config
+            .worker_effort
+            .as_deref()
+            .and_then(|s| s.parse::<crate::spec::Effort>().ok());
+        mux.set_default_worker_spec(WorkerSpec {
+            name: None,
+            cli: config.worker_cli,
+            model: config.worker_model.clone(),
+            effort: default_effort,
+        });
+
+        // Populate per-worker specs from the cascade resolver output so that
+        // subsequent `add_worker` calls (dynamic spawns) inherit the same
+        // per-name decision without callers having to re-supply the spec.
+        for spec in &config.resolved_worker_specs {
+            if let Some(ref name) = spec.name {
+                mux.worker_specs.insert(name.clone(), spec.clone());
+            }
+        }
 
         // Calculate pane sizes based on layout
         // Layout: [Workers] [Supervisor] [Director]
@@ -220,13 +342,7 @@ impl Mux {
         let pane_rows = config.rows;
 
         // Create worker panes
-        let worker_names: Vec<String> = if config.worker_names.is_empty() {
-            (0..config.workers)
-                .map(|i| format!("worker-{}", i + 1))
-                .collect()
-        } else {
-            config.worker_names.clone()
-        };
+        let worker_names = Self::resolve_worker_names(&config);
 
         for name in &worker_names {
             // Use worker-specific CWD if available, otherwise fall back to default
@@ -236,14 +352,19 @@ impl Mux {
                 .cloned()
                 .unwrap_or_else(|| config.cwd.clone());
             let teams = config.teams_configs.get(name);
+
+            // Resolve per-worker spec via the shared helper.
+            let (cli, model_opt, effort_opt) =
+                Self::resolve_worker_spec_from_config(name, &config);
+
             let pane = Pane::worker(
                 name,
                 worker_cwd,
                 config.cas_root.as_ref(),
                 &config.supervisor_name,
-                config.worker_cli,
-                config.worker_model.as_deref(),
-                config.worker_effort.as_deref(),
+                cli,
+                model_opt.as_deref(),
+                effort_opt.as_deref(),
                 pane_rows,
                 pane_cols,
                 teams,
@@ -461,6 +582,40 @@ impl Mux {
             .count()
     }
 
+    /// Build the `PtyConfig` that `add_worker` would use for the given worker,
+    /// without actually spawning a process.
+    ///
+    /// Spec resolution order:
+    /// 1. Explicitly supplied `spec`.
+    /// 2. Per-worker entry in `self.worker_specs` (set by `set_worker_spec` or
+    ///    populated from `MuxConfig.resolved_worker_specs` in `Mux::factory`).
+    /// 3. `self.default_worker_spec` (Mux-wide fallback).
+    ///
+    /// Primary use: tests that need to verify CLI / model / effort routing
+    /// without spawning a real process.
+    pub fn build_add_worker_config(
+        &self,
+        name: &str,
+        cwd: PathBuf,
+        cas_root: Option<&PathBuf>,
+        supervisor_name: &str,
+        teams: Option<&TeamsSpawnConfig>,
+        spec: Option<WorkerSpec>,
+    ) -> PtyConfig {
+        let effective = self.effective_worker_spec(name, spec);
+        let effort_str = effective.effort.map(|e| e.as_claude_arg().to_string());
+        Pane::build_worker_config(
+            name,
+            cwd,
+            cas_root,
+            supervisor_name,
+            effective.cli,
+            effective.model.as_deref(),
+            effort_str.as_deref(),
+            teams,
+        )
+    }
+
     /// Add a worker pane at runtime
     ///
     /// This is the primary method for dynamic worker spawning.
@@ -470,6 +625,11 @@ impl Mux {
     /// * `cwd` - Working directory for the worker (typically a clone directory)
     /// * `cas_root` - Optional path to .cas directory for CAS_ROOT env var
     /// * `supervisor_name` - Name of the supervisor (enables `target: supervisor` in message action)
+    /// * `teams` - Optional native Agent Teams spawn config
+    /// * `spec` - Optional per-call `WorkerSpec` override. When `None`, the
+    ///   per-worker spec stored via `set_worker_spec` (or the Mux-wide default)
+    ///   is used. Callers that do not yet supply per-worker specs should pass
+    ///   `None` to preserve the existing behaviour.
     ///
     /// # Returns
     /// The pane ID on success
@@ -480,20 +640,23 @@ impl Mux {
         cas_root: Option<&PathBuf>,
         supervisor_name: &str,
         teams: Option<&TeamsSpawnConfig>,
+        spec: Option<WorkerSpec>,
     ) -> Result<PaneId> {
         // Check if pane with this name already exists
         if self.panes.contains_key(name) {
             return Err(Error::pty(format!("Pane '{name}' already exists")));
         }
 
+        let effective = self.effective_worker_spec(name, spec);
+        let effort_str = effective.effort.map(|e| e.as_claude_arg().to_string());
         let pane = Pane::worker(
             name,
             cwd,
             cas_root,
             supervisor_name,
-            self.worker_cli,
-            self.worker_model.as_deref(),
-            self.worker_effort.as_deref(),
+            effective.cli,
+            effective.model.as_deref(),
+            effort_str.as_deref(),
             self.rows,
             self.cols,
             teams,

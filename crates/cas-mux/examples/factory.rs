@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         rows: 24,
         cols: 120,
         teams_configs: std::collections::HashMap::new(),
+        resolved_worker_specs: vec![],
     };
 
     println!("Starting factory with:");

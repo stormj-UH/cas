@@ -131,11 +131,25 @@ impl FactoryCore {
         // Get terminal size (use default if running without terminal)
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
-        // Create mux with no panes initially
+        // Create mux with no panes initially.
+        // Build the default spec from singular fields then layer on any per-worker
+        // overrides from the cascade resolver so `spawn_worker` picks them up.
         let mut mux = Mux::new(rows, cols);
-        mux.set_worker_cli(config.worker_cli);
-        mux.set_worker_model(config.worker_model.clone());
-        mux.set_worker_effort(config.worker_effort.clone());
+        let default_effort = config
+            .worker_effort
+            .as_deref()
+            .and_then(|s| s.parse::<cas_mux::Effort>().ok());
+        mux.set_default_worker_spec(cas_mux::WorkerSpec {
+            name: None,
+            cli: config.worker_cli,
+            model: config.worker_model.clone(),
+            effort: default_effort,
+        });
+        for spec in &config.resolved_worker_specs {
+            if let Some(ref name) = spec.name {
+                mux.set_worker_spec(name, spec.clone());
+            }
+        }
 
         // Initialize recording if enabled
         let recording = if config.record {
@@ -253,6 +267,7 @@ impl FactoryCore {
                 self.cas_root.as_ref(),
                 supervisor_name,
                 None, // teams: cas-factory doesn't use native Agent Teams yet
+                None, // spec: use Mux default
             )
             .map_err(|e| FactoryError::Mux(e.to_string()))?;
 
