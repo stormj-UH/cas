@@ -37,7 +37,7 @@ pub struct MuxConfig {
     pub supervisor_model: Option<String>,
     /// Model for workers (passed as --model flag)
     pub worker_model: Option<String>,
-    /// Reasoning effort for supervisor (passed as --effort flag; defaults to "high")
+    /// Reasoning effort for supervisor (passed as --effort flag; defaults to "xhigh")
     pub supervisor_effort: Option<String>,
     /// Reasoning effort for workers (passed as --effort flag; defaults to "high")
     pub worker_effort: Option<String>,

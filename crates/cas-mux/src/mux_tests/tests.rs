@@ -1,4 +1,5 @@
 use crate::mux::*;
+use std::path::PathBuf;
 
 // ── cas-d571: effort config flows through Mux::factory() to PTY args ─────────
 // Tests the full MuxConfig → Mux::factory_pane_configs() → PtyConfig.args chain.
@@ -7,7 +8,6 @@ use crate::mux::*;
 
 #[test]
 fn factory_pane_configs_supervisor_effort_reaches_pty_args() {
-    use std::path::PathBuf;
     let config = MuxConfig {
         cwd: PathBuf::from("/tmp/test"),
         workers: 1,
@@ -29,15 +29,18 @@ fn factory_pane_configs_supervisor_effort_reaches_pty_args() {
         .iter()
         .position(|a| a == "--effort")
         .expect("supervisor PTY args must contain --effort");
+    let effort_val = sup_config
+        .args
+        .get(effort_idx + 1)
+        .expect("--effort must be followed by a value in supervisor PTY args");
     assert_eq!(
-        sup_config.args[effort_idx + 1], "low",
+        effort_val, "low",
         "MuxConfig::supervisor_effort must reach supervisor PTY --effort arg"
     );
 }
 
 #[test]
 fn factory_pane_configs_worker_effort_reaches_pty_args() {
-    use std::path::PathBuf;
     let config = MuxConfig {
         cwd: PathBuf::from("/tmp/test"),
         workers: 1,
@@ -59,8 +62,12 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
         .iter()
         .position(|a| a == "--effort")
         .expect("worker PTY args must contain --effort");
+    let effort_val = worker_config
+        .args
+        .get(effort_idx + 1)
+        .expect("--effort must be followed by a value in worker PTY args");
     assert_eq!(
-        worker_config.args[effort_idx + 1], "high",
+        effort_val, "high",
         "MuxConfig::worker_effort must reach worker PTY --effort arg"
     );
     // supervisor must be last in the returned vec (workers-first ordering)
@@ -73,7 +80,6 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
 
 #[test]
 fn factory_pane_configs_none_effort_uses_role_defaults() {
-    use std::path::PathBuf;
     // When MuxConfig effort fields are None, PtyConfig::claude defaults fire:
     // supervisor → "xhigh", worker → "high"
     let config = MuxConfig {
@@ -97,8 +103,12 @@ fn factory_pane_configs_none_effort_uses_role_defaults() {
         .iter()
         .position(|a| a == "--effort")
         .expect("supervisor PTY args must contain --effort");
+    let sup_effort_val = sup_config
+        .args
+        .get(sup_effort_idx + 1)
+        .expect("--effort must be followed by a value in supervisor PTY args");
     assert_eq!(
-        sup_config.args[sup_effort_idx + 1], "xhigh",
+        sup_effort_val, "xhigh",
         "supervisor with no effort override must default to xhigh"
     );
 
@@ -111,8 +121,12 @@ fn factory_pane_configs_none_effort_uses_role_defaults() {
         .iter()
         .position(|a| a == "--effort")
         .expect("worker PTY args must contain --effort");
+    let worker_effort_val = worker_config
+        .args
+        .get(worker_effort_idx + 1)
+        .expect("--effort must be followed by a value in worker PTY args");
     assert_eq!(
-        worker_config.args[worker_effort_idx + 1], "high",
+        worker_effort_val, "high",
         "worker with no effort override must default to high"
     );
 }
