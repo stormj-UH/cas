@@ -90,6 +90,8 @@ pub(super) fn execute_daemon(
         worker_model: llm.model_for_role("worker").map(String::from),
         supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
         worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
+        resolved_worker_specs: vec![],
+        resolved_supervisor_spec: None,
         enable_worktrees: !no_worktrees,
         worktree_root,
         notify: NotifyConfig {

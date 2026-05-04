@@ -533,7 +533,7 @@ pub struct LlmConfig {
 }
 
 /// Per-role LLM overrides (supervisor or worker)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmRoleConfig {
     /// Override harness for this role
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,5 +671,195 @@ mod tests {
         let fc = parsed.get("factory").expect("section present");
         assert_eq!(fc.cargo_build_jobs, FactoryConfig::default().cargo_build_jobs);
         assert_eq!(fc.nice_cargo, FactoryConfig::default().nice_cargo);
+    }
+
+    // ── LlmConfig::reasoning_effort_for_role ─────────────────────────────────
+    // cas-9393: critical-path method feeds supervisor_effort and worker_effort
+    // through the factory spawn pipeline — must have full coverage.
+
+    /// No config at all → None for every role.
+    #[test]
+    fn reasoning_effort_for_role_no_config_returns_none() {
+        let llm = LlmConfig::default();
+        assert_eq!(llm.reasoning_effort_for_role("supervisor"), None);
+        assert_eq!(llm.reasoning_effort_for_role("worker"), None);
+    }
+
+    /// Top-level `reasoning_effort` is the fallback when no per-role override
+    /// is present. Both supervisor and worker should see it.
+    #[test]
+    fn reasoning_effort_for_role_top_level_fallback() {
+        let llm = LlmConfig {
+            reasoning_effort: Some("medium".to_string()),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("medium"),
+            "supervisor should fall back to top-level reasoning_effort"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("medium"),
+            "worker should fall back to top-level reasoning_effort"
+        );
+    }
+
+    /// A supervisor-specific override shadows the top-level value for the
+    /// supervisor role, while the worker still sees the top-level value.
+    #[test]
+    fn reasoning_effort_for_role_supervisor_override() {
+        let llm = LlmConfig {
+            reasoning_effort: Some("high".to_string()),
+            supervisor: Some(LlmRoleConfig {
+                reasoning_effort: Some("low".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("low"),
+            "supervisor override must shadow top-level value"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("high"),
+            "worker must still see top-level when no worker override is set"
+        );
+    }
+
+    /// A worker-specific override shadows the top-level value for the worker
+    /// role, while the supervisor still sees the top-level value.
+    #[test]
+    fn reasoning_effort_for_role_worker_override() {
+        let llm = LlmConfig {
+            reasoning_effort: Some("medium".to_string()),
+            worker: Some(LlmRoleConfig {
+                reasoning_effort: Some("high".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("high"),
+            "worker override must shadow top-level value"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("medium"),
+            "supervisor must still see top-level when no supervisor override is set"
+        );
+    }
+
+    /// Per-role overrides are independent: supervisor and worker can each have
+    /// their own distinct effort level without interfering with each other.
+    #[test]
+    fn reasoning_effort_for_role_independent_overrides() {
+        let llm = LlmConfig {
+            reasoning_effort: None,
+            supervisor: Some(LlmRoleConfig {
+                reasoning_effort: Some("low".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            worker: Some(LlmRoleConfig {
+                reasoning_effort: Some("high".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("low"),
+            "supervisor-only override must not bleed into worker"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("high"),
+            "worker-only override must not bleed into supervisor"
+        );
+    }
+
+    /// An unknown / unrecognised role is treated as having no per-role override.
+    /// It falls back to the top-level value, or None if the top-level is unset.
+    #[test]
+    fn reasoning_effort_for_role_unknown_role_falls_back_to_top_level() {
+        let llm_with_top = LlmConfig {
+            reasoning_effort: Some("medium".to_string()),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm_with_top.reasoning_effort_for_role("orchestrator"),
+            Some("medium"),
+            "unknown role must fall back to top-level reasoning_effort"
+        );
+
+        let llm_no_top = LlmConfig::default();
+        assert_eq!(
+            llm_no_top.reasoning_effort_for_role("orchestrator"),
+            None,
+            "unknown role with no top-level must return None"
+        );
+    }
+
+    /// A per-role block may exist (e.g. to override harness or model) without
+    /// setting `reasoning_effort`. In that case the top-level value must still
+    /// be returned — the `and_then` short-circuit must not swallow the fallback.
+    #[test]
+    fn reasoning_effort_for_role_partial_override_falls_back_to_top_level() {
+        let llm = LlmConfig {
+            reasoning_effort: Some("high".to_string()),
+            supervisor: Some(LlmRoleConfig {
+                harness: Some("codex".to_string()),
+                reasoning_effort: None, // effort NOT set in the role block
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("high"),
+            "partial role override (harness set, effort absent) must fall back to top-level"
+        );
+    }
+
+    /// Round-trip via TOML deserialization: verifies that the serde attributes
+    /// on `LlmRoleConfig::reasoning_effort` are correct and that the field is
+    /// not silently dropped during deserialization.
+    #[test]
+    fn reasoning_effort_for_role_toml_roundtrip() {
+        let toml_str = r#"
+[llm]
+reasoning_effort = "medium"
+
+[llm.supervisor]
+reasoning_effort = "low"
+
+[llm.worker]
+reasoning_effort = "high"
+"#;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            llm: LlmConfig,
+        }
+        let parsed: Wrapper = toml::from_str(toml_str).expect("valid toml");
+        let llm = parsed.llm;
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            Some("low"),
+            "supervisor reasoning_effort must survive TOML deserialization"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some("high"),
+            "worker reasoning_effort must survive TOML deserialization"
+        );
+        // Top-level fallback still works after round-trip
+        assert_eq!(
+            llm.reasoning_effort_for_role("orchestrator"),
+            Some("medium"),
+            "top-level reasoning_effort must survive TOML deserialization"
+        );
     }
 }
