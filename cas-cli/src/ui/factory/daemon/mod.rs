@@ -220,3 +220,79 @@ pub use process::{
     ForkResult, daemonize, fork_into_daemon, run_daemon, run_daemon_after_fork,
     run_daemon_with_boot_progress,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::PendingSpawn;
+    use cas_mux::{Effort, SupervisorCli, WorkerSpec};
+
+    /// AC3 (cas-4cae): verify a codex spec stored in PendingSpawn reaches mux.add_worker.
+    ///
+    /// Simulates the routing chain introduced by T2:
+    ///   ClientMessage::SpawnWorkers { specs: [Some(codex_spec)] }
+    ///     → ws_client/gui_client handler → PendingSpawn::Named { spec: Some(..) }
+    ///     → queue_and_events: spec extracted from spawn_task tuple
+    ///     → finish_worker_spawn(result, teams, pending_spec)
+    ///     → mux.add_worker(..., spec)                   ← tested via build_add_worker_config
+    ///
+    /// build_add_worker_config is the PTY-free test proxy for add_worker; it builds
+    /// the PtyConfig that add_worker would spawn without touching real processes.
+    #[test]
+    fn pending_spawn_codex_spec_routes_to_mux_add_worker() {
+        let codex_spec = WorkerSpec {
+            name: Some("alice".to_string()),
+            cli: SupervisorCli::Codex,
+            model: Some("gpt-5o".to_string()),
+            effort: Some(Effort::Medium),
+        };
+
+        // Step 1: handler pushes PendingSpawn with the spec (simulates ws_client / gui_client).
+        let pending = PendingSpawn::Named {
+            name: "alice".to_string(),
+            isolate: false,
+            spec: Some(codex_spec.clone()),
+        };
+
+        // Step 2: queue_and_events extracts spec from spawn_task tuple after the blocking
+        // prepare phase completes.  Verify PendingSpawn correctly preserves the spec.
+        let extracted_spec = match pending {
+            PendingSpawn::Named { spec, .. } => spec,
+            _ => panic!("unexpected PendingSpawn variant"),
+        };
+        assert_eq!(
+            extracted_spec,
+            Some(codex_spec.clone()),
+            "PendingSpawn::Named must preserve the caller-supplied WorkerSpec"
+        );
+
+        // Step 3: spec is forwarded to mux.add_worker (here via build_add_worker_config,
+        // the PTY-free proxy used in tests).  Verify codex spec produces codex binary.
+        let mut mux = cas_mux::Mux::new(24, 80);
+        // Default is Claude — the spec override must win.
+        mux.set_default_worker_spec(WorkerSpec {
+            name: None,
+            cli: SupervisorCli::Claude,
+            model: None,
+            effort: None,
+        });
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let config = mux
+            .build_add_worker_config("alice", tmpdir.path().to_path_buf(), None, "supervisor", None, extracted_spec);
+
+        // When `nice` wraps the binary, the actual command is at args[2].
+        // See cas-mux/src/mux_tests/tests.rs::effective_command for the same pattern.
+        let effective_cmd = if config.command == "nice" {
+            config.args.get(2).map(String::as_str).unwrap_or("nice")
+        } else {
+            &config.command
+        };
+        assert!(
+            effective_cmd.contains("codex"),
+            "codex WorkerSpec must reach mux.add_worker and select the codex binary; \
+             got effective command: {:?} (command={:?}, args={:?})",
+            effective_cmd,
+            config.command,
+            config.args
+        );
+    }
+}
