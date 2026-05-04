@@ -624,6 +624,48 @@ impl Default for SyncConfig {
     }
 }
 
+/// Code-review ownership configuration (cas-b51a).
+///
+/// Controls whether the multi-persona review pipeline runs in the worker's
+/// close gate (legacy) or is deferred to the supervisor's review queue.
+///
+/// ```toml
+/// [code_review]
+/// owner = "supervisor"  # or "worker" (default)
+/// ```
+///
+/// - `"worker"` (default): existing behaviour — worker dispatches
+///   `cas-code-review` before close; ~14 min per close.
+/// - `"supervisor"`: worker runs a lightweight structural lint and
+///   transitions the task to `PendingSupervisorReview`; supervisor
+///   invokes `cas-code-review` on their own schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeReviewConfig {
+    /// Who owns the full cas-code-review dispatch: `"worker"` or `"supervisor"`.
+    /// Default is `"worker"` (backward-compat). Stage 2 will flip to `"supervisor"`.
+    #[serde(default = "default_code_review_owner")]
+    pub owner: String,
+}
+
+fn default_code_review_owner() -> String {
+    "worker".to_string()
+}
+
+impl Default for CodeReviewConfig {
+    fn default() -> Self {
+        Self {
+            owner: default_code_review_owner(),
+        }
+    }
+}
+
+impl CodeReviewConfig {
+    /// Returns true when the supervisor owns the full review dispatch.
+    pub fn supervisor_owned(&self) -> bool {
+        self.owner.eq_ignore_ascii_case("supervisor")
+    }
+}
+
 /// `[integrations]` — gates Phase-3 doctor-and-banner behavior for the
 /// vercel/neon/github auto-integration family (EPIC cas-b65f). Default-off
 /// across the board so an absent or empty section preserves the prior UX.

@@ -235,6 +235,12 @@ impl DirectorData {
                             *epic_closed_counts.entry(epic_id.clone()).or_insert(0) += 1;
                         }
                     }
+                    // cas-b51a: show tasks awaiting supervisor review as a
+                    // separate in-progress bucket so the TUI surfaces them
+                    // for the supervisor to act on.
+                    TaskStatus::PendingSupervisorReview => {
+                        in_progress_tasks.push(to_summary(task));
+                    }
                 }
             }
         }

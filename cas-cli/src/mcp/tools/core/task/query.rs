@@ -162,6 +162,8 @@ impl CasCore {
                                 TaskStatus::InProgress => "●",
                                 TaskStatus::Blocked => "◉",
                                 TaskStatus::Closed => "✓",
+                                // cas-b51a: awaiting supervisor code-review
+                                TaskStatus::PendingSupervisorReview => "⏳",
                             };
                             output.push_str(&format!(
                                 "  {} {} [P{}] {}\n",
