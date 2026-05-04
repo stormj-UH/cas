@@ -3097,4 +3097,16 @@ async fn test_worker_self_cert_blocked_when_fresh_dispatch_row_exists() {
         "dispatch row summary must still start with 'Dispatch requested' — must not have been overwritten: {}",
         row_after.summary
     );
+
+    // Exactly one verification row must exist — the original dispatch row.
+    // A second Skipped row would indicate the self-cert path ran before being
+    // blocked, which is the exact bug cas-164c was fixing.
+    let all_rows = verification_store
+        .get_for_task(&id)
+        .expect("get_for_task should succeed");
+    assert_eq!(
+        all_rows.len(),
+        1,
+        "exactly one verification row (the dispatch row) must exist after blocked second close — a Skipped row would indicate self-cert ran despite in_flight_dispatch=true"
+    );
 }
