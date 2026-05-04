@@ -325,6 +325,27 @@ mod tests {
         );
     }
 
+    /// cas-eeab: verify AuditTrailGap Display/FromStr round-trip and icon are
+    /// consistent so a typo in either direction is caught at test time rather than
+    /// silently misfiled in the daemon's event store.
+    #[test]
+    fn test_audit_trail_gap_round_trips() {
+        let s = EventType::AuditTrailGap.to_string();
+        assert_eq!(s, "audit_trail_gap");
+        assert_eq!(
+            s.parse::<EventType>().unwrap(),
+            EventType::AuditTrailGap
+        );
+        // Icon must be non-empty (used by TUI icon column); icon() is on Event, not EventType
+        let event = Event::new(
+            EventType::AuditTrailGap,
+            EventEntityType::Task,
+            "cas-test",
+            "test gap",
+        );
+        assert!(!event.icon().is_empty());
+    }
+
     #[test]
     fn test_event_new() {
         let event = Event::new(

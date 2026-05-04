@@ -1576,7 +1576,16 @@ impl CasCore {
             description,
             entity_id: Some(task_id.to_string()),
         };
-        let _ = crate::mcp::socket::send_event(&self.cas_root, &gap_event);
+        if let Err(e) = crate::mcp::socket::send_event(&self.cas_root, &gap_event) {
+            // Fire-and-forget, but log the failure so that a double-silent failure
+            // (store write fails AND socket send fails) leaves at least a trace.
+            // cas-eeab: safe_auto autofix for silently discarded send_event result.
+            tracing::warn!(
+                task_id = %task_id,
+                error = %e,
+                "failed to emit audit_trail_gap event to daemon socket"
+            );
+        }
     }
 }
 

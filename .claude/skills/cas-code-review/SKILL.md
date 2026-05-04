@@ -1,6 +1,6 @@
 ---
 name: cas-code-review
-description: Multi-persona code review orchestrator. Runs as the pre-close quality gate for CAS factory workers and also on manual invocation. Dispatches 5 always-on reviewer personas (correctness, testing, maintainability, project-standards, fallow) plus any activated conditional personas (security, performance, adversarial) in parallel against the current diff, merges their structured findings through a deterministic pipeline, and routes results according to the invocation mode. Trigger automatically at `task.close` in `autofix` mode (the primary path), or manually for interactive review, report-only scans, or headless skill-to-skill calls.
+description: Multi-persona code review orchestrator. Runs as the pre-close quality gate for CAS factory workers and also on manual invocation. Dispatches 4 always-on reviewer personas (correctness, testing, maintainability, project-standards) plus fallow (dispatched only on JS/TS diffs) and any activated conditional personas (security, performance, adversarial) in parallel against the current diff, merges their structured findings through a deterministic pipeline, and routes results according to the invocation mode. Trigger automatically at `task.close` in `autofix` mode (the primary path), or manually for interactive review, report-only scans, or headless skill-to-skill calls.
 managed_by: cas
 ---
 
@@ -9,7 +9,7 @@ managed_by: cas
 This skill is the orchestrator for CAS's Phase 1 multi-persona code review pipeline. It does **not** perform the review itself — each reviewer persona is a separate Sonnet sub-agent with its own prompt under `references/personas/`. Your job in this skill is to:
 
 1. Figure out **what** is being reviewed (the diff + the author's intent).
-2. Decide **who** reviews it (the 5 always-on personas plus any activated conditional ones).
+2. Decide **who** reviews it (the 4 always-on personas, plus fallow when the repo is JS/TS, plus any activated conditional ones).
 3. Run them in **parallel**, collect their structured output envelopes.
 4. Hand the merged findings to the merge pipeline (Unit 5) and then route them according to the invocation mode.
 
@@ -40,6 +40,16 @@ Do **not** invoke this skill manually as a substitute for `mcp__cas__verificatio
 
 If you receive none of these (bare manual invocation), default `mode=interactive`, resolve `base_sha` via the Unit 3 helper, and proceed.
 
+## Step 0: Tiny-diff bypass
+
+Before any other work, check whether the diff is large enough or non-trivial enough to warrant the full multi-persona pipeline. The Rust-side `cas_task_close` gate already skips the multi-persona reviewer on docs-only / test-only / empty diffs via `has_reviewable_changes` (see `cas-cli/src/mcp/tools/core/task/lifecycle/close_ops.rs`). The orchestrator skill MUST mirror that check at the prompt level so the cost is paid neither in the skill nor in the gate. Specifically:
+
+1. Run `git diff --name-only <base_sha>..HEAD`. If every changed file matches a docs path (`*.md`, anything under `docs/`) OR a test path (`tests/`, `test/`, `*_test.rs`, `*.test.ts`, `*.spec.ts`, `*.test.tsx`, `*.spec.tsx`) — return a clean Allow envelope WITHOUT dispatching any personas. Output: `{"residual": [], "pre_existing": [], "mode": "<mode>", "skipped_reason": "diff is docs-only / test-only — no reviewable code paths"}`.
+2. Otherwise, run `git diff --shortstat <base_sha>..HEAD`. If the result shows fewer than **5 lines changed total** AND the changed files are all already-existing files (no new files), return a clean Allow envelope as above with `"skipped_reason": "diff is trivial (<5 lines, no new files) — full review pipeline not warranted"`. (5-line threshold: anything smaller is typically a typo fix, a const tweak, or a one-line guard. Bigger jobs deserve the full pipeline.)
+3. Otherwise, proceed to Step 1 as written.
+
+This bypass exists because the orchestrator + 4–8 personas + full diff feed costs ~100K input tokens; running it on a 2-line typo fix is pure waste. The mode-specific gating (autofix vs. interactive vs. report-only) still works — the bypass returns the same envelope shape, so callers cannot tell the difference structurally.
+
 ## Step 1: Intent extraction
 
 Before dispatching any reviewer, write a **2–3 line intent summary** describing *what the author was trying to accomplish*. This becomes an input to every persona so their calibration matches the author's stated goal — a "refactor only" change is judged differently from a "new security-sensitive endpoint".
@@ -61,7 +71,9 @@ Keep it tight. Personas use this to calibrate severity, not to learn the problem
 
 ## Step 2: Conditional persona selection (LLM-judged, not path pattern matching)
 
-The **5 always-on personas always run**: `correctness`, `testing`, `maintainability`, `project-standards`, `fallow`. No conditions, no exceptions. The `fallow` persona is a thin wrapper around the deterministic `fallow audit` CLI — it self-skips on non-JS/TS repos / diffs and on missing-binary; it is "always-on" in the sense that the orchestrator always dispatches it and lets the persona's internal skip rules decide whether to emit findings. See `references/personas/fallow.md` for the skip contract.
+The **4 always-on personas always run**: `correctness`, `testing`, `maintainability`, `project-standards`. No conditions, no exceptions.
+
+The `fallow` persona is a thin wrapper around the deterministic `fallow audit` CLI. **Skip dispatching `fallow` entirely** when the orchestrator detects the repo is non-JS/TS (no `package.json` at the repo root AND no `*.ts`/`*.tsx`/`*.js`/`*.jsx` in the diff). Record this skip explicitly in the output envelope as `"skipped": ["fallow"], "skip_reason": {"fallow": "non-JS/TS repo: no package.json and no JS/TS files in diff"}` so the audit trail honestly reflects that fallow was considered and excluded by rule, not silently dropped. When the repo is JS/TS, dispatch fallow and let its internal `fallow audit` CLI return whatever it returns (including a clean no-finding envelope on a small diff).
 
 The **3 conditional personas** — `security`, `performance`, `adversarial` — activate based on the R2 heuristics below. **Critically: you activate them by reading the diff and judging whether the heuristic applies. This is an LLM judgment, LLM-judged, not path pattern matching.** Do not grep for `/auth/` in paths and call it security activation. Do not count lines with `regex`. Read the diff, understand what it does, decide whether the heuristic fires.
 
@@ -71,13 +83,13 @@ Why the stridency: past iterations of automated review have drifted into "activa
 
 - **`security`** — activate when the diff touches authentication boundaries, user input handling, or permission surfaces. Concretely: session/token issuance, signature checks, role/permission gates, anywhere external input is parsed or deserialized, anywhere a privilege decision is made. Changes that merely *pass through* auth-adjacent code without touching its logic do not require security review.
 - **`performance`** — activate when the diff touches DB queries, data transforms on potentially large inputs, caching, or async code paths. Concretely: SQL/Prisma query construction, sort/group/aggregate logic, cache read/write/invalidation, new `async`/`await` usage in hot paths, anything touching a loop whose bound comes from untrusted data. Changes to one-shot, small-N, non-hot-path code usually do not.
-- **`adversarial`** — activate when **either** (a) the diff is 50+ changed non-test lines, **or** (b) the diff touches any CAS high-stakes module: task verification flow (`close_ops`, `verify_ops`), factory coordination (spawn / message / queue / lifecycle), SQLite store mutations, hook system (`pre_tool`, `post_tool`), MCP tool dispatch. Either condition is sufficient. This is the persona that stress-tests for "what could go wrong under concurrent factory sessions", "what happens when this lease expires mid-operation", "what's the cascade when this assertion fires in production" — exactly the failure modes the Phase 0 debugging history documents.
+- **`adversarial`** — activate when **both** (a) the diff is **50+ changed non-test lines**, **and** (b) the diff touches any CAS high-stakes module: task verification flow (`close_ops`, `verify_ops`), factory coordination (spawn / message / queue / lifecycle), SQLite store mutations, hook system (`pre_tool`, `post_tool`), MCP tool dispatch. Both conditions must hold. Additionally, **always skip adversarial** when the total diff is **under 20 changed lines** regardless of which files are touched — small surgical fixes do not warrant the heaviest persona's stress-testing budget. Tiny diffs that genuinely warrant adversarial scrutiny (e.g., a 5-line concurrency primitive change) are vanishingly rare and `correctness` already covers logic bugs in that range. Record the activation decision and reason in the output envelope as before. This is the persona that stress-tests for "what could go wrong under concurrent factory sessions", "what happens when this lease expires mid-operation", "what's the cascade when this assertion fires in production" — exactly the failure modes the Phase 0 debugging history documents.
 
 Record your activation decision explicitly in the output envelope so a reader can see *which* personas ran and *why* the conditional ones were included. Example: `"activated": ["security", "adversarial"], "activation_reason": {"security": "diff adds a new MCP tool handler that parses untrusted input", "adversarial": "diff is 83 non-test lines and touches close_ops.rs"}`.
 
 ## Step 3: Parallel dispatch
 
-Spawn all activated personas in parallel via the Task tool. This is a single message with one Task tool call per persona — **not** a sequential loop. Opus can issue all 5–8 Task calls in a single response; do so.
+Spawn all activated personas in parallel via the Task tool. This is a single message with one Task tool call per persona — **not** a sequential loop. Opus can issue all 4–8 Task calls in a single response; do so.
 
 For each persona, the Task tool call passes:
 
