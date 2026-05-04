@@ -9,7 +9,7 @@ use tempfile::TempDir;
 /// Helper to create CasService for server protocol tests
 fn setup_service() -> (TempDir, CasService) {
     let (temp, core) = setup_cas();
-    (temp, CasService::new(core))
+    (temp, CasService::new(core, None))
 }
 
 #[test]

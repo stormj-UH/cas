@@ -1787,7 +1787,7 @@ async fn test_factory_worker_close_hits_narrowed_jail() {
     let (temp, core) = setup_cas();
     let _env_lock = env_test_lock();
     let _cas_dir = temp.path().join(".cas");
-    let service = CasService::new(core);
+    let service = CasService::new(core, None);
     let _env = FactoryWorkerEnv::enter();
 
     // Create and start a task so it's leased + InProgress with no verification.
@@ -1844,7 +1844,7 @@ async fn test_skipped_verification_row_satisfies_jail_and_close() {
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
     let verification_store = open_verification_store(&cas_dir).unwrap();
-    let service = CasService::new(core);
+    let service = CasService::new(core, None);
     let _env = FactoryWorkerEnv::enter();
 
     // Create + start a task so it's leased + InProgress.
@@ -1916,7 +1916,7 @@ async fn test_skipped_verification_row_satisfies_jail_and_close() {
 async fn test_factory_worker_non_close_mutation_still_exempt() {
     let (_temp, core) = setup_cas();
     let _env_lock = env_test_lock();
-    let service = CasService::new(core);
+    let service = CasService::new(core, None);
     let _env = FactoryWorkerEnv::enter();
 
     // Task A: will be leased + jailed (no verification record).
@@ -1986,7 +1986,7 @@ async fn test_task_close_succeeds_after_verifier_clearance() {
     let cas_dir = temp.path().join(".cas");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
-    let service = CasService::new(core);
+    let service = CasService::new(core, None);
     let _env = FactoryWorkerEnv::enter();
 
     let created = service

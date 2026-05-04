@@ -7,7 +7,7 @@ use tempfile::TempDir;
 /// Helper to setup CAS with CasService for consolidated tools
 fn setup_cas_service() -> (TempDir, CasService) {
     let (temp, core) = setup_cas();
-    (temp, CasService::new(core))
+    (temp, CasService::new(core, None))
 }
 
 /// Create a SpecRequest with only the action set
