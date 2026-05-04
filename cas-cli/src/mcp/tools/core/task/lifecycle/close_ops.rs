@@ -490,12 +490,13 @@ impl CasCore {
                         // envelope (or without any envelope) continue to the
                         // existing jail-arming path below.
                         //
-                        // Note: the downstream code_review_gate (below) calls
-                        // evaluate_gate() on residual, which re-validates
-                        // PR-introduced P0s — but does NOT replicate the
-                        // per-finding pre_existing forgery defence added here in
-                        // worker_review_envelope_is_clean. The full predicate
-                        // (including the forgery defence) is enforced solely here.
+                        // Note: the downstream code_review_gate (below) also
+                        // applies the full forgery defence (cas-4c64): Check A
+                        // blocks any P0 in residual[] regardless of the
+                        // per-finding pre_existing flag, and Check B blocks any
+                        // P0 in pre_existing[]. Both this predicate and
+                        // run_code_review_gate enforce the defence symmetrically.
+                        // If you tighten either, tighten both.
                         let envelope_str = req
                             .code_review_findings
                             .as_deref()
@@ -2131,10 +2132,11 @@ pub(crate) enum CodeReviewGateOutcome {
 ///   `CODE_REVIEW_REQUIRED`, pointing the worker at the skill.
 /// - `code_review_findings == Some(envelope)` that fails
 ///   [`ReviewOutcome::validate`] → [`Reject`] as a malformed envelope.
-/// - Otherwise → defer to
-///   [`cas_store::code_review::close_gate::evaluate_gate`]. Any
-///   non-pre-existing P0 in `residual` → [`Reject`] with a formatted
-///   block message; else [`Proceed`].
+/// - Otherwise → run the full forgery defence (cas-4c64): Check A
+///   rejects any P0 in `residual[]` regardless of the per-finding
+///   `pre_existing` flag; Check B rejects any P0 in `pre_existing[]`.
+///   Then [`evaluate_gate`] is called as a safety net. Any rejection
+///   returns a formatted block message; all checks pass → [`Proceed`].
 pub(crate) fn run_code_review_gate(
     task: &Task,
     req: &TaskCloseRequest,
