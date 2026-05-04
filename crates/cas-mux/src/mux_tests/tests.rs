@@ -320,6 +320,88 @@ fn effective_worker_spec_uses_worker_specs_map() {
 
 // ── end priority-2 coverage ───────────────────────────────────────────────────
 
+// ── cas-35fe: custom worker_names branch ─────────────────────────────────────
+
+#[test]
+fn factory_pane_configs_custom_worker_names() {
+    // Use names that differ from auto-generated "worker-1"/"worker-2" so that
+    // a regression swapping the custom-names branch back to auto-generation
+    // would cause the assertions to fail.
+    let config = MuxConfig {
+        cwd: std::path::PathBuf::from("/tmp/test"),
+        workers: 2,
+        worker_names: vec!["alice".to_string(), "bob".to_string()],
+        include_director: false,
+        supervisor_cli: crate::harness::SupervisorCli::Claude,
+        worker_cli: crate::harness::SupervisorCli::Claude,
+        ..MuxConfig::default()
+    };
+    let configs = Mux::factory_pane_configs(&config);
+
+    let names: Vec<&str> = configs.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"alice"),
+        "factory_pane_configs must honour custom worker name 'alice'"
+    );
+    assert!(
+        names.contains(&"bob"),
+        "factory_pane_configs must honour custom worker name 'bob'"
+    );
+    assert!(
+        !names.contains(&"worker-1"),
+        "factory_pane_configs must NOT auto-generate names when worker_names is non-empty"
+    );
+    assert!(
+        !names.contains(&"worker-2"),
+        "factory_pane_configs must NOT auto-generate names when worker_names is non-empty"
+    );
+}
+
+// ── end cas-35fe ──────────────────────────────────────────────────────────────
+
+// ── cas-5175: set_default_worker_spec → add_worker effort propagation ─────────
+
+#[test]
+fn add_worker_effort_propagates_to_pty_args() {
+    // Verify that effort set on the Mux-wide default flows through
+    // effective_worker_spec → build_add_worker_config → PtyConfig args.
+    // Uses the config-only build_add_worker_config helper (no PTY spawn).
+    use crate::spec::Effort;
+
+    let mut mux = Mux::new(24, 80);
+    mux.set_default_worker_spec(crate::spec::WorkerSpec {
+        name: None,
+        cli: crate::harness::SupervisorCli::Claude,
+        model: None,
+        effort: Some(Effort::Low),
+    });
+
+    let pty = mux.build_add_worker_config(
+        "effort-worker",
+        std::path::PathBuf::from("/tmp/test"),
+        None,
+        "supervisor",
+        None,
+        None, // no explicit override → falls through to default
+    );
+
+    let effort_idx = pty
+        .args
+        .iter()
+        .position(|a| a == "--effort")
+        .expect("--effort must appear in PTY args when effort is set on the Mux default");
+    let effort_val = pty
+        .args
+        .get(effort_idx + 1)
+        .expect("--effort must be followed by a value");
+    assert_eq!(
+        effort_val, "low",
+        "Effort::Low must reach PTY args as \"low\" via the default spec path"
+    );
+}
+
+// ── end cas-5175 ──────────────────────────────────────────────────────────────
+
 #[test]
 fn test_mux_new() {
     let mux = Mux::new(24, 80);

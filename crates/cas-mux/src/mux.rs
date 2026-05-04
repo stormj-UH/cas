@@ -209,6 +209,22 @@ impl Mux {
             .unwrap_or_else(|| self.default_worker_spec.clone())
     }
 
+    /// Resolve the worker names for a [`MuxConfig`].
+    ///
+    /// If `config.worker_names` is non-empty those names are used as-is.
+    /// Otherwise names are auto-generated as `worker-1`, `worker-2`, … up to
+    /// `config.workers`.  Extracted to eliminate the identical block that
+    /// previously appeared in both `factory_pane_configs` and `factory`.
+    fn resolve_worker_names(config: &MuxConfig) -> Vec<String> {
+        if config.worker_names.is_empty() {
+            (0..config.workers)
+                .map(|i| format!("worker-{}", i + 1))
+                .collect()
+        } else {
+            config.worker_names.clone()
+        }
+    }
+
     /// Resolve the CLI, model string, and effort string for a named worker
     /// from a [`MuxConfig`].
     ///
@@ -247,13 +263,7 @@ impl Mux {
     /// flow from `MuxConfig` all the way to the CLI subprocess arguments,
     /// without requiring a real `claude` or `codex` binary.
     pub fn factory_pane_configs(config: &MuxConfig) -> Vec<(String, PtyConfig)> {
-        let worker_names: Vec<String> = if config.worker_names.is_empty() {
-            (0..config.workers)
-                .map(|i| format!("worker-{}", i + 1))
-                .collect()
-        } else {
-            config.worker_names.clone()
-        };
+        let worker_names = Self::resolve_worker_names(config);
 
         let mut result = Vec::with_capacity(worker_names.len() + 1);
 
@@ -332,13 +342,7 @@ impl Mux {
         let pane_rows = config.rows;
 
         // Create worker panes
-        let worker_names: Vec<String> = if config.worker_names.is_empty() {
-            (0..config.workers)
-                .map(|i| format!("worker-{}", i + 1))
-                .collect()
-        } else {
-            config.worker_names.clone()
-        };
+        let worker_names = Self::resolve_worker_names(&config);
 
         for name in &worker_names {
             // Use worker-specific CWD if available, otherwise fall back to default
