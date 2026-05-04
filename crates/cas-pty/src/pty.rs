@@ -255,7 +255,7 @@ impl PtyConfig {
         supervisor_name: Option<&str>,
         factory_worker_cli: Option<&str>,
         model: Option<&str>,
-        _effort: Option<&str>,
+        effort: Option<&str>,
         _teams: Option<&TeamsSpawnConfig>,
     ) -> Self {
         // Native Agent Teams is Claude Code-only; Codex CLI does not support it.
@@ -313,6 +313,12 @@ impl PtyConfig {
         if let Some(m) = model {
             args.push("--model".to_string());
             args.push(m.to_string());
+        }
+        // Codex CLI 0.128.0 has no --effort flag; effort is set via -c TOML override.
+        // Valid values: none, minimal, low, medium, high, xhigh (same vocabulary as Claude).
+        if let Some(e) = effort {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort={e}"));
         }
 
         if role == "supervisor" {
@@ -1093,6 +1099,49 @@ mod tests {
             .position(|a| a == "--effort")
             .expect("--effort must be present");
         assert_eq!(config.args[effort_idx + 1], "high");
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_codex_with_effort() {
+        let config = PtyConfig::codex(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            Some("medium"),  // effort
+            None,  // teams
+        );
+        let c_idx = config
+            .args
+            .iter()
+            .position(|a| a == "-c")
+            .expect("-c flag must be present when effort is Some");
+        assert_eq!(
+            config.args[c_idx + 1], "model_reasoning_effort=medium",
+            "effort override must emit model_reasoning_effort TOML key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pty_config_codex_no_effort_when_none() {
+        let config = PtyConfig::codex(
+            "test-agent",
+            "worker",
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            None,
+            None,  // model
+            None,  // effort — None means no override
+            None,  // teams
+        );
+        assert!(
+            !config.args.iter().any(|a| a.starts_with("model_reasoning_effort")),
+            "no model_reasoning_effort arg should be emitted when effort is None"
+        );
     }
 
     #[tokio::test]
