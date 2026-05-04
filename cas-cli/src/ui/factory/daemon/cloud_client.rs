@@ -916,11 +916,25 @@ fn handle_cloud_command(
                 .get("isolate")
                 .and_then(|i| i.as_bool())
                 .unwrap_or(false);
-            // cas-4cae: per-worker spec support for the cloud path requires a spawn queue schema
-            // update (T3/cas-2992). For now, spec overrides via the cloud protocol are silently
-            // dropped and the session default applies.
+            // cas-2992: build per-worker spec from optional cli/model/effort fields
+            // forwarded by the cloud relay.  Invalid values are logged and ignored so
+            // a malformed cloud message doesn't bring down the handler.
+            let spec_json_owned = {
+                let cli = params.get("cli").and_then(|v| v.as_str());
+                let model = params.get("model").and_then(|v| v.as_str());
+                let effort = params.get("effort").and_then(|v| v.as_str());
+                match crate::mcp::tools::service::factory_ops::build_spawn_spec_json(
+                    cli, model, effort,
+                ) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::warn!("Cloud spawn_workers: invalid spec override ({}); ignoring", e);
+                        None
+                    }
+                }
+            };
             match crate::store::open_spawn_queue_store(cas_dir) {
-                Ok(queue) => match queue.enqueue_spawn(count, &names, isolate) {
+                Ok(queue) => match queue.enqueue_spawn(count, &names, isolate, spec_json_owned.as_deref()) {
                     Ok(id) => {
                         tracing::info!("Cloud spawn_workers queued (id={}): count={}", id, count)
                     }

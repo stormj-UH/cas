@@ -5,6 +5,7 @@ use crate::ui::factory::{
     daemon_log_path, daemonize, fork_first_daemon, run_boot_screen_client,
 };
 use anyhow::{Result, bail};
+use cas_factory::spec_resolver::{ConfigSources, resolve_specs};
 use std::time::Duration;
 
 #[allow(clippy::too_many_arguments)]
@@ -24,6 +25,7 @@ pub(super) fn execute_daemon(
     boot_progress: bool,
     supervisor_name: Option<String>,
     worker_names: Vec<String>,
+    worker_spec_jsons: Vec<String>,
 ) -> Result<()> {
     let cas_root = find_cas_root()?;
     let cas_config = Config::load(&cas_root).unwrap_or_default();
@@ -66,6 +68,27 @@ pub(super) fn execute_daemon(
 
     let llm = cas_config.llm();
 
+    // Resolve per-worker specs from the cascade (cas-2992).
+    let resolved_worker_specs = {
+        let sources = ConfigSources {
+            cli_flag: if worker_cli != cas_mux::SupervisorCli::Claude {
+                Some(worker_cli)
+            } else {
+                None
+            },
+            model_flag: llm.model_for_role("worker").map(String::from),
+            effort_flag: llm
+                .reasoning_effort_for_role("worker")
+                .and_then(|s| s.parse().ok()),
+            worker_spec_jsons,
+            user_config: None, // auto-resolve from home dir
+            project_config: Some(cwd.join(".cas").join("config.toml")),
+        };
+        resolve_specs(effective_workers, sources).map_err(|e| {
+            anyhow::anyhow!("Failed to resolve worker specs: {e}")
+        })?
+    };
+
     // Resolve supervisor name up front so teams_configs and FactoryConfig agree.
     // When the caller doesn't provide a name, generate one so the teams config
     // key matches the Mux pane name (app/init.rs uses generate_unique for this).
@@ -90,7 +113,7 @@ pub(super) fn execute_daemon(
         worker_model: llm.model_for_role("worker").map(String::from),
         supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
         worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
-        resolved_worker_specs: vec![],
+        resolved_worker_specs,
         resolved_supervisor_spec: None,
         enable_worktrees: !no_worktrees,
         worktree_root,

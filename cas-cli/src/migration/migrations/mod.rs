@@ -175,6 +175,7 @@ mod m197_skills_add_share;
 mod m198_tasks_add_share;
 pub mod m199_known_repos;
 mod m200_agents_add_pid_starttime;
+mod m201_spawn_queue_add_worker_spec;
 
 /// All migrations in order. IDs must be sequential and never reused.
 pub const MIGRATIONS: &[Migration] = &[
@@ -349,6 +350,8 @@ pub const MIGRATIONS: &[Migration] = &[
     m199_known_repos::MIGRATION,
     // Typed PID-reuse fingerprint on agents (EPIC cas-9508 / cas-b157)
     m200_agents_add_pid_starttime::MIGRATION,
+    // Add worker_spec column to spawn_queue for per-worker CLI/model/effort overrides (cas-2992)
+    m201_spawn_queue_add_worker_spec::MIGRATION,
 ];
 
 #[cfg(test)]

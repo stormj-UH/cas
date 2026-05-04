@@ -201,6 +201,9 @@ fn factory_req(action: &str) -> FactoryRequest {
         remind_filter: None,
         remind_id: None,
         remind_ttl_secs: None,
+        cli: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -293,6 +296,74 @@ async fn test_spawn_workers_closed_epic_not_counted() {
     let result = env.service.factory(Parameters(req)).await;
 
     assert!(result.is_err(), "Closed epic should not count as active");
+}
+
+// cas-2992: spawn_workers with cli/model/effort overrides
+#[tokio::test]
+async fn test_spawn_workers_cli_codex_enqueues_spec() {
+    // Given a spawn_workers request with cli=codex,
+    // the queued SpawnRequest.worker_spec should contain "codex".
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.cli = Some("codex".to_string());
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok(), "spawn_workers with cli=codex should succeed");
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1, "should have one queue entry");
+
+    let spec_json = entries[0]
+        .worker_spec
+        .as_deref()
+        .expect("worker_spec should be set when cli override given");
+    assert!(
+        spec_json.contains("codex"),
+        "spec JSON should mention 'codex': {spec_json}"
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_workers_invalid_cli_returns_error() {
+    // An unrecognised cli value should return an MCP error, not silently use defaults.
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(1);
+    req.cli = Some("openai".to_string()); // invalid
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_err(), "invalid cli should return error");
+    let err = result.unwrap_err();
+    assert!(
+        err.message.contains("openai") || err.message.contains("cli"),
+        "error should mention the invalid value: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn test_spawn_workers_no_cli_override_has_no_spec() {
+    // Without cli/model/effort fields, worker_spec should be None (session defaults).
+    let env = FactoryTestEnv::new();
+    env.create_epic("Test Epic");
+
+    let mut req = factory_req("spawn_workers");
+    req.count = Some(2);
+
+    let result = env.service.factory(Parameters(req)).await;
+    assert!(result.is_ok());
+
+    let entries = env.spawn_queue().peek(10).expect("peek");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].worker_spec.is_none(),
+        "no cli/model/effort → worker_spec should be None (session default)"
+    );
 }
 
 // =============================================================================

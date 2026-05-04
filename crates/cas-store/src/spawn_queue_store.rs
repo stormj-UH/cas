@@ -58,6 +58,12 @@ pub struct SpawnRequest {
     pub force: bool,
     /// Whether spawned workers should be isolated in their own git worktrees
     pub isolate: bool,
+    /// Per-worker spec override serialized as JSON (cas-2992).
+    ///
+    /// `Some(json)` carries a `WorkerSpec`-compatible JSON object.  Callers
+    /// in `cas-cli` (which depend on `cas-mux`) deserialise this into a
+    /// `WorkerSpec` at consumption time.  `None` means "use session default".
+    pub worker_spec: Option<String>,
     /// When the request was queued
     pub created_at: DateTime<Utc>,
     /// When the request was processed (None if pending)
@@ -73,6 +79,7 @@ CREATE TABLE IF NOT EXISTS spawn_queue (
     worker_names TEXT,
     force INTEGER NOT NULL DEFAULT 0,
     isolate INTEGER NOT NULL DEFAULT 0,
+    worker_spec TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT
 );
@@ -85,8 +92,19 @@ pub trait SpawnQueueStore: Send + Sync {
     /// Initialize the store (create tables)
     fn init(&self) -> Result<()>;
 
-    /// Queue a spawn request
-    fn enqueue_spawn(&self, count: i32, worker_names: &[String], isolate: bool) -> Result<i64>;
+    /// Queue a spawn request.
+    ///
+    /// `spec_json` is an optional JSON-serialised `WorkerSpec` that callers in
+    /// `cas-cli` (which depend on `cas-mux`) produce from `cli`/`model`/`effort`
+    /// overrides.  `None` means "use the session default".  This field is stored
+    /// in the `worker_spec` column added by migration m201.
+    fn enqueue_spawn(
+        &self,
+        count: i32,
+        worker_names: &[String],
+        isolate: bool,
+        spec_json: Option<&str>,
+    ) -> Result<i64>;
 
     /// Queue a shutdown request
     fn enqueue_shutdown(
@@ -162,7 +180,9 @@ impl SqliteSpawnQueueStore {
         let worker_names_str: Option<String> = row.get(3)?;
         let force: i32 = row.get(4).unwrap_or(0);
         let isolate: i32 = row.get(5).unwrap_or(0);
-        let processed_at_str: Option<String> = row.get(7)?;
+        // Column 6 = worker_spec (added by migration m201; NULL for pre-migration rows)
+        let worker_spec: Option<String> = row.get(6).unwrap_or_default();
+        let processed_at_str: Option<String> = row.get(8)?;
 
         Ok(SpawnRequest {
             id: row.get(0)?,
@@ -171,7 +191,8 @@ impl SqliteSpawnQueueStore {
             worker_names: Self::parse_worker_names(worker_names_str),
             force: force != 0,
             isolate: isolate != 0,
-            created_at: Self::parse_datetime(&row.get::<_, String>(6)?).unwrap_or_else(Utc::now),
+            worker_spec,
+            created_at: Self::parse_datetime(&row.get::<_, String>(7)?).unwrap_or_else(Utc::now),
             processed_at: processed_at_str.and_then(|s| Self::parse_datetime(&s)),
         })
     }
@@ -183,6 +204,7 @@ impl SqliteSpawnQueueStore {
         worker_names: &[String],
         force: bool,
         isolate: bool,
+        spec_json: Option<&str>,
     ) -> Result<i64> {
         crate::shared_db::with_write_retry(|| {
         let conn = self.conn.lock().unwrap();
@@ -194,8 +216,8 @@ impl SqliteSpawnQueueStore {
         };
 
         conn.execute(
-            "INSERT INTO spawn_queue (action, count, worker_names, force, isolate, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            params![action.as_str(), count, names, force as i32, isolate as i32, now],
+            "INSERT INTO spawn_queue (action, count, worker_names, force, isolate, worker_spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![action.as_str(), count, names, force as i32, isolate as i32, spec_json, now],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -213,13 +235,20 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         Ok(())
     }
 
-    fn enqueue_spawn(&self, count: i32, worker_names: &[String], isolate: bool) -> Result<i64> {
+    fn enqueue_spawn(
+        &self,
+        count: i32,
+        worker_names: &[String],
+        isolate: bool,
+        spec_json: Option<&str>,
+    ) -> Result<i64> {
         self.enqueue(
             SpawnAction::Spawn,
             Some(count),
             worker_names,
             false,
             isolate,
+            spec_json,
         )
     }
 
@@ -229,11 +258,11 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         worker_names: &[String],
         force: bool,
     ) -> Result<i64> {
-        self.enqueue(SpawnAction::Shutdown, count, worker_names, force, false)
+        self.enqueue(SpawnAction::Shutdown, count, worker_names, force, false, None)
     }
 
     fn enqueue_respawn(&self, worker_names: &[String]) -> Result<i64> {
-        self.enqueue(SpawnAction::Respawn, None, worker_names, false, false)
+        self.enqueue(SpawnAction::Respawn, None, worker_names, false, false, None)
     }
 
     fn poll(&self, limit: usize) -> Result<Vec<SpawnRequest>> {
@@ -241,7 +270,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, action, count, worker_names, force, isolate, created_at, processed_at
+            "SELECT id, action, count, worker_names, force, isolate, worker_spec, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL
              ORDER BY created_at ASC
@@ -279,7 +308,7 @@ impl SpawnQueueStore for SqliteSpawnQueueStore {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare_cached(
-            "SELECT id, action, count, worker_names, force, isolate, created_at, processed_at
+            "SELECT id, action, count, worker_names, force, isolate, worker_spec, created_at, processed_at
              FROM spawn_queue
              WHERE processed_at IS NULL
              ORDER BY created_at ASC
@@ -357,7 +386,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         // Queue a spawn request
-        let id = store.enqueue_spawn(2, &[], false).unwrap();
+        let id = store.enqueue_spawn(2, &[], false, None).unwrap();
         assert!(id > 0);
 
         // Poll should return it
@@ -405,7 +434,7 @@ mod tests {
     fn test_peek_does_not_process() {
         let (_temp, store) = create_test_store();
 
-        store.enqueue_spawn(3, &[], false).unwrap();
+        store.enqueue_spawn(3, &[], false, None).unwrap();
 
         // Peek should return request
         let requests = store.peek(10).unwrap();
@@ -423,8 +452,8 @@ mod tests {
     fn test_fifo_ordering() {
         let (_temp, store) = create_test_store();
 
-        store.enqueue_spawn(1, &[], false).unwrap();
-        store.enqueue_spawn(2, &[], false).unwrap();
+        store.enqueue_spawn(1, &[], false, None).unwrap();
+        store.enqueue_spawn(2, &[], false, None).unwrap();
         store
             .enqueue_shutdown(None, &["worker-1".to_string()], false)
             .unwrap();
@@ -472,7 +501,7 @@ mod tests {
         let (_temp, store) = create_test_store();
 
         // Queue a spawn request with isolate=true
-        store.enqueue_spawn(2, &[], true).unwrap();
+        store.enqueue_spawn(2, &[], true, None).unwrap();
 
         let requests = store.poll(10).unwrap();
         assert_eq!(requests.len(), 1);
@@ -480,10 +509,39 @@ mod tests {
         assert!(requests[0].isolate);
 
         // Queue a spawn request with isolate=false
-        store.enqueue_spawn(1, &[], false).unwrap();
+        store.enqueue_spawn(1, &[], false, None).unwrap();
 
         let requests = store.poll(10).unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].isolate);
+    }
+
+    #[test]
+    fn test_enqueue_spawn_with_spec_json_persists_and_dequeues() {
+        // cas-2992: verify worker_spec JSON round-trips through the queue.
+        let (_temp, store) = create_test_store();
+
+        let spec_json = r#"{"name":null,"cli":"codex","model":null,"effort":"high"}"#;
+        store.enqueue_spawn(1, &[], false, Some(spec_json)).unwrap();
+
+        let requests = store.peek(10).unwrap();
+        assert_eq!(requests.len(), 1);
+        let stored = requests[0].worker_spec.as_deref().expect("worker_spec should be set");
+        assert!(stored.contains("codex"), "spec should contain 'codex': {stored}");
+    }
+
+    #[test]
+    fn test_enqueue_spawn_without_spec_is_none() {
+        // Backwards compat: enqueue without spec → worker_spec is None.
+        let (_temp, store) = create_test_store();
+
+        store.enqueue_spawn(1, &[], false, None).unwrap();
+
+        let requests = store.peek(10).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].worker_spec.is_none(),
+            "worker_spec should be None when no spec supplied"
+        );
     }
 }
