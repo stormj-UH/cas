@@ -3110,3 +3110,115 @@ async fn test_worker_self_cert_blocked_when_fresh_dispatch_row_exists() {
         "exactly one verification row (the dispatch row) must exist after blocked second close — a Skipped row would indicate self-cert ran despite in_flight_dispatch=true"
     );
 }
+
+/// cas-c97e AC1+AC2 (Option B): if the Skipped verification row write fails, the
+/// close must still SUCCEED (fall-through, not abort). The audit gap must be
+/// visible via a DaemonEvent but must not block the worker.
+///
+/// Test strategy: use a raw SQLite BEFORE INSERT trigger on the verifications table
+/// to force `verification_store.add()` to fail with SQLITE_ABORT. The close path
+/// must return "Closed task:" and the verifications table must remain empty
+/// (confirming the insert was blocked and the error was handled gracefully).
+///
+/// Note: DaemonEvent emission via `send_event` is fire-and-forget over a Unix
+/// socket; no daemon is running in unit tests so the event is silently discarded.
+/// The observable invariant (close succeeds, no row written) is sufficient to
+/// cover the failure-mode behaviour codified by Option B.
+#[tokio::test]
+async fn test_worker_close_succeeds_when_skipped_row_write_fails_option_b() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let _env = FactoryWorkerEnv::enter();
+
+    // Create + start task.
+    let req = TaskCreateRequest {
+        title: "cas-c97e: close succeeds when Skipped row write fails".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    );
+    let id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // Install a BEFORE INSERT trigger that makes every INSERT into verifications
+    // raise SQLITE_ABORT — simulating a transient store failure.
+    {
+        let db_path = cas_dir.join("cas.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .expect("should open cas.db for trigger installation");
+        conn.execute_batch(
+            "CREATE TRIGGER block_verification_insert \
+             BEFORE INSERT ON verifications \
+             BEGIN SELECT RAISE(ABORT, 'simulated-store-failure'); END;",
+        )
+        .expect("trigger creation should succeed");
+    }
+
+    // Attempt close with a clean envelope. The Skipped row write will fail
+    // (SQLITE_ABORT from the trigger) but Option B must fall through — close
+    // must succeed.
+    let result = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("All criteria met — clean review envelope.".to_string()),
+            bypass_code_review: None,
+            code_review_findings: Some(CLEAN_ENVELOPE.to_string()),
+        }))
+        .await
+        .expect("task_close should return a result");
+    let text = extract_text(result);
+
+    // Option B: close must succeed despite the audit write failure.
+    assert!(
+        text.contains("Closed task:"),
+        "close must succeed (Option B fall-through) even when Skipped row write fails: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "close must NOT be blocked by the store failure: {text}"
+    );
+
+    // Task must be Closed in the DB.
+    let task_after = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task_after.status,
+        cas::types::TaskStatus::Closed,
+        "task must be Closed after Option B fall-through"
+    );
+
+    // The verifications table must be empty — the trigger blocked the insert,
+    // confirming the error-handling path was exercised (not the happy path).
+    let all_rows = verification_store
+        .get_for_task(&id)
+        .expect("get_for_task should succeed even with trigger present");
+    assert_eq!(
+        all_rows.len(),
+        0,
+        "verifications table must be empty — the trigger must have blocked the Skipped row insert"
+    );
+}

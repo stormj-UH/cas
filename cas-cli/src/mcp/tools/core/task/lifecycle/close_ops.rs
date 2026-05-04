@@ -561,25 +561,81 @@ impl CasCore {
                             // so the bypass reason is permanently recorded and the
                             // MCP jail's check_pending_verification sees a
                             // satisfying row on any retry.
-                            if let Ok(ver_id) = verification_store.generate_id() {
-                                let mut skipped_row =
-                                    Verification::skipped(
-                                        ver_id,
-                                        req.id.clone(),
-                                        "Worker-owned verification: cas-code-review autofix \
-                                         returned clean ReviewOutcome envelope"
-                                            .to_string(),
-                                    );
-                                skipped_row.verification_type = verification_type;
-                                if let Ok(agent_id) = self.get_agent_id() {
-                                    skipped_row.agent_id = Some(agent_id);
+                            //
+                            // cas-c97e (Option B): if the write fails, fall through
+                            // rather than abort the close — audit completeness is less
+                            // critical than close-path correctness. But the failure must
+                            // NOT be silent: emit a DaemonEvent::WorkerActivity with
+                            // event_type="audit_trail_gap" so the supervisor TUI surfaces
+                            // the missing record without halting the worker.
+                            match verification_store.generate_id() {
+                                Ok(ver_id) => {
+                                    let mut skipped_row =
+                                        Verification::skipped(
+                                            ver_id,
+                                            req.id.clone(),
+                                            "Worker-owned verification: cas-code-review autofix \
+                                             returned clean ReviewOutcome envelope"
+                                                .to_string(),
+                                        );
+                                    skipped_row.verification_type = verification_type;
+                                    if let Ok(agent_id) = self.get_agent_id() {
+                                        skipped_row.agent_id = Some(agent_id);
+                                    }
+                                    if let Err(e) = verification_store.add(&skipped_row) {
+                                        tracing::warn!(
+                                            task_id = %req.id,
+                                            error = %e,
+                                            "failed to persist worker-owned verification Skipped row"
+                                        );
+                                        // cas-c97e: surface the audit gap via a supervisor-visible
+                                        // event so ops can detect the missing row without the close
+                                        // path blocking.
+                                        if let Ok(agent_id) = self.get_agent_id() {
+                                            let gap_event =
+                                                crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                                    session_id: agent_id,
+                                                    event_type: "audit_trail_gap".to_string(),
+                                                    description: format!(
+                                                        "Skipped verification row write failed \
+                                                         for task {}: {e}",
+                                                        req.id
+                                                    ),
+                                                    entity_id: Some(req.id.clone()),
+                                                };
+                                            let _ = crate::mcp::socket::send_event(
+                                                &self.cas_root,
+                                                &gap_event,
+                                            );
+                                        }
+                                    }
                                 }
-                                if let Err(e) = verification_store.add(&skipped_row) {
+                                Err(e) => {
                                     tracing::warn!(
                                         task_id = %req.id,
                                         error = %e,
-                                        "failed to persist worker-owned verification Skipped row"
+                                        "failed to generate ID for worker-owned verification Skipped row"
                                     );
+                                    // cas-c97e: ID-generation failure also surfaces as an
+                                    // audit-gap event — it is indistinguishable from a write
+                                    // failure from the supervisor's perspective.
+                                    if let Ok(agent_id) = self.get_agent_id() {
+                                        let gap_event =
+                                            crate::mcp::socket::DaemonEvent::WorkerActivity {
+                                                session_id: agent_id,
+                                                event_type: "audit_trail_gap".to_string(),
+                                                description: format!(
+                                                    "Skipped verification row ID generation failed \
+                                                     for task {}: {e}",
+                                                    req.id
+                                                ),
+                                                entity_id: Some(req.id.clone()),
+                                            };
+                                        let _ = crate::mcp::socket::send_event(
+                                            &self.cas_root,
+                                            &gap_event,
+                                        );
+                                    }
                                 }
                             }
                             // Emit activity event for supervisor visibility.
