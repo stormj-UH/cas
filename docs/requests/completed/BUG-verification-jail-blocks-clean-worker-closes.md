@@ -134,3 +134,9 @@ If `code_review_findings` arrives with `residual.findings.severity ∉ {P0}`, tr
 - Sister `task-verifier` agent definition: marked "Internal agent ... Do not invoke directly" — confirms the error message's suggested workaround is wrong
 - Affected session messages from `ready-finch-99`: 1106 (cas-c52c), 1118 (cas-e531), 1131 (cas-6532), 1140 (cas-db7a), 1166 (cas-894f), 1192 (cas-1b03) — all forwarded close blockers
 - Cross-worker close blocks confirmed by supervisor `mighty-puma-25` for: `noble-falcon-40` (cas-5556, cas-789a, cas-f598), `noble-newt-22` (cas-8f6a, cas-e2b0), `witty-marten-42` (cas-9b87, cas-35fd) — same session, same pattern, every worker
+
+---
+completed: 2026-05-04
+completed_by: cas-778a
+commit: 12dea48
+---

@@ -486,34 +486,42 @@ impl CasCore {
                         // pre_existing, the cas-code-review autofix pipeline IS the
                         // worker's verification step. Skip task-verifier dispatch —
                         // write a Skipped row for the audit trail and fall through
-                        // to let the close proceed. The downstream code_review_gate
-                        // (below) independently re-validates the envelope, so the
-                        // predicate is enforced twice. Workers without a clean
+                        // to let the close proceed. Workers without a clean
                         // envelope (or without any envelope) continue to the
                         // existing jail-arming path below.
+                        //
+                        // Note: the downstream code_review_gate (below) calls
+                        // evaluate_gate() on residual, which re-validates
+                        // PR-introduced P0s — but does NOT replicate the
+                        // per-finding pre_existing forgery defence added here in
+                        // worker_review_envelope_is_clean. The full predicate
+                        // (including the forgery defence) is enforced solely here.
+                        let envelope_str = req
+                            .code_review_findings
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
                         let worker_owns_verification = is_factory_worker
-                            && req
-                                .code_review_findings
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .is_some_and(worker_review_envelope_is_clean);
+                            && envelope_str.is_some_and(worker_review_envelope_is_clean);
 
                         if worker_owns_verification {
-                            // Persist the envelope to task deliverables so the
-                            // downstream code_review_gate can re-validate it
-                            // independently (second-line defence).
-                            if let Some(envelope) = req
-                                .code_review_findings
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                            {
-                                let mut task_to_update = task.clone();
-                                task_to_update.deliverables.review_envelope =
+                            // Eagerly persist the envelope and clear any stale
+                            // pending_verification=true via a clone so the intermediate
+                            // DB state is consistent even if the close fails later.
+                            // The in-memory `task` variable is re-applied at line 1022
+                            // (after `let mut task = task`) so the final close update
+                            // also carries these fields. Both paths are needed: the
+                            // intermediate persist catches early returns; the in-memory
+                            // update ensures the final task_store.update(&task) wins.
+                            if let Some(envelope) = envelope_str {
+                                let mut task_to_persist = task.clone();
+                                task_to_persist.deliverables.review_envelope =
                                     Some(envelope.to_string());
-                                task_to_update.updated_at = chrono::Utc::now();
-                                if let Err(e) = task_store.update(&task_to_update) {
+                                // Clear any stale pending_verification flag left by a
+                                // prior jail-arming close attempt.
+                                task_to_persist.pending_verification = false;
+                                task_to_persist.updated_at = chrono::Utc::now();
+                                if let Err(e) = task_store.update(&task_to_persist) {
                                     tracing::warn!(
                                         task_id = %req.id,
                                         error = %e,
@@ -1014,6 +1022,23 @@ impl CasCore {
         task.status = TaskStatus::Closed;
         task.closed_at = Some(now);
         task.updated_at = now;
+
+        // cas-778a: apply worker-owned verification fields to the now-mutable
+        // `task` so the final task_store.update(&task) below carries them.
+        // The intermediate clone-persist above writes the DB eagerly; this
+        // ensures the in-memory value used for `deliverables` capture below
+        // and the final write are consistent with the intermediate state.
+        if let Some(envelope) = req
+            .code_review_findings
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if is_factory_worker && worker_review_envelope_is_clean(envelope) {
+                task.deliverables.review_envelope = Some(envelope.to_string());
+                task.pending_verification = false;
+            }
+        }
 
         // Capture deliverables on close
         let mut deliverables = task.deliverables.clone();
@@ -1987,8 +2012,16 @@ pub(crate) fn worker_review_envelope_is_clean(envelope: &str) -> bool {
         return false;
     }
     // cas-3086: no PR-introduced P0 in residual.
-    let residual_clean = matches!(evaluate_gate(&outcome.residual), GateDecision::Allow);
-    // cas-fef4: no P0 smuggled through pre_existing.
+    // ALSO explicitly reject any P0 in residual regardless of per-finding
+    // `pre_existing` flag: `evaluate_gate` skips findings with
+    // `pre_existing: true` (they are treated as baseline noise, not
+    // PR-introduced), so a forged envelope with a P0 in `residual` that
+    // carries `pre_existing: true` would otherwise pass both the gate call
+    // and the `pre_existing`-array check below. Genuine pre-existing P0s
+    // belong in `outcome.pre_existing[]`, not in `residual[]`.
+    let residual_clean = matches!(evaluate_gate(&outcome.residual), GateDecision::Allow)
+        && !outcome.residual.iter().any(|f| f.severity == FindingSeverity::P0);
+    // cas-fef4: no P0 smuggled through the top-level pre_existing array.
     let pre_existing_clean = outcome
         .pre_existing
         .iter()
