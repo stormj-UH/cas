@@ -22,6 +22,7 @@ use crate::ui::factory::{
 };
 use crate::worktree::GitOperations;
 use anyhow::{Result, bail};
+use cas_factory::spec_resolver::{ConfigSources, resolve_specs};
 use clap::{Args, Subcommand};
 use std::io::IsTerminal;
 
@@ -232,6 +233,16 @@ pub struct FactoryArgs {
     /// Disable cloud phone-home (push factory state to CAS Cloud)
     #[arg(long, global = true)]
     pub no_phone_home: bool,
+
+    /// Per-worker spec override as a JSON object (repeatable).
+    ///
+    /// Each value is a JSON object with optional fields `name`, `cli`,
+    /// `model`, `effort`.  Matched to worker slots by name first, then
+    /// by sequential position.  Example:
+    ///   --worker-spec '{"name":"alice","cli":"codex"}' \
+    ///   --worker-spec '{"name":"bob","cli":"claude","effort":"high"}'
+    #[arg(long = "worker-spec", value_name = "JSON")]
+    pub worker_spec: Vec<String>,
 }
 
 impl Default for FactoryArgs {
@@ -255,6 +266,7 @@ impl Default for FactoryArgs {
             supervisor_cli: "claude".to_string(),
             worker_cli: "claude".to_string(),
             no_phone_home: false,
+            worker_spec: vec![],
         }
     }
 }
@@ -358,6 +370,10 @@ pub enum FactoryCommands {
         /// Explicit worker names (internal use, repeat per worker)
         #[arg(long = "worker-name", hide = true)]
         worker_names: Vec<String>,
+
+        /// Per-worker spec JSON overrides (internal use, repeat per worker)
+        #[arg(long = "worker-spec-json", hide = true)]
+        worker_spec_jsons: Vec<String>,
     },
 
     /// Check if worktree is behind its sync target (used as SessionStart hook)
@@ -573,6 +589,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 boot_progress,
                 supervisor_name,
                 worker_names,
+                worker_spec_jsons,
             } => daemon::execute_daemon(
                 session,
                 cwd,
@@ -589,6 +606,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
                 *boot_progress,
                 supervisor_name.clone(),
                 worker_names.clone(),
+                worker_spec_jsons.clone(),
             ),
             FactoryCommands::CheckStaleness { branch, fetch } => {
                 worktree_ops::execute_check_staleness(branch.as_deref(), *fetch)
@@ -879,6 +897,28 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
     // point. No-op at this site; the env is already set by the time
     // worker PTYs spawn.
 
+    // Resolve per-worker specs from the cascade (cas-2992): config files,
+    // CLI flags, and per-worker JSON overrides in priority order.
+    let resolved_worker_specs = {
+        let sources = ConfigSources {
+            cli_flag: if preflight.worker_cli != cas_mux::SupervisorCli::Claude {
+                Some(preflight.worker_cli)
+            } else {
+                None
+            },
+            model_flag: llm.model_for_role("worker").map(String::from),
+            effort_flag: llm
+                .reasoning_effort_for_role("worker")
+                .and_then(|s| s.parse().ok()),
+            worker_spec_jsons: args.worker_spec.clone(),
+            user_config: None, // auto-resolve from home dir
+            project_config: Some(cwd.join(".cas").join("config.toml")),
+        };
+        resolve_specs(args.workers as usize, sources).map_err(|e| {
+            anyhow::anyhow!("Failed to resolve worker specs: {e}")
+        })?
+    };
+
     // Build native Agent Teams spawn configs so agents start with Teams CLI flags.
     let (teams_configs, lead_session_id) = {
         use crate::ui::factory::daemon::runtime::teams::TeamsManager;
@@ -896,7 +936,7 @@ pub fn execute(args: &FactoryArgs, cli: &Cli, cas_root: Option<&std::path::Path>
         worker_model: llm.model_for_role("worker").map(String::from),
         supervisor_effort: llm.reasoning_effort_for_role("supervisor").map(String::from),
         worker_effort: llm.reasoning_effort_for_role("worker").map(String::from),
-        resolved_worker_specs: vec![],
+        resolved_worker_specs,
         resolved_supervisor_spec: None,
         enable_worktrees: preflight.enable_worktrees,
         worktree_root: args.worktree_root.clone(),
@@ -1363,6 +1403,53 @@ mod tests {
         let args = FactoryArgs::default();
         assert!(!args.attach, "--attach should default to false");
         assert!(!args.start_new, "--new should default to false");
+    }
+
+    // cas-2992: --worker-spec flag integration
+    #[test]
+    fn test_factory_args_worker_spec_field_defaults_empty() {
+        let args = FactoryArgs::default();
+        assert!(
+            args.worker_spec.is_empty(),
+            "--worker-spec should default to empty vec"
+        );
+    }
+
+    #[test]
+    fn test_factory_args_worker_spec_feeds_resolve_specs() {
+        // Verify that the --worker-spec JSONs are consumed by resolve_specs
+        // to produce the correct resolved_worker_specs for a FactoryConfig.
+        // This is a unit test of the resolver wiring, not the full execute() flow.
+        let worker_spec_json = r#"{"cli":"codex"}"#.to_string();
+        let args = FactoryArgs {
+            workers: 2,
+            worker_spec: vec![worker_spec_json],
+            ..FactoryArgs::default()
+        };
+
+        let sources = ConfigSources {
+            worker_spec_jsons: args.worker_spec.clone(),
+            // Skip config files: pass non-existent paths so resolver treats them as absent
+            user_config: Some(std::path::PathBuf::from("/nonexistent/user/.cas/config.toml")),
+            project_config: Some(std::path::PathBuf::from("/nonexistent/project/.cas/config.toml")),
+            ..Default::default()
+        };
+        let specs = resolve_specs(args.workers as usize, sources)
+            .expect("resolve_specs should succeed");
+
+        assert_eq!(specs.len(), 2, "should produce one spec per worker");
+        // First slot gets the JSON override (codex)
+        assert_eq!(
+            specs[0].cli,
+            cas_mux::SupervisorCli::Codex,
+            "first worker spec should be Codex from JSON override"
+        );
+        // Second slot falls back to builtin default (Claude) since only one spec JSON was given
+        assert_eq!(
+            specs[1].cli,
+            cas_mux::SupervisorCli::Claude,
+            "second worker spec should be Claude (builtin default)"
+        );
     }
 
     #[test]

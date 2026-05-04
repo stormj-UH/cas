@@ -530,17 +530,33 @@ impl FactoryDaemon {
                 SpawnAction::Spawn => {
                     let count = request.count.unwrap_or(1) as usize;
                     let isolate = request.isolate;
+                    // cas-2992: deserialize the optional WorkerSpec from the queue row.
+                    // Invalid JSON is logged and treated as "no override" so a corrupt row
+                    // does not block all subsequent spawns.
+                    let spec: Option<cas_mux::WorkerSpec> = request
+                        .worker_spec
+                        .as_deref()
+                        .and_then(|json| match serde_json::from_str(json) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "spawn queue: invalid worker_spec JSON ({}); using session default",
+                                    e
+                                );
+                                None
+                            }
+                        });
                     if request.worker_names.is_empty() {
                         self.app.spawning_count += count;
                         for _ in 0..count {
                             self.pending_spawns
-                                .push_back(PendingSpawn::Anonymous { isolate, spec: None });
+                                .push_back(PendingSpawn::Anonymous { isolate, spec: spec.clone() });
                         }
                     } else {
                         self.app.spawning_count += request.worker_names.len();
                         for name in request.worker_names {
                             self.pending_spawns
-                                .push_back(PendingSpawn::Named { name, isolate, spec: None });
+                                .push_back(PendingSpawn::Named { name, isolate, spec: spec.clone() });
                         }
                     }
                 }

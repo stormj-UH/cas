@@ -93,8 +93,18 @@ impl CasService {
             })
             .unwrap_or_default();
 
+        // cas-2992: build a WorkerSpec from the cli/model/effort override fields
+        // and serialize it to JSON for storage in the spawn queue.  None of the
+        // three fields being present → no spec override (session defaults apply).
+        let spec_json_owned: Option<String> = build_spawn_spec_json(
+            req.cli.as_deref(),
+            req.model.as_deref(),
+            req.effort.as_deref(),
+        )
+        .map_err(|e| Self::error(ErrorCode::INVALID_PARAMS, e))?;
+
         let request_id = queue
-            .enqueue_spawn(count, &worker_names, isolate)
+            .enqueue_spawn(count, &worker_names, isolate, spec_json_owned.as_deref())
             .map_err(|e| {
                 Self::error(
                     ErrorCode::INTERNAL_ERROR,
@@ -114,7 +124,50 @@ impl CasService {
 
         Ok(Self::success(msg))
     }
+}
 
+/// Build a JSON-serialized [`cas_mux::WorkerSpec`] from optional string overrides
+/// supplied via the MCP `spawn_workers` action or the cloud protocol.
+///
+/// Returns `Ok(None)` when all three parameters are absent (session defaults apply).
+/// Returns `Err(String)` when a parameter value is invalid.
+pub(crate) fn build_spawn_spec_json(
+    cli: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Option<String>, String> {
+    if cli.is_none() && model.is_none() && effort.is_none() {
+        return Ok(None);
+    }
+
+    let parsed_cli = match cli {
+        Some(s) => s
+            .parse::<cas_mux::SupervisorCli>()
+            .map_err(|_| format!("invalid cli value {s:?}: expected 'claude' or 'codex'"))?,
+        None => cas_mux::SupervisorCli::Claude,
+    };
+
+    let parsed_effort: Option<cas_mux::Effort> = match effort {
+        Some(s) => Some(
+            s.parse::<cas_mux::Effort>()
+                .map_err(|e| format!("invalid effort value {s:?}: {e}"))?,
+        ),
+        None => None,
+    };
+
+    let spec = cas_mux::WorkerSpec {
+        name: None,
+        cli: parsed_cli,
+        model: model.map(String::from),
+        effort: parsed_effort,
+    };
+
+    let json = serde_json::to_string(&spec)
+        .map_err(|e| format!("failed to serialize WorkerSpec: {e}"))?;
+    Ok(Some(json))
+}
+
+impl CasService {
     pub(super) async fn factory_shutdown_workers(
         &self,
         req: FactoryRequest,

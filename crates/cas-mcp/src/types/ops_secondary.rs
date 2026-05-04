@@ -451,6 +451,31 @@ pub struct FactoryRequest {
     )]
     #[serde(default, deserialize_with = "deser::option_i64")]
     pub remind_ttl_secs: Option<i64>,
+
+    // ========== Spawn-time worker spec overrides (cas-2992) ==========
+    /// Worker CLI override for spawn_workers ('claude' or 'codex').
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker CLI to use for spawned workers: 'claude' (default) or 'codex'. Applies to all workers in this spawn request."
+    )]
+    #[serde(default)]
+    pub cli: Option<String>,
+
+    /// Worker model override for spawn_workers.
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker model override (e.g. 'claude-opus-4-5'). Applies to all workers in this spawn request."
+    )]
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Worker reasoning effort override for spawn_workers.
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker reasoning effort override: 'minimal', 'low', 'medium', 'high', 'xhigh'. Applies to all workers in this spawn request."
+    )]
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Unified coordination operations request combining agent, factory, and worktree operations.
@@ -620,6 +645,30 @@ pub struct CoordinationRequest {
     #[serde(default)]
     pub isolate: Option<bool>,
 
+    /// Worker CLI override for spawn_workers ('claude' or 'codex').
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker CLI to use for spawned workers: 'claude' (default) or 'codex'. Applies to all workers in this spawn_workers request."
+    )]
+    #[serde(default)]
+    pub cli: Option<String>,
+
+    /// Worker model override for spawn_workers.
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker model override (e.g. 'claude-opus-4-5'). Applies to all workers in this spawn_workers request."
+    )]
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Worker reasoning effort override for spawn_workers.
+    /// Applies to every spawned worker in this request.
+    #[schemars(
+        description = "Worker reasoning effort override: 'minimal', 'low', 'medium', 'high', 'xhigh'. Applies to all workers in this spawn_workers request."
+    )]
+    #[serde(default)]
+    pub effort: Option<String>,
+
     /// Reminder message to deliver when triggered
     #[schemars(description = "Reminder message to deliver when triggered")]
     #[serde(default)]
@@ -750,6 +799,9 @@ impl CoordinationRequest {
             remind_filter: self.remind_filter.clone(),
             remind_id: self.remind_id,
             remind_ttl_secs: self.remind_ttl_secs,
+            cli: self.cli.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
         }
     }
 }
