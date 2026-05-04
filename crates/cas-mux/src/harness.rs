@@ -1,7 +1,10 @@
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// Supported interactive harnesses for factory panes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SupervisorCli {
     Claude,
     Codex,

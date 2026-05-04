@@ -68,6 +68,12 @@ pub enum ClientMessage {
         count: usize,
         /// Optional specific names
         names: Vec<String>,
+        /// Per-worker spec overrides, parallel to `names`.
+        /// Empty or shorter than `names` means use session defaults for the unspecified slots.
+        /// `None` at index i means use the session default for that worker.
+        /// Old clients that omit this field get an empty vec (backwards-compatible).
+        #[serde(default)]
+        specs: Vec<Option<cas_mux::WorkerSpec>>,
     },
 
     /// Shutdown workers
@@ -388,6 +394,55 @@ mod tests {
                 assert_eq!(data, b"Hello, world!\n");
             }
             _ => panic!("Wrong message type"),
+        }
+    }
+
+    /// T2 (cas-4cae): SpawnWorkers must carry per-worker specs.
+    /// This test fails until protocol.rs, PendingSpawn, and finish_worker_spawn are updated.
+    #[test]
+    fn spawn_workers_with_spec_round_trips_through_wire() {
+        use cas_mux::{SupervisorCli, WorkerSpec};
+        let spec = WorkerSpec {
+            name: Some("alice".to_string()),
+            cli: SupervisorCli::Codex,
+            model: Some("gpt-5.5".to_string()),
+            effort: Some(cas_mux::Effort::Medium),
+        };
+        let msg = ClientMessage::SpawnWorkers {
+            count: 1,
+            names: vec!["alice".to_string()],
+            specs: vec![Some(spec)],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ClientMessage::SpawnWorkers { count, names, specs } => {
+                assert_eq!(count, 1);
+                assert_eq!(names, vec!["alice"]);
+                assert_eq!(specs.len(), 1);
+                let s = specs[0].as_ref().unwrap();
+                assert_eq!(s.name.as_deref(), Some("alice"), "WorkerSpec.name must survive wire round-trip");
+                assert_eq!(s.cli, SupervisorCli::Codex);
+                assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(s.effort, Some(cas_mux::Effort::Medium));
+            }
+            _ => panic!("Wrong message type decoded"),
+        }
+    }
+
+    /// Backwards compat: old clients sending SpawnWorkers without specs must decode cleanly.
+    #[test]
+    fn spawn_workers_without_specs_field_is_backwards_compatible() {
+        // Simulate a legacy wire message with no "specs" field
+        let json = r#"{"SpawnWorkers":{"count":2,"names":["bob","carol"]}}"#;
+        let decoded: ClientMessage = serde_json::from_str(json).unwrap();
+        match decoded {
+            ClientMessage::SpawnWorkers { count, names, specs } => {
+                assert_eq!(count, 2);
+                assert_eq!(names, vec!["bob", "carol"]);
+                assert!(specs.is_empty(), "missing specs field should default to empty vec");
+            }
+            _ => panic!("Wrong message type decoded"),
         }
     }
 

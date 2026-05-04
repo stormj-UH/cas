@@ -83,7 +83,7 @@ impl std::fmt::Display for Effort {
 ///
 /// `None` in any field means "use the backend's own default", not "still
 /// needs resolution".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpec {
     /// Optional name for this worker slot (e.g. `"alice"`).
     /// `None` means the factory assigns a generated name at spawn time.
