@@ -3001,9 +3001,11 @@ pub(crate) fn run_lightweight_structural_lint(
     }
 
     // Check 2: dbg! macro calls
+    // Use `contains("dbg!(")` to catch all forms regardless of preceding
+    // whitespace: bare `dbg!(...)`, `=dbg!(...)`, `let x=dbg!(...)`, etc.
     for (i, line) in added_lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("dbg!(") || trimmed.contains(" dbg!(") || trimmed.contains("\tdbg!(") {
+        if trimmed.contains("dbg!(") {
             violations.push(format!(
                 "Line +{}: `dbg!()` call — remove debug instrumentation before review",
                 i + 1
@@ -3147,12 +3149,46 @@ mod lightweight_lint_tests {
     }
 
     #[test]
-    fn lint_catches_dbg() {
+    fn lint_catches_dbg_with_space() {
+        // "let x = dbg!(foo)" — space before dbg
         let dir = init_repo_with_diff("let x = dbg!(foo);\n");
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Fail(_)),
-            "dbg!() should fail lint"
+            "dbg!() with space before it should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_dbg_bare() {
+        // "dbg!(foo)" — bare at start of expression
+        let dir = init_repo_with_diff("dbg!(foo);\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "bare dbg!() should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_dbg_no_space_after_equals() {
+        // "let x=dbg!(foo)" — no space between = and dbg
+        let dir = init_repo_with_diff("let x=dbg!(foo);\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "dbg!() with no space after '=' should fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_catches_dbg_embedded_in_expression() {
+        // "let x=dbg!(foo)" as part of a longer expression — regression guard
+        let dir = init_repo_with_diff("return self.compute(=dbg!(val));\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "dbg!() embedded in expression should fail lint"
         );
     }
 
