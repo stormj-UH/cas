@@ -3183,7 +3183,7 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_catches_dbg_embedded_in_expression() {
-        // "let x=dbg!(foo)" as part of a longer expression — regression guard
+        // "return self.compute(=dbg!(val))" — dbg! embedded in a call-site expression
         let dir = init_repo_with_diff("return self.compute(=dbg!(val));\n");
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
