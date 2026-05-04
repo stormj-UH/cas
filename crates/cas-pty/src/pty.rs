@@ -1151,6 +1151,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // effort
             Some(&teams),
         );
         assert!(
@@ -1188,6 +1189,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // effort
             Some(&teams),
         );
         assert!(
@@ -1224,6 +1226,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // effort
             Some(&teams),
         );
         assert!(
@@ -1376,6 +1379,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert!(
@@ -1401,6 +1405,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert!(
@@ -1423,6 +1428,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert_eq!(config.command, "nice");
@@ -1493,6 +1499,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert!(
@@ -1518,6 +1525,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert!(
@@ -1540,6 +1548,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert_eq!(config.command, "nice");
@@ -1561,6 +1570,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,  // effort
                 None,
             );
             assert_eq!(

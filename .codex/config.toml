@@ -1,0 +1,4 @@
+[mcp_servers.cs]
+command = "cas"
+args = ["serve"]
+env_vars = ["PATH", "HOME", "USER"]
