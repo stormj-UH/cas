@@ -331,6 +331,24 @@ impl CasCore {
                 // observable instead of fire-and-forget.
                 let had_prior_verification = matches!(&latest, Ok(Some(_)));
 
+                // cas-164c: detect a FRESH in-flight dispatch row — status=Error,
+                // summary starts with the dispatch prefix, age ≤
+                // VERIFICATION_JAIL_TIMEOUT_SECS.  A fresh row means the
+                // supervisor already dispatched a task-verifier subagent that
+                // hasn't written its verdict yet.  We must NOT let the
+                // worker-owned self-cert short-circuit skip that in-flight
+                // verifier; doing so would orphan the running subagent's verdict.
+                //
+                // Computed here (via a shared borrow) before `match latest`
+                // consumes the value, so it stays available inside the
+                // `Ok(None) | Ok(Some(_))` arm that runs the self-cert check.
+                let in_flight_dispatch = matches!(&latest, Ok(Some(v))
+                    if v.status == VerificationStatus::Error
+                        && v.summary.starts_with(DISPATCH_SUMMARY_PREFIX)
+                        && (chrono::Utc::now() - v.created_at).num_seconds()
+                            <= VERIFICATION_JAIL_TIMEOUT_SECS
+                );
+
                 match latest {
                     Ok(Some(v))
                         if v.status == VerificationStatus::Approved
@@ -502,8 +520,17 @@ impl CasCore {
                             .as_deref()
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
+                        // cas-164c: suppress self-cert when a fresh task-verifier
+                        // dispatch row is already in-flight.  The running subagent's
+                        // verdict must be allowed to land before the close can
+                        // short-circuit.  Stale dispatch rows (age >
+                        // VERIFICATION_JAIL_TIMEOUT_SECS) are handled by the
+                        // timeout-escalation arm above and do NOT set
+                        // `in_flight_dispatch`, so self-cert still works once the
+                        // timeout window expires.
                         let worker_owns_verification = is_factory_worker
-                            && envelope_str.is_some_and(worker_review_envelope_is_clean);
+                            && envelope_str.is_some_and(worker_review_envelope_is_clean)
+                            && !in_flight_dispatch;
 
                         if worker_owns_verification {
                             // Eagerly persist the envelope and clear any stale
