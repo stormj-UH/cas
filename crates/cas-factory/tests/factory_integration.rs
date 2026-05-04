@@ -198,6 +198,8 @@ fn test_config() -> FactoryConfig {
         teams_configs: std::collections::HashMap::new(),
         lead_session_id: None,
         minions_theme: false,
+        resolved_worker_specs: vec![],
+        resolved_supervisor_spec: None,
     }
 }
 

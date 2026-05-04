@@ -195,6 +195,14 @@ pub struct FactoryConfig {
     pub lead_session_id: Option<String>,
     /// Use Minions theme for boot screen, names, and colors
     pub minions_theme: bool,
+    /// Resolved per-worker specs (populated by the cascade resolver).
+    ///
+    /// Empty until `cas_factory::spec_resolver::resolve_specs` is called and
+    /// its output stored here.  Not yet consumed by spawn logic — wiring
+    /// happens in a later subtask (cas-34f7f / cas-1948).
+    pub resolved_worker_specs: Vec<cas_mux::WorkerSpec>,
+    /// Resolved supervisor spec (populated by the cascade resolver).
+    pub resolved_supervisor_spec: Option<cas_mux::WorkerSpec>,
 }
 
 impl Default for FactoryConfig {
@@ -220,6 +228,8 @@ impl Default for FactoryConfig {
             teams_configs: std::collections::HashMap::new(),
             lead_session_id: None,
             minions_theme: false,
+            resolved_worker_specs: vec![],
+            resolved_supervisor_spec: None,
         }
     }
 }

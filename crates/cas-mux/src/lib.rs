@@ -33,6 +33,7 @@ mod mux;
 mod pane;
 mod pty;
 mod render;
+mod spec;
 
 pub use error::{Error, Result};
 pub use harness::{HarnessCapabilities, SupervisorCli};
@@ -41,3 +42,4 @@ pub use pane::TerminalSnapshot;
 pub use pane::{Pane, PaneBackend, PaneId, PaneKind};
 pub use pty::{Pty, PtyConfig, PtyEvent, TeamsSpawnConfig};
 pub use render::{LayoutDirection, Renderer};
+pub use spec::{Effort, WorkerSpec};
