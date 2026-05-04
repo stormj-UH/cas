@@ -285,6 +285,41 @@ fn add_worker_uses_explicit_spec() {
 
 // ── end cas-3fed ──────────────────────────────────────────────────────────────
 
+// ── cas-3fed autofix: priority-2 branch coverage ─────────────────────────────
+
+#[test]
+fn effective_worker_spec_uses_worker_specs_map() {
+    // Priority 2: per-worker entry in Mux::worker_specs wins over the
+    // default when no explicit spec is supplied (priority 1 absent).
+    let mut mux = Mux::new(24, 80);
+    // builtin_default → Claude; override just "worker-map" to Codex.
+    let codex_spec = WorkerSpec {
+        name: Some("worker-map".to_string()),
+        cli: crate::harness::SupervisorCli::Codex,
+        model: None,
+        effort: None,
+    };
+    mux.set_worker_spec("worker-map", codex_spec);
+
+    // No explicit spec → should pick up the map entry.
+    let effective = mux.effective_worker_spec("worker-map", None);
+    assert_eq!(
+        effective.cli,
+        crate::harness::SupervisorCli::Codex,
+        "worker_specs map entry must take priority over default when no explicit spec is passed"
+    );
+
+    // A name not in the map should still fall through to the default.
+    let default_effective = mux.effective_worker_spec("unknown-worker", None);
+    assert_eq!(
+        default_effective.cli,
+        crate::harness::SupervisorCli::Claude,
+        "unknown worker must fall back to Mux default (Claude builtin_default)"
+    );
+}
+
+// ── end priority-2 coverage ───────────────────────────────────────────────────
+
 #[test]
 fn test_mux_new() {
     let mux = Mux::new(24, 80);
