@@ -87,6 +87,32 @@ fn init_git_repo_with_staged_changes(project_root: &std::path::Path) {
     git(&["add", "feature.rs"]);
 }
 
+/// Init a git repo where the staged diff contains a `todo!()` violation so
+/// `run_lightweight_structural_lint` returns `Fail`.
+fn init_git_repo_with_lint_violation(project_root: &std::path::Path) {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(project_root)
+            .output()
+            .expect("git command should run")
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    // Initial commit so HEAD exists.
+    std::fs::write(project_root.join("base.rs"), "fn main() {}\n").expect("write should succeed");
+    git(&["add", "base.rs"]);
+    git(&["commit", "-m", "init"]);
+    // Stage a file with a todo!() — this will appear as an added line in `git diff HEAD`.
+    std::fs::write(
+        project_root.join("wip.rs"),
+        "pub fn incomplete() -> u32 { todo!(\"not implemented yet\") }\n",
+    )
+    .expect("write should succeed");
+    git(&["add", "wip.rs"]);
+}
+
 // ---------------------------------------------------------------------------
 // AC5 named tests
 // ---------------------------------------------------------------------------
@@ -360,6 +386,92 @@ async fn test_owner_config_default_is_worker_in_factory_mode() {
     let cfg3: Config = toml::from_str(toml_worker).expect("worker TOML should parse");
     let cr3 = cfg3.code_review.as_ref().expect("code_review section should be present");
     assert!(!cr3.supervisor_owned(), "supervisor_owned() must be false for owner = 'worker'");
+}
+
+/// cas-b5ac: A close whose diff contains a `todo!()` call must be rejected by
+/// the lightweight structural lint gate when owner=supervisor is configured.
+/// The close must:
+///   1. Return an MCP-level error (is_error=true), not Ok.
+///   2. Name the offending lint rule in the error message.
+///   3. Leave the task in InProgress — no transition to PendingSupervisorReview.
+#[tokio::test]
+async fn test_lint_fail_close_blocked_before_pending_supervisor_review() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+    // Enable supervisor-owned review and disable verification.
+    write_supervisor_review_config(&cas_dir);
+
+    // Create a git repo whose staged diff includes a `todo!()` so the lint fires.
+    init_git_repo_with_lint_violation(temp.path());
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let service = CasService::new(core, None);
+
+    let _worker_guard = FactoryWorkerGuard::enter();
+
+    // Create and start a task.
+    let create = task_req(serde_json::json!({
+        "action": "create",
+        "title": "WIP task with todo violation",
+        "priority": 2,
+        "task_type": "task",
+    }));
+    let created = service
+        .task(Parameters(create))
+        .await
+        .expect("task.create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .task(Parameters(task_req(
+            serde_json::json!({ "action": "start", "id": id }),
+        )))
+        .await
+        .expect("task.start should succeed");
+
+    // Attempt close — the staged diff contains `todo!()`, so lint must fail.
+    let close_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id,
+            "reason": "Done.",
+        }))))
+        .await
+        .expect("close returns Ok(CallToolResult) even when lint fails");
+
+    // AC1: close must return is_error=true at the MCP level (not a silent success).
+    assert_eq!(
+        close_result.is_error,
+        Some(true),
+        "Lint-fail close must set is_error=true so the worker knows it was rejected"
+    );
+
+    let close_text = extract_text(close_result);
+
+    // AC2: error message must name the offending lint rule.
+    assert!(
+        close_text.contains("todo!(") || close_text.contains("LIGHTWEIGHT LINT FAILED"),
+        "Error message must identify the offending lint rule; got: {close_text}"
+    );
+
+    // AC3: task must remain InProgress — no PendingSupervisorReview transition on lint failure.
+    let task = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        TaskStatus::InProgress,
+        "Task must remain InProgress after lint failure; got: {:?}",
+        task.status
+    );
+    assert_ne!(
+        task.status,
+        TaskStatus::PendingSupervisorReview,
+        "Lint failure must NOT transition task to PendingSupervisorReview"
+    );
 }
 
 // ---------------------------------------------------------------------------
