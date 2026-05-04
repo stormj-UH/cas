@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::harness::SupervisorCli;
 use crate::pane::{Pane, PaneId, PaneKind};
-use crate::pty::{PtyEvent, TeamsSpawnConfig};
+use crate::pty::{PtyConfig, PtyEvent, TeamsSpawnConfig};
 use cas_factory_protocol::ServerMessage;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -147,6 +147,70 @@ impl Mux {
     /// Set reasoning effort used for worker pane spawns.
     pub fn set_worker_effort(&mut self, effort: Option<String>) {
         self.worker_effort = effort;
+    }
+
+    /// Build the `PtyConfig`s that `factory()` would spawn for each worker and
+    /// supervisor pane, without actually spawning any processes.
+    ///
+    /// Returns `(agent_name, PtyConfig)` pairs — workers first, then the
+    /// supervisor. The director pane (no PTY) is excluded.
+    ///
+    /// Primary use: integration tests that need to verify effort / model args
+    /// flow from `MuxConfig` all the way to the CLI subprocess arguments,
+    /// without requiring a real `claude` or `codex` binary.
+    pub fn factory_pane_configs(config: &MuxConfig) -> Vec<(String, PtyConfig)> {
+        let num_panes = config.workers + 1 + if config.include_director { 1 } else { 0 };
+        let pane_cols = config.cols / num_panes as u16;
+        let pane_rows = config.rows;
+
+        let worker_names: Vec<String> = if config.worker_names.is_empty() {
+            (0..config.workers)
+                .map(|i| format!("worker-{}", i + 1))
+                .collect()
+        } else {
+            config.worker_names.clone()
+        };
+
+        let mut result = Vec::with_capacity(worker_names.len() + 1);
+
+        for name in &worker_names {
+            let worker_cwd = config
+                .worker_cwds
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| config.cwd.clone());
+            let teams = config.teams_configs.get(name);
+            let pty_config = Pane::build_worker_config(
+                name,
+                worker_cwd,
+                config.cas_root.as_ref(),
+                &config.supervisor_name,
+                config.worker_cli,
+                config.worker_model.as_deref(),
+                config.worker_effort.as_deref(),
+                teams,
+            );
+            result.push((name.clone(), pty_config));
+        }
+
+        let sup_teams = config.teams_configs.get(&config.supervisor_name);
+        let sup_config = Pane::build_supervisor_config(
+            &config.supervisor_name,
+            config.cwd.clone(),
+            config.cas_root.as_ref(),
+            config.supervisor_cli,
+            config.worker_cli,
+            &worker_names,
+            config.supervisor_model.as_deref(),
+            config.supervisor_effort.as_deref(),
+            sup_teams,
+        );
+        // Unused in the config-only path but keep signature consistent with
+        // factory() so callers can reference the same parameter set.
+        let _ = (pane_rows, pane_cols);
+        result.push((config.supervisor_name.clone(), sup_config));
+
+        result
     }
 
     /// Create a multiplexer with factory configuration

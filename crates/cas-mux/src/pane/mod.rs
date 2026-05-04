@@ -196,6 +196,45 @@ impl Pane {
         Self::with_pty(name, PaneKind::Shell, pty, rows, cols)
     }
 
+    /// Build the `PtyConfig` that `worker()` would spawn, without actually
+    /// spawning a process. Used by `Mux::factory_pane_configs` and tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_worker_config(
+        name: &str,
+        cwd: PathBuf,
+        cas_root: Option<&PathBuf>,
+        supervisor_name: &str,
+        cli: SupervisorCli,
+        model: Option<&str>,
+        effort: Option<&str>,
+        teams: Option<&TeamsSpawnConfig>,
+    ) -> PtyConfig {
+        match cli {
+            SupervisorCli::Claude => PtyConfig::claude(
+                name,
+                "worker",
+                cwd,
+                cas_root,
+                Some(supervisor_name),
+                None,
+                model,
+                effort,
+                teams,
+            ),
+            SupervisorCli::Codex => PtyConfig::codex(
+                name,
+                "worker",
+                cwd,
+                cas_root,
+                Some(supervisor_name),
+                None,
+                model,
+                effort,
+                teams,
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn worker(
         name: &str,
@@ -209,38 +248,59 @@ impl Pane {
         cols: u16,
         teams: Option<&TeamsSpawnConfig>,
     ) -> Result<Self> {
-        match cli {
-            SupervisorCli::Claude => {
-                let config = PtyConfig::claude(
-                    name,
-                    "worker",
-                    cwd,
-                    cas_root,
-                    Some(supervisor_name),
-                    None,
-                    model,
-                    effort,
-                    teams,
-                );
-                let pty = Pty::spawn(name, config)?;
-                Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
-            }
-            SupervisorCli::Codex => {
-                let config = PtyConfig::codex(
-                    name,
-                    "worker",
-                    cwd,
-                    cas_root,
-                    Some(supervisor_name),
-                    None,
-                    model,
-                    effort,
-                    teams,
-                );
-                let pty = Pty::spawn(name, config)?;
-                Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
-            }
-        }
+        let config = Self::build_worker_config(
+            name, cwd, cas_root, supervisor_name, cli, model, effort, teams,
+        );
+        let pty = Pty::spawn(name, config)?;
+        Self::with_pty(name, PaneKind::Worker, pty, rows, cols)
+    }
+
+    /// Build the `PtyConfig` that `supervisor()` would spawn, without actually
+    /// spawning a process. Used by `Mux::factory_pane_configs` and tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_supervisor_config(
+        name: &str,
+        cwd: PathBuf,
+        cas_root: Option<&PathBuf>,
+        cli: SupervisorCli,
+        worker_cli: SupervisorCli,
+        worker_names: &[String],
+        model: Option<&str>,
+        effort: Option<&str>,
+        teams: Option<&TeamsSpawnConfig>,
+    ) -> PtyConfig {
+        let worker_cli_str = worker_cli.as_str();
+        let worker_names_csv = if worker_names.is_empty() {
+            None
+        } else {
+            Some(worker_names.join(","))
+        };
+        let mut config = match cli {
+            SupervisorCli::Claude => PtyConfig::claude(
+                name,
+                "supervisor",
+                cwd,
+                cas_root,
+                None,
+                Some(worker_cli_str),
+                model,
+                effort,
+                teams,
+            ),
+            SupervisorCli::Codex => PtyConfig::codex(
+                name,
+                "supervisor",
+                cwd,
+                cas_root,
+                None,
+                Some(worker_cli_str),
+                model,
+                effort,
+                teams,
+            ),
+        };
+        Self::push_supervisor_env(&mut config.env, cli, &worker_names_csv);
+        config
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -257,47 +317,11 @@ impl Pane {
         effort: Option<&str>,
         teams: Option<&TeamsSpawnConfig>,
     ) -> Result<Self> {
-        let worker_cli_str = worker_cli.as_str();
-        let worker_names_csv = if worker_names.is_empty() {
-            None
-        } else {
-            Some(worker_names.join(","))
-        };
-
-        match cli {
-            SupervisorCli::Claude => {
-                let mut config = PtyConfig::claude(
-                    name,
-                    "supervisor",
-                    cwd,
-                    cas_root,
-                    None,
-                    Some(worker_cli_str),
-                    model,
-                    effort,
-                    teams,
-                );
-                Self::push_supervisor_env(&mut config.env, cli, &worker_names_csv);
-                let pty = Pty::spawn(name, config)?;
-                Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
-            }
-            SupervisorCli::Codex => {
-                let mut config = PtyConfig::codex(
-                    name,
-                    "supervisor",
-                    cwd,
-                    cas_root,
-                    None,
-                    Some(worker_cli_str),
-                    model,
-                    effort,
-                    teams,
-                );
-                Self::push_supervisor_env(&mut config.env, cli, &worker_names_csv);
-                let pty = Pty::spawn(name, config)?;
-                Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
-            }
-        }
+        let config = Self::build_supervisor_config(
+            name, cwd, cas_root, cli, worker_cli, worker_names, model, effort, teams,
+        );
+        let pty = Pty::spawn(name, config)?;
+        Self::with_pty(name, PaneKind::Supervisor, pty, rows, cols)
     }
 
     fn push_supervisor_env(
