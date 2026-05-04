@@ -8,13 +8,16 @@ fn bool_prop(value: bool) -> &'static str {
 
 /// Resolve the current worker harness from the live on-disk `LlmConfig`.
 ///
-/// Called before every dynamic worker spawn so that `cas config set
-/// llm.worker.harness codex` takes effect on the next spawn without
-/// requiring a daemon restart (fix for cas-9bc6: the harness was
-/// previously cached at daemon boot and never re-read).
+/// Exists as a standalone function so unit tests can verify the on-disk
+/// config-read path directly, without needing a full `FactoryApp`.
 ///
 /// Falls back to `SupervisorCli::Claude` when the config file is absent
 /// or unparseable — degraded but not broken.
+///
+/// In production code the equivalent logic lives inside
+/// `FactoryApp::sync_worker_config_from_live_settings`, which also
+/// re-reads model and effort in the same config load.
+#[cfg(test)]
 pub(super) fn resolve_live_worker_harness(
     cas_dir: &std::path::Path,
 ) -> cas_mux::SupervisorCli {
