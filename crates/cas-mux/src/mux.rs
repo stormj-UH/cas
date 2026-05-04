@@ -39,7 +39,7 @@ pub struct MuxConfig {
     pub worker_model: Option<String>,
     /// Reasoning effort for supervisor (passed as --effort flag; defaults to "high")
     pub supervisor_effort: Option<String>,
-    /// Reasoning effort for workers (passed as --effort flag; defaults to "medium")
+    /// Reasoning effort for workers (passed as --effort flag; defaults to "high")
     pub worker_effort: Option<String>,
     /// Include director pane
     pub include_director: bool,
@@ -159,10 +159,6 @@ impl Mux {
     /// flow from `MuxConfig` all the way to the CLI subprocess arguments,
     /// without requiring a real `claude` or `codex` binary.
     pub fn factory_pane_configs(config: &MuxConfig) -> Vec<(String, PtyConfig)> {
-        let num_panes = config.workers + 1 + if config.include_director { 1 } else { 0 };
-        let pane_cols = config.cols / num_panes as u16;
-        let pane_rows = config.rows;
-
         let worker_names: Vec<String> = if config.worker_names.is_empty() {
             (0..config.workers)
                 .map(|i| format!("worker-{}", i + 1))
@@ -205,9 +201,6 @@ impl Mux {
             config.supervisor_effort.as_deref(),
             sup_teams,
         );
-        // Unused in the config-only path but keep signature consistent with
-        // factory() so callers can reference the same parameter set.
-        let _ = (pane_rows, pane_cols);
         result.push((config.supervisor_name.clone(), sup_config));
 
         result

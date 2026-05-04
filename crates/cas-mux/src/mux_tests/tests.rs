@@ -52,8 +52,8 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
 
     let (_, worker_config) = configs
         .iter()
-        .find(|(name, _)| name != &config.supervisor_name)
-        .expect("at least one worker config must be present");
+        .find(|(name, _)| name == "worker-1")
+        .expect("worker-1 config must be present");
     let effort_idx = worker_config
         .args
         .iter()
@@ -62,6 +62,12 @@ fn factory_pane_configs_worker_effort_reaches_pty_args() {
     assert_eq!(
         worker_config.args[effort_idx + 1], "high",
         "MuxConfig::worker_effort must reach worker PTY --effort arg"
+    );
+    // supervisor must be last in the returned vec (workers-first ordering)
+    assert_eq!(
+        configs.last().unwrap().0,
+        config.supervisor_name,
+        "supervisor must be the last entry in factory_pane_configs output"
     );
 }
 
@@ -98,8 +104,8 @@ fn factory_pane_configs_none_effort_uses_role_defaults() {
 
     let (_, worker_config) = configs
         .iter()
-        .find(|(name, _)| name != &config.supervisor_name)
-        .expect("worker config must be present");
+        .find(|(name, _)| name == "worker-1")
+        .expect("worker-1 config must be present");
     let worker_effort_idx = worker_config
         .args
         .iter()
