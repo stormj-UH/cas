@@ -37,6 +37,8 @@ Registration checklist (varies by framework):
 rg 'changed_function' src/
 ```
 
+**Rust public-type additions:** adding a field to a `pub struct` is a silent breaking change for downstream crates that construct the struct by listing every field (no `..Default::default()`). Those crates compile fine in isolation but fail with `E0063` at workspace scope. Always verify with check 4 scope rules when touching public types.
+
 ### 4. Tests pass
 ```bash
 # Run the project's test suite
@@ -47,6 +49,19 @@ If tests fail in code you didn't modify:
 1. Re-run to check if flaky (transient failures happen).
 2. If consistent, report as blocker with the specific test name and error output.
 3. Do NOT try to fix other people's tests — that's out of scope.
+
+#### Rust: per-crate vs workspace-wide test scope
+
+| What you changed | Minimum test run |
+|---|---|
+| Internal logic, private functions only | `cargo test -p <crate>` |
+| Public type in `crates/*/src/lib.rs` — new/removed field, changed signature | **`cargo test --workspace`** |
+| Anything in `crates/cas-mux`, `crates/cas-factory`, `crates/cas-types` | **`cargo test --workspace`** (consumed by `cas-cli`) |
+| Test files only (`tests/**/*.rs`) with no API change | `cargo build --workspace --tests` at minimum |
+
+**Why per-crate isn't enough:** when you add a field to a `pub struct` in a shared crate, that crate's own tests pass (the new field has a `Default`). But downstream crates that name every field in a struct literal fail with `E0063`. `cargo test -p <crate>` never sees this — only `cargo test --workspace` or `cargo build --workspace --tests` catches it.
+
+**Historical note (cas-c0e0):** two fields were added to `FactoryConfig` (cas-factory). Per-crate tests passed. `cas-cli` constructors failed E0063 at workspace scope. The regression shipped to main as commit `3dc7488` and was caught only during manual merge.
 
 ### 5. No dead code left behind
 Check for language-specific dead code markers on your new code:
