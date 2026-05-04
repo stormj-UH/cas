@@ -46,6 +46,17 @@ In shared mode, file-overlap analysis is even more critical — two workers edit
    mcp__cas__coordination action=spawn_workers count=N isolate=true
    ```
    Omit `isolate` for shared mode.
+
+   **Heterogeneous team example** — Claude supervisor spawning Codex workers:
+   ```
+   # All Codex workers
+   mcp__cas__coordination action=spawn_workers count=2 cli=codex isolate=true
+
+   # Named workers with explicit Codex backend
+   mcp__cas__coordination action=spawn_workers count=1 cli=codex worker_names="alice" isolate=true
+   ```
+   `cli`, `model`, and `effort` are per-spawn overrides; omit to use the session default.
+   Full parameter table in [reference.md](reference.md#spawn_workers-parameters).
 2. Verify workers appear in TUI before assigning (stale DB records are not real workers)
 3. Assign tasks: `mcp__cas__task action=update id=<id> assignee=<worker>`
 4. Search for relevant context and send assignment message:

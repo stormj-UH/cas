@@ -9,6 +9,19 @@ Wrong field names and invalid actions waste dispatch cycles. This section covers
 - *Factory*: `spawn_workers`, `shutdown_workers`, `worker_status`, `worker_activity`, `clear_context`, `my_context`, `sync_all_workers`, `gc_report`, `gc_cleanup`, `remind`, `remind_list`, `remind_cancel`
 - *Worktree*: `worktree_create`, `worktree_list`, `worktree_show`, `worktree_cleanup`, `worktree_merge`, `worktree_status`
 
+**`spawn_workers` parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `count` | int | Number of workers to spawn |
+| `isolate` | bool | Each worker gets its own git worktree and branch (default false) |
+| `worker_names` | string | Comma-separated names for the spawned workers |
+| `cli` | string | CLI backend override: `claude` or `codex`. Overrides the daemon's session default for this spawn only. |
+| `model` | string | Model name override (e.g. `claude-opus-4-5`). Passed as `--model`. |
+| `effort` | string | Reasoning effort override: `minimal`, `low`, `medium`, `high`, `xhigh`. Passed as `--effort` (Claude) or `--config model_reasoning_effort=<v>` (Codex). |
+
+`cli`, `model`, and `effort` are per-spawn overrides — they apply to the workers spawned by this call only, not to the session default. Omit any field to inherit the session default.
+
 **Task ID is always `id`** — not `task_id`, `taskId`, or `_id`.
 
 **Priority** is `0=Critical, 1=High, 2=Medium (default), 3=Low, 4=Backlog`. Accepts numeric OR named alias: `priority=1` ≡ `priority="high"`. Other aliases: `critical`, `medium`, `low`, `backlog`, `p0`-`p4`.

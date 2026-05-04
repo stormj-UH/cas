@@ -70,7 +70,20 @@ Field purposes (write decisions, not code — "Approach" is 1–3 sentences of s
 - **Test scenarios** — name the scenarios, including at least one error path. Don't leave test design entirely to the worker.
 - **Verification** — observable outcome. What can be demonstrated when done. Maps to `demo_statement`.
 
-EPIC subtasks only — standalone bugs/chores/spikes stay freeform. Fields can be `N/A` or omitted when not applicable. Template → schema mapping: Goal→`description`, Approach→`design`, Test scenarios→`acceptance_criteria`, Verification→`demo_statement`, Dependencies→`blocked_by`, Execution note→`execution_note`.
+EPIC subtasks only — standalone bugs/chores/spikes stay freeform. Fields can be `N/A` or omitted when not applicable.
+
+| Template field | Maps to |
+|---|---|
+| Unit N name | `title` |
+| Goal | first paragraph of `description` |
+| Requirements | prose bullet in `description` (convention) |
+| Dependencies | `blocked_by` (hard) or `description` prose (soft) |
+| Files | `description` prose block |
+| Approach | `design` field |
+| Execution note | `execution_note` field |
+| Patterns to follow | `description` prose |
+| Test scenarios | `acceptance_criteria` field |
+| Verification | `demo_statement` field |
 
 ## Assignment Checks
 
