@@ -17,7 +17,7 @@ fn setup_cas_with_entities() -> (TempDir, CasCore, CasService) {
     let entity_store = open_entity_store(&cas_dir).unwrap();
     entity_store.init().unwrap();
 
-    let service = CasService::new(core.clone());
+    let service = CasService::new(core.clone(), None);
     (temp, core, service)
 }
 

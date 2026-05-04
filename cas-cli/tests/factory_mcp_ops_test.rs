@@ -48,7 +48,7 @@ impl FactoryTestEnv {
 
         let core = CasCore::with_daemon(cas_root.clone(), None, None);
         core.set_agent_id_for_testing(agent_id.to_string());
-        let service = CasService::new(core);
+        let service = CasService::new(core, None);
 
         Self {
             _temp: temp,
@@ -186,6 +186,7 @@ impl Drop for EnvGuard {
 fn factory_req(action: &str) -> FactoryRequest {
     FactoryRequest {
         action: action.to_string(),
+        id: None,
         count: None,
         worker_names: None,
         target: None,
