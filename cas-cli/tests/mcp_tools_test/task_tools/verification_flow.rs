@@ -2951,3 +2951,162 @@ async fn test_worker_close_with_malformed_envelope_still_blocked() {
         "task must NOT be Closed when verification is required"
     );
 }
+
+/// cas-164c AC1: factory worker close with a clean envelope MUST be blocked
+/// when a FRESH task-verifier dispatch row (status=Error, summary starts with
+/// "Dispatch requested", age ≤ VERIFICATION_JAIL_TIMEOUT_SECS) already exists.
+///
+/// Scenario:
+///   1. First close (no envelope) → verification jail arms, dispatch row written.
+///   2. Dispatch row is confirmed fresh (< 10 min old — it was just written).
+///   3. Second close WITH a clean CLEAN_ENVELOPE → must NOT short-circuit via
+///      worker-owned self-cert; the in-flight verifier's verdict must be awaited.
+///
+/// Before the fix (cas-164c), step 3 would write a Skipped row and close the
+/// task, orphaning the running task-verifier subagent.
+#[tokio::test]
+async fn test_worker_self_cert_blocked_when_fresh_dispatch_row_exists() {
+    let (temp, service) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let verification_store = open_verification_store(&cas_dir).unwrap();
+    let _env = FactoryWorkerEnv::enter();
+
+    // Create + start task.
+    let req = TaskCreateRequest {
+        title: "cas-164c: self-cert blocked by fresh dispatch row".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let create_text = extract_text(
+        service
+            .cas_task_create(Parameters(req))
+            .await
+            .expect("task_create should succeed"),
+    );
+    let id = extract_task_id(&create_text)
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .cas_task_start(Parameters(IdRequest { id: id.clone() }))
+        .await
+        .expect("task_start should succeed");
+
+    // First close — no envelope. The verification jail arms and a fresh
+    // dispatch-request row (status=Error, summary="Dispatch requested…") is
+    // written.
+    let _ = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("Done".to_string()),
+            bypass_code_review: None,
+            code_review_findings: None,
+        }))
+        .await
+        .expect("first close should return a result");
+
+    let task_after_first = task_store.get(&id).expect("task should exist");
+    assert!(
+        task_after_first.pending_verification,
+        "first close must arm the verification jail"
+    );
+
+    // Confirm the dispatch row is fresh (just written — well within the
+    // VERIFICATION_JAIL_TIMEOUT_SECS window).
+    let dispatch = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification store should be readable")
+        .expect("dispatch row must exist after first close");
+    assert_eq!(
+        dispatch.status,
+        cas::types::VerificationStatus::Error,
+        "dispatch row status must be Error"
+    );
+    assert!(
+        dispatch.summary.starts_with("Dispatch requested"),
+        "dispatch row summary must start with 'Dispatch requested', got: {}",
+        dispatch.summary
+    );
+    let age_secs = (chrono::Utc::now() - dispatch.created_at).num_seconds();
+    assert!(
+        age_secs < 600,
+        "dispatch row must be fresh (age={age_secs}s < 600s)"
+    );
+
+    // Second close WITH a clean envelope. The in-flight dispatch row is fresh,
+    // so worker-owned self-cert (cas-778a) must be SUPPRESSED. The task must
+    // remain jailed and the dispatch row must NOT be replaced by a Skipped row.
+    let result = service
+        .cas_task_close(Parameters(TaskCloseRequest {
+            id: id.clone(),
+            reason: Some("All criteria met — clean review envelope.".to_string()),
+            bypass_code_review: None,
+            code_review_findings: Some(CLEAN_ENVELOPE.to_string()),
+        }))
+        .await
+        .expect("second close should return a result");
+    let text = extract_text(result);
+
+    assert!(
+        text.contains("VERIFICATION REQUIRED"),
+        "second close with clean envelope must still require verification when fresh dispatch row exists: {text}"
+    );
+    assert!(
+        !text.contains("Closed task:"),
+        "second close must NOT succeed while fresh dispatch row exists: {text}"
+    );
+
+    // Task must remain jailed — pending_verification still true.
+    let task_after_second = task_store.get(&id).expect("task should exist");
+    assert!(
+        task_after_second.pending_verification,
+        "pending_verification must remain true — jail must NOT be cleared by self-cert while dispatch is in-flight"
+    );
+    assert_ne!(
+        task_after_second.status,
+        cas::types::TaskStatus::Closed,
+        "task must NOT be Closed while fresh dispatch row is in-flight"
+    );
+
+    // The dispatch row must NOT have been replaced with a Skipped row.
+    let row_after = verification_store
+        .get_latest_for_task(&id)
+        .expect("verification store should be readable")
+        .expect("verification row must still exist");
+    assert_eq!(
+        row_after.status,
+        cas::types::VerificationStatus::Error,
+        "dispatch row must remain Error — self-cert must NOT have overwritten it with Skipped: {:?}",
+        row_after.status
+    );
+    assert!(
+        row_after.summary.starts_with("Dispatch requested"),
+        "dispatch row summary must still start with 'Dispatch requested' — must not have been overwritten: {}",
+        row_after.summary
+    );
+
+    // Exactly one verification row must exist — the original dispatch row.
+    // A second Skipped row would indicate the self-cert path ran before being
+    // blocked, which is the exact bug cas-164c was fixing.
+    let all_rows = verification_store
+        .get_for_task(&id)
+        .expect("get_for_task should succeed");
+    assert_eq!(
+        all_rows.len(),
+        1,
+        "exactly one verification row (the dispatch row) must exist after blocked second close — a Skipped row would indicate self-cert ran despite in_flight_dispatch=true"
+    );
+}
