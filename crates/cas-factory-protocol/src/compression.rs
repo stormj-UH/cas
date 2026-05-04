@@ -62,7 +62,7 @@ pub enum CompressionError {
 /// let data = b"Hello, world!";
 /// let compressed = compress(data);
 /// let decompressed = decompress(&compressed).unwrap();
-/// assert_eq!(data.as_slice(), decompressed.as_slice());
+/// assert_eq!(data as &[u8], &decompressed[..]);
 /// ```
 pub fn compress(data: &[u8]) -> Vec<u8> {
     if data.len() > COMPRESSION_THRESHOLD {

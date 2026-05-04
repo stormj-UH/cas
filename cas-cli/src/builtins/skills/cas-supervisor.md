@@ -49,6 +49,23 @@ New session? Run these 5 steps in order. Open the linked reference for detail.
 4. **Create EPIC** — `mcp__cas__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
 5. **Spawn, assign, end turn** — `mcp__cas__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
 
+## Heterogeneous Teams (Claude supervisor + Codex workers)
+
+To spawn workers on a different CLI backend than the supervisor, pass `cli=` to `spawn_workers`:
+
+```
+# Spawn one Codex worker from a Claude supervisor session
+mcp__cas__coordination action=spawn_workers count=1 cli=codex
+
+# Spawn two workers with explicit names and Codex backend
+mcp__cas__coordination action=spawn_workers count=2 cli=codex worker_names="alice,bob"
+
+# Or from the CLI before starting the daemon:
+# cas factory --workers 2 --worker-spec '{"cli":"Codex","name":"alice"}'
+```
+
+`cli`, `model`, and `effort` are per-spawn overrides. See [references/reference.md](cas-supervisor/references/reference.md) for the full `spawn_workers` parameter table.
+
 ## References
 
 Each file below is a focused chunk of the operational guide. Open the one you need — they are not pre-loaded.

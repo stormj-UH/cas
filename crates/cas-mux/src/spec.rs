@@ -107,6 +107,27 @@ impl WorkerSpec {
             effort: Some(Effort::High),
         }
     }
+
+    /// Construct a named Codex spec with no model or effort override.
+    ///
+    /// Convenience constructor for tests and callers that want to pin a
+    /// specific worker slot to the Codex backend without specifying model or
+    /// effort (both will use the Codex binary's own defaults).
+    ///
+    /// # Example
+    /// ```
+    /// use cas_mux::WorkerSpec;
+    /// let spec = WorkerSpec::codex_default("alice");
+    /// assert_eq!(spec.name.as_deref(), Some("alice"));
+    /// ```
+    pub fn codex_default(name: &str) -> Self {
+        Self {
+            name: Some(name.to_string()),
+            cli: SupervisorCli::Codex,
+            model: None,
+            effort: None,
+        }
+    }
 }
 
 #[cfg(test)]
