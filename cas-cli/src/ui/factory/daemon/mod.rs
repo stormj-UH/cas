@@ -103,9 +103,9 @@ struct WsConnection {
 #[derive(Debug)]
 enum PendingSpawn {
     /// Spawn a worker with an auto-generated name
-    Anonymous { isolate: bool },
+    Anonymous { isolate: bool, spec: Option<cas_mux::WorkerSpec> },
     /// Spawn a worker with a specific name
-    Named { name: String, isolate: bool },
+    Named { name: String, isolate: bool, spec: Option<cas_mux::WorkerSpec> },
     /// Shutdown workers
     Shutdown {
         count: Option<usize>,
@@ -152,9 +152,10 @@ pub struct FactoryDaemon {
     compact_rows: u16,
     /// Pending spawn/shutdown actions (processed one per tick to avoid blocking TUI)
     pending_spawns: VecDeque<PendingSpawn>,
-    /// In-flight background spawn task: (worker_name, join_handle).
+    /// In-flight background spawn task: (worker_name, per-spawn spec override, join_handle).
     /// One at a time, runs git worktree ops off main thread.
-    spawn_task: Option<(String, JoinHandle<anyhow::Result<WorkerSpawnResult>>)>,
+    /// The spec carries the caller-supplied WorkerSpec through the async gap to finish_worker_spawn.
+    spawn_task: Option<(String, Option<cas_mux::WorkerSpec>, JoinHandle<anyhow::Result<WorkerSpawnResult>>)>,
     /// Cloud phone-home WebSocket client handle
     cloud_handle: Option<cloud_client::CloudClientHandle>,
     /// Whether cloud phone-home should be started (deferred from init for fork-first path)

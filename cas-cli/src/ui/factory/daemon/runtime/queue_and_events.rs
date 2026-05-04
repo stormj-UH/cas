@@ -534,13 +534,13 @@ impl FactoryDaemon {
                         self.app.spawning_count += count;
                         for _ in 0..count {
                             self.pending_spawns
-                                .push_back(PendingSpawn::Anonymous { isolate });
+                                .push_back(PendingSpawn::Anonymous { isolate, spec: None });
                         }
                     } else {
                         self.app.spawning_count += request.worker_names.len();
                         for name in request.worker_names {
                             self.pending_spawns
-                                .push_back(PendingSpawn::Named { name, isolate });
+                                .push_back(PendingSpawn::Named { name, isolate, spec: None });
                         }
                     }
                 }
@@ -569,11 +569,11 @@ impl FactoryDaemon {
     /// either: (a) check if the in-flight spawn finished, or (b) start a new one.
     pub(super) async fn process_pending_spawns(&mut self) {
         // Step 1: Check if in-flight background spawn completed
-        if let Some((_, ref handle)) = self.spawn_task {
+        if let Some((_, _, ref handle)) = self.spawn_task {
             if !handle.is_finished() {
                 return; // Still running, don't start another
             }
-            let (pending_name, handle) = self.spawn_task.take().unwrap();
+            let (pending_name, pending_spec, handle) = self.spawn_task.take().unwrap();
             // Remove from pending workers (boot pane transitions to real pane or disappears)
             self.app.remove_pending_worker(&pending_name);
             match handle.await {
@@ -594,7 +594,7 @@ impl FactoryDaemon {
                     if let Some(ref tc) = teams_config {
                         crate::ui::theme::register_agent_color(&tc.agent_name, &tc.agent_color);
                     }
-                    match self.app.finish_worker_spawn(result, teams_config) {
+                    match self.app.finish_worker_spawn(result, teams_config, pending_spec) {
                         Ok(name) => {
                             tracing::info!("Spawned worker (async): {}", name);
                             // Register new worker with native Agent Teams
@@ -668,13 +668,16 @@ impl FactoryDaemon {
         };
 
         match action {
-            PendingSpawn::Anonymous { isolate } => {
+            PendingSpawn::Anonymous { isolate, spec } => {
                 match self.app.prepare_worker_spawn(None, isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
                         self.app.add_pending_worker(worker_name.clone(), isolate);
-                        self.spawn_task =
-                            Some((worker_name, tokio::task::spawn_blocking(move || prep.run())));
+                        self.spawn_task = Some((
+                            worker_name,
+                            spec,
+                            tokio::task::spawn_blocking(move || prep.run()),
+                        ));
                     }
                     Err(e) => {
                         crate::telemetry::track(
@@ -689,13 +692,16 @@ impl FactoryDaemon {
                     }
                 }
             }
-            PendingSpawn::Named { name, isolate } => {
+            PendingSpawn::Named { name, isolate, spec } => {
                 match self.app.prepare_worker_spawn(Some(&name), isolate) {
                     Ok(prep) => {
                         let worker_name = prep.worker_name.clone();
                         self.app.add_pending_worker(worker_name.clone(), isolate);
-                        self.spawn_task =
-                            Some((worker_name, tokio::task::spawn_blocking(move || prep.run())));
+                        self.spawn_task = Some((
+                            worker_name,
+                            spec,
+                            tokio::task::spawn_blocking(move || prep.run()),
+                        ));
                     }
                     Err(e) => {
                         crate::telemetry::track(

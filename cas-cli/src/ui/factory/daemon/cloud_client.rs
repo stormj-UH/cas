@@ -916,6 +916,9 @@ fn handle_cloud_command(
                 .get("isolate")
                 .and_then(|i| i.as_bool())
                 .unwrap_or(false);
+            // cas-4cae: per-worker spec support for the cloud path requires a spawn queue schema
+            // update (T3/cas-2992). For now, spec overrides via the cloud protocol are silently
+            // dropped and the session default applies.
             match crate::store::open_spawn_queue_store(cas_dir) {
                 Ok(queue) => match queue.enqueue_spawn(count, &names, isolate) {
                     Ok(id) => {

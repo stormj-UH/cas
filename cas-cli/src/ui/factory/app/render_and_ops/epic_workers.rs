@@ -226,7 +226,7 @@ impl FactoryApp {
                 return Err(e);
             }
         };
-        self.finish_worker_spawn(result, None)
+        self.finish_worker_spawn(result, None, None)
     }
 
     /// Phase 1: Prepare spawn data (fast, runs on main thread).
@@ -335,6 +335,7 @@ impl FactoryApp {
         &mut self,
         result: WorkerSpawnResult,
         teams: Option<cas_mux::TeamsSpawnConfig>,
+        spec: Option<cas_mux::WorkerSpec>,
     ) -> anyhow::Result<String> {
         // cas-9bc6: re-read live LlmConfig so harness/model/effort changes made
         // via `cas config set` after daemon boot are reflected in this spawn.
@@ -357,7 +358,7 @@ impl FactoryApp {
             cas_root.as_ref(),
             &self.supervisor_name,
             teams.as_ref(),
-            None, // spec: use Mux default (T3 will supply per-spawn overrides)
+            spec, // cas-4cae: per-spawn spec override from SpawnWorkers protocol
         ) {
             crate::telemetry::track(
                 "factory_worker_spawn_result",
