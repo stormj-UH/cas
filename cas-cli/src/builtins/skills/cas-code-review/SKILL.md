@@ -19,11 +19,13 @@ Everything in this document is the orchestrator's responsibility. The personas t
 
 ## Purpose
 
-The primary trigger for this skill is **automatic invocation at CAS factory worker `task.close`** in `autofix` mode. The review runs *before* close completes and its outcome gates the close (P0 findings hard-block; see the mode table below). This is the tightest feedback loop the brainstorm identified and it is the path most invocations will take.
+The primary trigger for this skill is **manual invocation by the supervisor** during cherry-pick to the epic branch (per-task) and at EPIC→base merge (integration sweep). Use `mode=interactive` for both. This is the path most invocations will take under the default `[code_review] owner = "supervisor"` configuration.
 
-Three secondary modes exist and are described in the Mode reference table:
+The `autofix` mode still exists as the legacy worker-owned path for projects that opt back in via `[code_review] owner = "worker"` in `.cas/config.toml`. In that mode the review runs *before* worker close completes and gates it (P0 findings hard-block).
 
-- `interactive` — a human is driving; show findings in a full UX, support a bounded 2-round fix-and-rereview loop.
+Three other modes exist and are described in the Mode reference table:
+
+- `autofix` — legacy, worker-owned, opt-in only; gates `task.close` inline.
 - `report-only` — read-only scan, safe to run in parallel (never writes, never mutates tasks).
 - `headless` — called from another skill, returns the merged envelope as structured text.
 
@@ -138,10 +140,10 @@ CAS supports two review ownership modes, configured via `[code_review] owner = "
 
 | `owner` | Worker behavior at close | Supervisor responsibility |
 |---|---|---|
-| `worker` (default) | Runs the full `autofix` pipeline inline; close blocks until review completes (~14 min) | None — workers self-certify |
-| `supervisor` | Runs lightweight structural lint (<1s); task transitions to `pending_supervisor_review` | Supervisor runs `/cas-code-review mode=interactive` on queued tasks and delivers findings via coordination message |
+| `supervisor` **(default)** | Runs lightweight structural lint (<1s); task transitions to `pending_supervisor_review` | Supervisor runs `/cas-code-review mode=interactive` at cherry-pick and at EPIC→base merge |
+| `worker` (opt-out / legacy) | Runs the full `autofix` pipeline inline; close blocks until review completes (~14 min) | None — workers self-certify |
 
-The default is `worker` for backwards compatibility. Stage 2 (flip the default to `supervisor`) is a follow-on task.
+The default is `supervisor`. Pin to legacy worker-owned behavior with `[code_review] owner = "worker"` in `.cas/config.toml`.
 
 ## Mode reference
 
@@ -149,8 +151,8 @@ The four invocation modes, per brainstorm R8 + R5 + R9–R11:
 
 | Mode | Trigger | Edits files? | Creates tasks? | Gates close? | Fix loop | Notes |
 |---|---|---|---|---|---|---|
-| `autofix` | Automatic at factory worker `task.close` (primary, `owner=worker` only) | Yes, via fixer sub-agent on `safe_auto` | Yes, residual non-`safe_auto` → CAS tasks with `P0→0…P3→3` | Yes — any P0 hard-blocks; supervisor override required to downgrade | Bounded `max_rounds=2` | R5, R9, R10, R11. This is the primary path; everything else is secondary. |
-| `interactive` | Manual human or supervisor invocation; also used by supervisor in `owner=supervisor` mode | Only via fixer if user accepts the offered loop | Only if user accepts | No | Bounded 2-round on user consent | R8. Full UX; show findings, let the human drive. |
+| `autofix` | Automatic at factory worker `task.close` (legacy, `owner=worker` only — opt-in) | Yes, via fixer sub-agent on `safe_auto` | Yes, residual non-`safe_auto` → CAS tasks with `P0→0…P3→3` | Yes — any P0 hard-blocks; supervisor override required to downgrade | Bounded `max_rounds=2` | R5, R9, R10, R11. Legacy opt-in path for `owner=worker` projects. |
+| `interactive` | Used by supervisor at cherry-pick (per-task) and at EPIC→base merge (integration sweep) — primary path under default `owner=supervisor`. Also available for manual human invocation. | Only via fixer if user accepts the offered loop | Only if user accepts | No | Bounded 2-round on user consent | R8. Full UX; show findings, let the human drive. |
 | `report-only` | Manual or scheduled | No | No | No | None | R8. Safe for parallel runs; strictly read-only. |
 | `headless` | Skill-to-skill call | No (orchestrator itself does not edit) | No | No | None | R8. Returns merged envelope as structured text; caller decides next steps. |
 
