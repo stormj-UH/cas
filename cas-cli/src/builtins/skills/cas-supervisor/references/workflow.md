@@ -93,12 +93,19 @@ base branch ────────────────────► (sta
 3. Cherry-pick to base branch: `git cherry-pick <commit-sha>` (one per commit)
    - **If conflicts arise:** (a) non-overlapping additions (e.g., both workers added to Cargo.toml) — keep both entries, (b) semantic conflicts — review both changes and pick the correct merge, (c) if unsure — message the worker who committed for context before resolving
 4. Verify build after cherry-pick: `~/.cargo/bin/cargo build --quiet`
-5. Message other active workers to sync onto the **local** branch (not `origin/`):
+5. Run code review against the cherry-picked range:
+   ```bash
+   # Capture the pre-cherry-pick HEAD as the review base
+   pre_cp=$(git rev-parse HEAD@{1})
+   ```
+   Then invoke: `/cas-code-review mode=interactive base_sha=<pre_cp> task_id=<task-id>`
+   Address any P0 findings before notifying other workers to sync.
+6. Message other active workers to sync onto the **local** branch (not `origin/`):
    ```
    mcp__cas__coordination action=message target=<other-worker> message="Branch updated after cherry-pick. Sync: git stash && git rebase <base-branch> && git stash pop"
    ```
-6. Clear completed worker's context: `mcp__cas__coordination action=clear_context target=<worker>`
-7. Assign next task
+7. Clear completed worker's context: `mcp__cas__coordination action=clear_context target=<worker>`
+8. Assign next task
 
 ## Phase 3: Review (Shared Mode)
 
@@ -125,11 +132,16 @@ When workers share the main directory, there's no branch merging — workers com
 
 1. Verify all tasks closed: `mcp__cas__task action=list status=open epic=<epic-id>`
 2. Run tests
-3. **Isolated mode only**: Merge epic to base branch and cleanup worktrees (can be 10GB+ each):
+3. Run integration review against the full EPIC diff — per-cherry-pick reviews catch per-task issues; this step catches cross-task integration issues (e.g., two tasks individually clean but semantically conflicting):
+   From inside the epic branch checkout, invoke:
+   `/cas-code-review mode=interactive base_sha=<base-branch>`
+   (substitute `main`, `develop`, or your actual base branch name for `<base-branch>`)
+   Address any P0 findings before merging.
+4. **Isolated mode only**: Merge epic to base branch and cleanup worktrees (can be 10GB+ each):
    ```bash
    git checkout <base-branch> && git merge epic/<slug>
    mcp__cas__coordination action=shutdown_workers count=0
    git worktree remove <path>  # for each worker worktree
    git branch -d epic/<slug>
    ```
-4. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`
+5. Shutdown workers: `mcp__cas__coordination action=shutdown_workers count=0`
