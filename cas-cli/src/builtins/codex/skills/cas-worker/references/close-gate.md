@@ -82,39 +82,6 @@ For every non-trivial change, trace **2 levels out** from the edited code — ca
 
 Only close after all checks pass. The verifier will catch what you miss — but rejections cost time.
 
-## Close-time Code Review Gate
-
-Before closing any task with code changes, run the `cas-code-review` skill and pass its output to close:
-
-1. **Run the review:**
-   ```
-   Skill(cas-code-review, mode=autofix, task_id=<your task id>)
-   ```
-
-2. **Pass the result to close.** The skill returns a `ReviewOutcome` JSON envelope. Pass it to close:
-   ```
-   mcp__cas__task action=close id=<task id> reason=<...> \
-     code_review_findings='<ReviewOutcome JSON>'
-   ```
-
-3. **Skipped automatically** for `execution_note=additive-only` tasks and pure docs/test-only diffs. Calling close without findings on other tasks returns `CODE_REVIEW_REQUIRED`.
-
-### If close is blocked on P0
-
-1. Read every P0 finding — they are code-grounded, not speculative.
-2. Fix the finding, commit, retry close. Do not spam-retry without fixing.
-3. If you cannot fix it (pre-existing code, out-of-scope), forward the block to supervisor via `note_type=blocker` and wait. `bypass_code_review=true` is supervisor-only.
-
-Non-P0 findings become follow-up tasks automatically — they don't block your close.
-
-### What NOT to do
-
-- Do not invoke the legacy `code-reviewer` agent — it's deprecated.
-- Do not edit `close_ops.rs` or gate policy to let your diff through.
-- Do not skip pre-close self-verification — the gate supplements your own checks.
-
-**Latency:** the multi-persona review adds noticeable time to close. Do not assume it's hung or bypass the gate to dodge latency.
-
 ## Simplify-As-You-Go
 
 After closing your **third** task in the current EPIC — and again after the 6th, 9th, 12th, etc. — invoke the `simplify` skill on your own recent work in that EPIC before picking up the next task.

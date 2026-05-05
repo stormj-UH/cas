@@ -16,13 +16,9 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 4. Implement. Commit after each logical unit. Follow project commit style (`git log --oneline -10`). Include task ID in commit messages.
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
 6. Run pre-close self-verification — see [references/close-gate.md](cas-worker/references/close-gate.md).
-7. Run `/cas-code-review` with `mode=autofix` — see [references/close-gate.md](cas-worker/references/close-gate.md).
-   > **Supervisor-owned review mode:** If the project config has `[code_review] owner = "supervisor"`, step 7 is skipped. Close runs a fast structural lint (<1s) and transitions the task to `pending_supervisor_review` instead of blocking for the full multi-persona review. You will still get close feedback immediately; the full review result arrives later via a supervisor coordination message.
-8. Close with the ReviewOutcome from step 7: `mcp__cas__task action=close id=<task-id> reason="..." code_review_findings='<ReviewOutcome JSON>'`
+7. Close: `mcp__cas__task action=close id=<task-id> reason="..."`
    - **Success** → message the supervisor.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
-   - **CODE_REVIEW_REQUIRED** → you skipped step 7. Go back.
-   - **P0 BLOCK** → fix the P0 findings, re-run step 7, retry close.
    - **verification-required** → message supervisor immediately. Do NOT spawn verifier agents or retry close.
    - **VERIFICATION_JAIL_BLOCKED** → see [references/recovery.md](cas-worker/references/recovery.md). Forward once, then trust the DB.
 
@@ -87,6 +83,6 @@ Open these on demand — they are not pre-loaded.
 
 | Situation | Open |
 |---|---|
-| About to close (steps 6–7) | close-gate |
+| About to close (step 6) | close-gate |
 | Anything went wrong (jail, MCP, worktree, reassignment) | recovery |
 | Need an exact field name or action name | details |
