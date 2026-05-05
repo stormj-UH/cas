@@ -1068,12 +1068,18 @@ impl CasCore {
         //   * Additive-only tasks — already skipped by the gate below.
         //   * `has_reviewable_changes` returns false — docs-only or empty
         //     diff; normal close path is appropriate.
-        //   * `owner=worker` (default) — legacy path, unchanged.
+        //   * `owner=worker` — legacy opt-out path, unchanged.
+        //
+        // When the `[code_review]` section is absent entirely, fall through to
+        // `CodeReviewConfig::default().supervisor_owned()` so the runtime gate
+        // tracks the same default as the config layer (cas-865b: default is
+        // "supervisor").  The old `.unwrap_or(false)` hard-coded worker mode
+        // for absent sections, making the config-layer default ineffective.
         let supervisor_review_mode = config
             .code_review
             .as_ref()
             .map(|cr| cr.supervisor_owned())
-            .unwrap_or(false);
+            .unwrap_or_else(|| crate::config::CodeReviewConfig::default().supervisor_owned());
 
         if supervisor_review_mode
             && is_factory_worker

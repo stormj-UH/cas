@@ -483,6 +483,94 @@ async fn test_lint_fail_close_blocked_before_pending_supervisor_review() {
     );
 }
 
+/// cas-865b: A factory worker close on a project with **no** `[code_review]`
+/// section in config.toml must enter supervisor-review mode (PendingSupervisorReview)
+/// rather than falling back to the legacy worker path.
+///
+/// This is the runtime counterpart to the config-layer assertion in
+/// `test_owner_config_default_is_supervisor`.  It exercises the fixed
+/// `close_ops.rs` line that was previously `.unwrap_or(false)` — which hard-
+/// coded worker mode for absent sections.  After cas-865b the absent-section
+/// path must track `CodeReviewConfig::default().supervisor_owned()` = true.
+#[tokio::test]
+async fn test_worker_close_absent_code_review_section_defaults_to_supervisor_mode() {
+    let (temp, _core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    let cas_dir = temp.path().join(".cas");
+
+    // Write a config with NO [code_review] section — only verification disabled.
+    // This is the absent-section case that close_ops.rs must now treat as
+    // supervisor mode.
+    let toml_no_code_review = "[verification]\nenabled = false\n";
+    std::fs::write(cas_dir.join("config.toml"), toml_no_code_review)
+        .expect("config.toml should be writable");
+
+    // Init git repo at the project root so has_reviewable_changes() returns true.
+    init_git_repo_with_staged_changes(temp.path());
+
+    let core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    let task_store = open_task_store(&cas_dir).unwrap();
+    let service = CasService::new(core, None);
+
+    let _worker_guard = FactoryWorkerGuard::enter();
+
+    let create = task_req(serde_json::json!({
+        "action": "create",
+        "title": "Absent-config default-supervisor close test",
+        "priority": 2,
+        "task_type": "task",
+    }));
+    let created = service
+        .task(Parameters(create))
+        .await
+        .expect("task.create should succeed");
+    let id = extract_task_id(&extract_text(created))
+        .expect("should have task ID")
+        .to_string();
+
+    service
+        .task(Parameters(task_req(
+            serde_json::json!({ "action": "start", "id": id }),
+        )))
+        .await
+        .expect("task.start should succeed");
+
+    // Close without code_review_findings — absent [code_review] must default to
+    // supervisor mode and transition to PendingSupervisorReview.
+    let close_result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id,
+            "reason": "All acceptance criteria met.",
+        }))))
+        .await
+        .expect("task.close should return a result");
+
+    let close_text = extract_text(close_result);
+
+    // Must NOT see CODE_REVIEW_REQUIRED (the old worker-mode gate).
+    assert!(
+        !close_text.contains("CODE_REVIEW_REQUIRED"),
+        "Absent [code_review] must NOT fall back to CODE_REVIEW_REQUIRED; got: {close_text}"
+    );
+
+    // Must see the supervisor-review confirmation.
+    assert!(
+        close_text.contains("supervisor review") || close_text.contains("pending_supervisor_review"),
+        "Absent [code_review] must transition to supervisor review; got: {close_text}"
+    );
+
+    // Task status must be PendingSupervisorReview.
+    let task = task_store.get(&id).expect("task should exist");
+    assert_eq!(
+        task.status,
+        TaskStatus::PendingSupervisorReview,
+        "Absent [code_review] section must default to PendingSupervisorReview; got: {:?}",
+        task.status
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helpers (local copies of patterns from verification_flow.rs)
 // ---------------------------------------------------------------------------
