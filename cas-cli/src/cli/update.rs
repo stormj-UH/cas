@@ -54,6 +54,12 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub sync: bool,
 
+    /// Distribute embedded built-in skills/agents/commands to ~/.claude
+    /// (and ~/.codex if present). Does not touch project-scoped config
+    /// (settings.json, CLAUDE.md, hooks, db-backed rules/skills).
+    #[arg(long)]
+    pub user: bool,
+
     /// Show what migrations would be applied without running them
     #[arg(long)]
     pub dry_run: bool,
@@ -67,6 +73,14 @@ pub fn execute(args: &UpdateArgs, cli: &Cli, cas_root: Option<&Path>) -> anyhow:
     // Note: update command accepts Option<&Path> because it can run without an initialized CAS
     // (e.g., binary update only, or checking for updates before init)
     let current_version = env!("CARGO_PKG_VERSION");
+
+    // Handle user-level builtin distribution (~/.claude, ~/.codex)
+    if args.user {
+        let mut steps = UpdateStepTracker::new(1, !cli.json);
+        return steps.run("Distributing built-ins to user-level", || {
+            sync_user_builtins(cli)
+        });
+    }
 
     // Handle sync-only mode (just sync .claude/.codex files)
     if args.sync {
@@ -381,6 +395,102 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
             fmt.write_raw("  ")?;
             fmt.success("Database skills up to date")?;
         }
+    }
+
+    Ok(())
+}
+
+/// Distribute embedded built-in skills/agents/commands to user-level dirs
+/// (`~/.claude` for Claude Code, `~/.codex` for Codex if present).
+///
+/// Why this exists: factory worker worktrees that don't ship `.claude/skills/`
+/// in their tracked tree fall back to user-level skills. Without a user-level
+/// refresh path, those workers silently consume stale skill prompts after a
+/// `cas update` because `--sync` only writes into the current project. This is
+/// the user-level analogue of `--sync`: builtins only, no project-scoped
+/// config (settings.json, CLAUDE.md, hooks, db-backed rules/skills).
+fn sync_user_builtins(cli: &Cli) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        anyhow::anyhow!("could not resolve user home directory; set $HOME and retry")
+    })?;
+    let claude_dir = home.join(".claude");
+    let codex_dir = home.join(".codex");
+
+    let theme = ActiveTheme::default();
+
+    if !cli.json {
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme.clone());
+        fmt.subheading("Distributing built-ins to user-level")?;
+    }
+
+    // Claude: gated on dir existence — if a user has no ~/.claude, they're
+    // not using Claude Code globally and we don't want to materialize an
+    // empty dir for them.
+    let claude_result = if claude_dir.exists() {
+        let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Claude, &claude_dir)?;
+        if !cli.json {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme.clone());
+            fmt.write_raw("  ")?;
+            if r.total_updated() > 0 {
+                fmt.success(&format!(
+                    "~/.claude: updated {} files ({} agents, {} skills)",
+                    r.total_updated(),
+                    r.agents_updated,
+                    r.skills_updated
+                ))?;
+                for file in &r.updated_files {
+                    fmt.write_raw(&format!("    + {file}"))?;
+                    fmt.newline()?;
+                }
+            } else {
+                fmt.success("~/.claude: built-ins up to date")?;
+            }
+        }
+        Some(r)
+    } else {
+        if !cli.json {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme.clone());
+            fmt.write_raw("  ")?;
+            fmt.warning("~/.claude does not exist — skipping (Claude Code not installed?)")?;
+        }
+        None
+    };
+
+    let codex_result = if codex_dir.exists() {
+        let r = sync_all_builtins_for_harness(cas_mux::SupervisorCli::Codex, &codex_dir)?;
+        if !cli.json {
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme.clone());
+            fmt.write_raw("  ")?;
+            if r.total_updated() > 0 {
+                fmt.success(&format!(
+                    "~/.codex: updated {} files ({} agents, {} skills)",
+                    r.total_updated(),
+                    r.agents_updated,
+                    r.skills_updated
+                ))?;
+            } else {
+                fmt.success("~/.codex: built-ins up to date")?;
+            }
+        }
+        Some(r)
+    } else {
+        // No nag for absent ~/.codex — Codex is opt-in and most users won't
+        // have it. Silent skip.
+        None
+    };
+
+    if cli.json {
+        let claude_total = claude_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
+        let codex_total = codex_result.as_ref().map(|r| r.total_updated()).unwrap_or(0);
+        let claude_present = claude_dir.exists();
+        let codex_present = codex_dir.exists();
+        println!(
+            r#"{{"claude_present":{claude_present},"claude_builtins_updated":{claude_total},"codex_present":{codex_present},"codex_builtins_updated":{codex_total}}}"#
+        );
     }
 
     Ok(())
