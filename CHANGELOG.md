@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [2.13.0] - 2026-05-05
+
+### Changed
+
+#### Default code-review ownership flipped from `worker` to `supervisor` (EPIC cas-cac3 / cas-b51a Stage 2+3)
+
+**The default `[code_review] owner` is now `"supervisor"`.** Projects with no `[code_review]` block in `.cas/config.toml` now use supervisor-owned review by default — no opt-in required.
+
+- **Workers run only the lightweight structural lint at close (<1s).** The multi-persona review pipeline is no longer invoked inline at `task.close` by default. Tasks transition to `pending_supervisor_review` after a clean lint pass; workers are immediately free to pick up the next task.
+- **Supervisor runs `/cas-code-review mode=interactive` at cherry-pick time (per-task) and at EPIC→base merge (integration sweep).** See `cas-supervisor/references/workflow.md` Phase 3 step 5 and Phase 4 step 3 for the exact invocation sequence.
+- **Pin to legacy behavior** with `[code_review] owner = "worker"` in `.cas/config.toml`. This restores the original inline dispatch (~14 min per close) for teams that want it.
+- **`close_ops.rs` absent-section fix (cas-865b):** `.unwrap_or(false)` at the runtime close gate replaced with `.unwrap_or_else(|| CodeReviewConfig::default().supervisor_owned())` so projects with no `[code_review]` block track the config-layer default instead of being hardcoded to worker mode.
+- **Skill prose updated:** `cas-worker` workflow (steps re-numbered), `cas-supervisor` workflow (cherry-pick and integration review steps added), `cas-code-review` SKILL.md (ownership table, mode reference, purpose section all reflect new default).
+
 ## [2.12.0] - 2026-05-04
 
 ### Added
@@ -404,6 +418,7 @@ After upgrading, the new gates fire on `task.close` calls. If a worker hits the 
 - Initial stable release with core functionality.
 
 [Unreleased]: https://github.com/pippenz/cas/compare/v2.12.0...HEAD
+[2.13.0]: https://github.com/pippenz/cas/compare/v2.12.0...v2.13.0
 [2.12.0]: https://github.com/pippenz/cas/compare/v2.11.0...v2.12.0
 [2.11.0]: https://github.com/pippenz/cas/compare/v2.10.1...v2.11.0
 [2.10.1]: https://github.com/pippenz/cas/compare/v2.10.0...v2.10.1
