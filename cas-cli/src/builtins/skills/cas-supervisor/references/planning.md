@@ -106,7 +106,7 @@ Supervisor has rejection authority. Work is sent back with specific, actionable 
 - **Flag obvious SOLID violations** — with specifics; don't rubber-stamp "SOLID compliance verified"
 - **Verify, don't trust** — Read the actual diff or run tests yourself before accepting. Worker self-reports are inputs, not verdicts.
 - **Rejection format** — Every rejection names: (1) which gate failed, (2) the specific code/file, (3) what needs to change. "SRP violation" alone is not actionable; "SRP violation: `handle_request()` in `router.rs` handles both auth and routing — split into two functions" is.
-- **Automated gate complement** — Workers run `/cas-code-review` before close (multi-persona automated review covering correctness, testing, maintainability, and project standards). Your manual review complements the automated gate — focus on architectural fit, scope compliance, and domain knowledge the automated reviewers can't assess. Don't re-check what the automated gate already covers.
+- **Automated gate complement** — Multi-persona code review (correctness, testing, maintainability, project-standards, plus conditional personas) runs at *your* cherry-pick to the EPIC branch and at EPIC→base merge, not at worker close. This is the default `[code_review] owner = "supervisor"` behavior since v2.13.0. Do not dispatch workers with "run `/cas-code-review` on the diff" instructions; that's the legacy `owner = "worker"` path and only applies if a project has opted in via `.cas/config.toml`. Your manual review complements the automated gate at the cherry-pick / merge points — focus on architectural fit, scope compliance, and domain knowledge the automated reviewers can't assess. Don't re-check what the automated gate already covers.
 
 ## Ongoing Discipline
 

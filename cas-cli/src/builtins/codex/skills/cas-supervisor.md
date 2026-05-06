@@ -49,11 +49,11 @@ New session? Run these 5 steps in order. Open the linked reference for detail.
 4. **Create EPIC** — `mcp__cs__task action=create task_type=epic title="..." description="..."`. Spec shape and templates in [references/planning.md](cas-supervisor/references/planning.md).
 5. **Spawn, assign, end turn** — `mcp__cs__coordination action=spawn_workers count=N isolate=true`, then assign with `update` (not `transfer`), send context, stop. Phases and merge flow in [references/workflow.md](cas-supervisor/references/workflow.md).
 
-## Supervisor-Owned Code Review (cas-b51a)
+## Supervisor-Owned Code Review (default since v2.13.0)
 
-When the project config has `[code_review] owner = "supervisor"`, workers skip the full multi-persona review at close and instead transition their tasks to `pending_supervisor_review`. This eliminates the ~14-minute per-close blocking cost on the worker side.
+The default `[code_review] owner` is `"supervisor"`. Workers skip the full multi-persona review at close and transition their tasks to `pending_supervisor_review`; you run the review at cherry-pick to the EPIC branch and at EPIC→base merge. This eliminates the ~14-minute, ~100K-token per-close blocking cost on the worker side. Do not dispatch workers with "run `/cas-code-review` on the diff" — that's the legacy inline-worker path.
 
-**Your responsibilities in this mode:**
+**Your responsibilities:**
 
 1. **Monitor the review queue** — Tasks in `pending_supervisor_review` are waiting for you. List them:
    ```
@@ -63,13 +63,13 @@ When the project config has `[code_review] owner = "supervisor"`, workers skip t
 3. **Deliver the verdict** — After review, send the worker a coordination message with the findings summary and any P0/P1 issues to address. If clean, confirm they can consider the task complete.
 4. **Record the verification** (optional) — `mcp__cs__verification action=add task_id=<id> status=approved summary="..."` to create an audit trail.
 
-**Config to enable (add to `.cas/config.toml`):**
+**Pinning to legacy inline-worker review** (only if your project explicitly wants the old behavior — adds ~14 min per close):
 ```toml
 [code_review]
-owner = "supervisor"
+owner = "worker"
 ```
 
-Default (`owner = "worker"`) preserves the existing behavior where each worker runs the full review inline.
+With `owner = "worker"`, each worker runs the full review inline at close and gates close on P0 findings. Most projects should leave this unset and use the supervisor default.
 
 ## Heterogeneous Teams (Claude supervisor + Codex workers)
 
