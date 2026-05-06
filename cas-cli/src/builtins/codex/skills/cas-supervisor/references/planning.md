@@ -1,3 +1,9 @@
+---
+name: planning
+description: Supervisor planning reference — gates, templates, EPIC sizing.
+managed_by: cas
+---
+
 # Planning — Gates, Templates, EPIC Sizing
 
 ## Planning Gates

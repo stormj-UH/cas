@@ -1,3 +1,9 @@
+---
+name: close-gate
+description: Worker pre-close self-verification gate.
+managed_by: cas
+---
+
 # Close Gate — Self-Verification
 
 Run all 6 self-verification checks before `mcp__cas__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.

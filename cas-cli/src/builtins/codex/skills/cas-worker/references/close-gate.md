@@ -1,6 +1,14 @@
-# Close Gate — Self-Verification + Code Review
+---
+name: close-gate
+description: Worker pre-close self-verification gate.
+managed_by: cas
+---
 
-Both must run before `mcp__cas__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.
+# Close Gate — Self-Verification
+
+Run all 6 self-verification checks before `mcp__cas__task action=close`. The gate is the same regardless of task type. Skip and you eat a verifier rejection round-trip.
+
+**Code review is not your job at close** under the v2.13.0+ default `[code_review] owner = "supervisor"`. The supervisor runs `/cas-code-review` at cherry-pick + EPIC merge time. Do not invoke the multi-persona review yourself unless your supervisor explicitly tells you to, or your project has opted in to legacy `owner = "worker"` in `.cas/config.toml` — the worker-inline path adds ~14 min and ~100K tokens per close, which is exactly what the v2.13.0 flip was designed to eliminate.
 
 ## Pre-Close Self-Verification
 
