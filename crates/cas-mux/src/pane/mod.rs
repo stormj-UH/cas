@@ -110,6 +110,13 @@ pub struct Pane {
     /// forwarded to the inner process (alt-screen, no scrollback) or handled
     /// by `Pane::scroll` (normal screen, scrollback available).
     in_alt_screen: bool,
+    /// Partial DEC private mode sequence carried over from the previous `feed()` chunk.
+    ///
+    /// PTY output arrives in arbitrary-sized chunks; a DEC escape sequence such as
+    /// `ESC [ ? 1049 h` can be split across two consecutive reads.  Keeping up to
+    /// `PARTIAL_ESC_CAP` (16) bytes of a trailing partial sequence and prepending
+    /// them to the next chunk means `update_alt_screen` always sees whole sequences.
+    partial_esc: Vec<u8>,
 }
 
 impl Pane {
@@ -148,6 +155,7 @@ impl Pane {
             total_bytes_received: 0,
             created_at: std::time::Instant::now(),
             in_alt_screen: false,
+            partial_esc: Vec::new(),
         })
     }
 
@@ -437,6 +445,9 @@ impl Pane {
         Ok(())
     }
 
+    /// Maximum bytes kept in the partial-escape carry buffer.
+    const PARTIAL_ESC_CAP: usize = 16;
+
     /// Scan `data` for DEC private mode sequences that toggle the alternate
     /// screen buffer and return the updated `in_alt_screen` state.
     ///
@@ -448,12 +459,25 @@ impl Pane {
     /// This is a fast forward scan; only the *last* matching sequence in the
     /// data wins, which is correct: if a pane enters and exits alt-screen in
     /// the same chunk, the final state is what matters.
+    ///
+    /// NOTE: `data` may already have a partial sequence prepended by `feed()`
+    /// (via `partial_esc`), so this function is kept pure (no `&self`) and the
+    /// caller manages the carry buffer.
     fn update_alt_screen(data: &[u8], current: bool) -> bool {
         let mut state = current;
         let mut i = 0;
-        while i + 4 < data.len() {
+        while i < data.len() {
             // Fast pre-check: must start with ESC [ ?
-            if data[i] != 0x1b || data[i + 1] != b'[' || data[i + 2] != b'?' {
+            // We need at least 5 bytes for the shortest sequence: ESC [ ? N h/l
+            if data[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= data.len() || data[i + 1] != b'[' {
+                i += 1;
+                continue;
+            }
+            if i + 2 >= data.len() || data[i + 2] != b'?' {
                 i += 1;
                 continue;
             }
@@ -464,6 +488,7 @@ impl Pane {
                 j += 1;
             }
             if j >= data.len() || j == param_start {
+                // Either truncated (j >= data.len()) or no digits — skip
                 i += 1;
                 continue;
             }
@@ -487,6 +512,49 @@ impl Pane {
         state
     }
 
+    /// Return the trailing bytes of `data` that look like the start of a DEC
+    /// private mode sequence (i.e., `ESC`, `ESC [`, `ESC [ ?`, or
+    /// `ESC [ ? {digits…}`), capped at `PARTIAL_ESC_CAP` bytes.
+    ///
+    /// This is called after `update_alt_screen` so that if `data` ends mid-
+    /// sequence the carry buffer is populated and the next `feed()` call sees
+    /// the whole sequence.
+    fn trailing_dec_partial(data: &[u8]) -> Vec<u8> {
+        let cap = Self::PARTIAL_ESC_CAP;
+        // Walk backwards from the end looking for a lone ESC that could start
+        // an incomplete DEC sequence.  We only care about the last up-to-cap bytes.
+        let search_start = data.len().saturating_sub(cap);
+        let slice = &data[search_start..];
+
+        // Find the last ESC (0x1b) in the slice.
+        let esc_pos = match slice.iter().rposition(|&b| b == 0x1b) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let tail = &slice[esc_pos..];
+
+        // Check whether the tail matches the prefix of a DEC private mode sequence.
+        // Pattern: ESC [ ? {digits…}   — any strict prefix is "partial".
+        let is_partial = match tail {
+            // Bare ESC at end
+            [0x1b] => true,
+            // ESC [
+            [0x1b, b'['] => true,
+            // ESC [ ?
+            [0x1b, b'[', b'?'] => true,
+            // ESC [ ? {digits…} — no terminator yet
+            [0x1b, b'[', b'?', rest @ ..] if !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit()) => true,
+            _ => false,
+        };
+
+        if is_partial {
+            tail.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Whether the inner process is currently in alt-screen (alternate buffer) mode.
     ///
     /// When `true`, the pane's ghostty_vt scrollback is empty — scrolling the
@@ -498,7 +566,17 @@ impl Pane {
 
     pub fn feed(&mut self, data: &[u8]) -> Result<()> {
         // Track alt-screen mode transitions before handing data to the terminal.
-        self.in_alt_screen = Self::update_alt_screen(data, self.in_alt_screen);
+        // If the previous chunk ended with an incomplete DEC sequence, prepend
+        // those carry bytes so split sequences are always seen whole.
+        if self.partial_esc.is_empty() {
+            self.in_alt_screen = Self::update_alt_screen(data, self.in_alt_screen);
+            self.partial_esc = Self::trailing_dec_partial(data);
+        } else {
+            let mut scan_buf = std::mem::take(&mut self.partial_esc);
+            scan_buf.extend_from_slice(data);
+            self.in_alt_screen = Self::update_alt_screen(&scan_buf, self.in_alt_screen);
+            self.partial_esc = Self::trailing_dec_partial(data);
+        }
 
         if self.user_scrolled {
             // Save scroll position before feeding new data

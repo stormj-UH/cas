@@ -386,9 +386,7 @@ impl FactoryApp {
             || self.show_reminder_dialog
             || self.show_changes_dialog
             || self.sidecar_focus != SidecarFocus::None
-            || (self.is_mission_control()
-                && self.mc_focus
-                    != crate::ui::factory::renderer::MissionControlFocus::None)
+            || self.is_mission_control()
         {
             return None;
         }

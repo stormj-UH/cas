@@ -669,3 +669,64 @@ fn test_mux_focused_is_in_alt_screen() {
     }
     assert!(!mux.focused_is_in_alt_screen());
 }
+
+// =============================================================================
+// Split-chunk DEC sequence tests (cas-d5fa P1 #2 — partial_esc carry buffer)
+//
+// PTY output arrives in arbitrary chunks; an ESC [ ? 1049 h sequence can be
+// split across two consecutive feed() calls.  The partial_esc carry buffer
+// ensures split sequences are always seen whole.
+// =============================================================================
+
+/// Sequence split after the digits: chunk1=`\x1b[?104`, chunk2=`9h`.
+/// The partial_esc buffer must carry the first chunk so the combined data
+/// `\x1b[?1049h` is scanned on the second feed() call.
+#[test]
+fn test_alt_screen_split_chunk_1049_digits() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    assert!(!pane.is_in_alt_screen());
+
+    pane.feed(b"\x1b[?104").unwrap();  // incomplete — digits not finished
+    assert!(!pane.is_in_alt_screen(), "partial sequence must not set alt-screen");
+
+    pane.feed(b"9h").unwrap();         // completes \x1b[?1049h
+    assert!(pane.is_in_alt_screen(), "split sequence must be detected after second chunk");
+}
+
+/// Sequence split at the `[`: chunk1 ends with bare `\x1b`, chunk2=`[?1049h`.
+#[test]
+fn test_alt_screen_split_at_esc() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    pane.feed(b"some output\x1b").unwrap();   // chunk ends on bare ESC
+    assert!(!pane.is_in_alt_screen());
+
+    pane.feed(b"[?1049h").unwrap();           // completes the sequence
+    assert!(pane.is_in_alt_screen(), "ESC split at chunk boundary must be handled");
+}
+
+/// Sequence split at `?`: chunk1=`\x1b[`, chunk2=`?1049h`.
+#[test]
+fn test_alt_screen_split_at_bracket() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    pane.feed(b"\x1b[").unwrap();
+    assert!(!pane.is_in_alt_screen());
+
+    pane.feed(b"?1049h").unwrap();
+    assert!(pane.is_in_alt_screen(), "ESC [ split must be carried over");
+}
+
+/// Verify exit sequence also works when split: chunk1=`\x1b[?104`, chunk2=`9l`.
+#[test]
+fn test_alt_screen_split_exit_sequence() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+    // Enter alt-screen in one clean chunk first.
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen());
+
+    // Exit via a split sequence.
+    pane.feed(b"\x1b[?104").unwrap();
+    assert!(pane.is_in_alt_screen(), "still in alt-screen mid-sequence");
+
+    pane.feed(b"9l").unwrap();
+    assert!(!pane.is_in_alt_screen(), "split exit sequence must be detected");
+}

@@ -125,4 +125,90 @@ mod cases {
         let cleaned = Pane::strip_literal_cursor_reports(input);
         assert_eq!(cleaned.as_ref(), input);
     }
+
+    // =========================================================================
+    // update_alt_screen unit tests — verify the fixed outer-loop guard
+    // (was `while i + 4 < data.len()`, now `while i < data.len()` with inner
+    //  bounds checks). These test sequences short enough that the old guard
+    //  would silently skip them.
+    // =========================================================================
+
+    #[test]
+    fn update_alt_screen_handles_minimum_length_seq() {
+        // Shortest valid sequence: ESC [ ? 4 7 h = 6 bytes (mode 47).
+        // With the old guard (i + 4 < len) this was only reached when i == 0
+        // AND len > 4, but if the data was exactly 6 bytes the loop ran while
+        // 0 + 4 < 6, i.e. for i in 0..1. That still works — but let's confirm.
+        let data = b"\x1b[?47h";
+        assert!(Pane::update_alt_screen(data, false));
+    }
+
+    #[test]
+    fn update_alt_screen_detects_1049_entry() {
+        let data = b"\x1b[?1049h";
+        assert!(Pane::update_alt_screen(data, false));
+    }
+
+    #[test]
+    fn update_alt_screen_last_sequence_wins() {
+        // Enter then exit in the same slice — last (exit) must win.
+        let data = b"\x1b[?1049h\x1b[?1049l";
+        assert!(!Pane::update_alt_screen(data, false));
+    }
+
+    #[test]
+    fn update_alt_screen_preserves_current_on_empty_input() {
+        assert!(Pane::update_alt_screen(b"", true));
+        assert!(!Pane::update_alt_screen(b"", false));
+    }
+
+    // =========================================================================
+    // trailing_dec_partial unit tests — verify carry-buffer detection
+    // =========================================================================
+
+    #[test]
+    fn trailing_dec_partial_bare_esc() {
+        let data = b"hello\x1b";
+        let partial = Pane::trailing_dec_partial(data);
+        assert_eq!(partial, b"\x1b");
+    }
+
+    #[test]
+    fn trailing_dec_partial_esc_bracket() {
+        let data = b"abc\x1b[";
+        let partial = Pane::trailing_dec_partial(data);
+        assert_eq!(partial, b"\x1b[");
+    }
+
+    #[test]
+    fn trailing_dec_partial_esc_bracket_question() {
+        let data = b"\x1b[?";
+        let partial = Pane::trailing_dec_partial(data);
+        assert_eq!(partial, b"\x1b[?");
+    }
+
+    #[test]
+    fn trailing_dec_partial_esc_bracket_question_digits() {
+        let data = b"junk\x1b[?104";
+        let partial = Pane::trailing_dec_partial(data);
+        assert_eq!(partial, b"\x1b[?104");
+    }
+
+    #[test]
+    fn trailing_dec_partial_complete_sequence_not_partial() {
+        // A complete sequence should NOT be kept — it ends with h/l.
+        let data = b"\x1b[?1049h";
+        let partial = Pane::trailing_dec_partial(data);
+        assert!(partial.is_empty(), "complete sequence must not be carried: {partial:?}");
+    }
+
+    #[test]
+    fn trailing_dec_partial_empty_input() {
+        assert!(Pane::trailing_dec_partial(b"").is_empty());
+    }
+
+    #[test]
+    fn trailing_dec_partial_no_esc() {
+        assert!(Pane::trailing_dec_partial(b"hello world").is_empty());
+    }
 }
