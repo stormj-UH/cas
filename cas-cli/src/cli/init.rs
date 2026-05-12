@@ -229,6 +229,7 @@ impl WizardConfig {
             llm: None,
             integrations: None,
             code_review: None,
+            memory: None,
         }
     }
 }

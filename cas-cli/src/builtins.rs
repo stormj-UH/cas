@@ -141,6 +141,16 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-task-tracking/SKILL.md",
         content: include_str!("builtins/skills/cas-task-tracking.md"),
     },
+    // session-learn (cas-39f5, EPIC cas-ebea): 7-signal session classifier
+    // borrowed from third-brain-v5-skills. The skill body is also the
+    // runtime prompt template embedded by the Stop hook handler (decision:
+    // in-process for v1, see the skill body's "in-process vs subprocess"
+    // section). v1 default: `[memory] session_learn_auto = false` —
+    // manual-invocation only until user opts in.
+    BuiltinFile {
+        path: "skills/session-learn/SKILL.md",
+        content: include_str!("builtins/skills/session-learn/SKILL.md"),
+    },
     BuiltinFile {
         path: "skills/cas-supervisor/SKILL.md",
         content: include_str!("builtins/skills/cas-supervisor.md"),
@@ -334,6 +344,13 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-task-tracking/SKILL.md",
         content: include_str!("builtins/codex/skills/cas-task-tracking.md"),
+    },
+    // session-learn (cas-39f5, EPIC cas-ebea) — Codex mirror. Kept
+    // byte-identical to the .claude copy by regression test in
+    // `test_session_learn_mirrors_are_identical`.
+    BuiltinFile {
+        path: "skills/session-learn/SKILL.md",
+        content: include_str!("builtins/codex/skills/session-learn/SKILL.md"),
     },
     BuiltinFile {
         path: "skills/cas-supervisor/SKILL.md",
@@ -1191,6 +1208,94 @@ This is the body content."#;
                  Description: {description:?}",
             );
         }
+    }
+
+    #[test]
+    fn test_builtin_skills_contains_session_learn() {
+        // cas-39f5: session-learn must be registered in both surfaces so
+        // `cas update` installs it at .claude/skills/session-learn/SKILL.md
+        // (and the .codex equivalent). Without this entry the SKILL.md
+        // source file exists on disk but never reaches downstream caches.
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            assert!(
+                skills
+                    .iter()
+                    .any(|b| b.path == "skills/session-learn/SKILL.md"),
+                "{label} missing session-learn SKILL.md registration"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_learn_skill_covers_seven_signal_taxonomy() {
+        // cas-39f5 AC: the skill body documents the 7-signal taxonomy
+        // (concept, entity, correction, pattern, idea, decision, gap)
+        // with each signal mapped to a CAS entry_type. The taxonomy is the
+        // contract the Rust handler will encode in v2 — if a signal name
+        // disappears from the skill body, the handler's JSON-schema parse
+        // path silently drops findings of that type. Pin every signal name
+        // so any drift triggers a compile-time test failure.
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/session-learn/SKILL.md")
+                .unwrap_or_else(|| panic!("{label}: session-learn SKILL.md not registered"));
+            for signal in [
+                "Concept",
+                "Entity",
+                "Correction",
+                "Pattern",
+                "Idea",
+                "Decision",
+                "Gap",
+            ] {
+                assert!(
+                    entry.content.contains(&format!("**{signal}**")),
+                    "{label}: session-learn SKILL.md missing signal marker **{signal}**"
+                );
+            }
+            // Must also document the kill-switch flag so users can find it.
+            assert!(
+                entry.content.contains("session_learn_auto"),
+                "{label}: session-learn SKILL.md must document the \
+                 `session_learn_auto` kill-switch flag"
+            );
+            // And must record the in-process vs subprocess decision the
+            // AC required.
+            assert!(
+                entry.content.contains("in-process"),
+                "{label}: session-learn SKILL.md must document the \
+                 in-process vs subprocess decision (cas-39f5 AC)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_learn_skill_md_mirrors_are_identical() {
+        // cas-39f5: the .claude and .codex copies of session-learn/SKILL.md
+        // are sync-mirrored by `cas update`. Drift between them silently
+        // produces a different classifier prompt on whichever harness
+        // reads the stale copy — exactly the failure mode cas-ec8f traced
+        // in cas-code-review. Pin byte-identity at the source.
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/session-learn/SKILL.md")
+            .expect("BUILTIN_SKILLS missing session-learn SKILL.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/session-learn/SKILL.md")
+            .expect("CODEX_BUILTIN_SKILLS missing session-learn SKILL.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "session-learn SKILL.md .claude and .codex copies must be byte-identical; \
+             drift here produces a divergent classifier prompt across harnesses",
+        );
     }
 
     #[test]
