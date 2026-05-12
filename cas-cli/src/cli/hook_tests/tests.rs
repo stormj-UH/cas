@@ -22,13 +22,28 @@ fn test_configure_creates_settings() {
             "Hooks should be omitted when global hooks exist"
         );
     } else {
-        // No global hooks — project should have hooks
+        // No global hooks — project should have hooks in exec-form (cas-7ecd fixture)
         assert!(settings.pointer("/hooks/SessionStart").is_some());
         assert!(settings.pointer("/hooks/SessionEnd").is_some());
         assert!(settings.pointer("/hooks/Stop").is_some());
         assert!(settings.pointer("/hooks/SubagentStop").is_some());
         assert!(settings.pointer("/hooks/PostToolUse").is_some());
         assert!(settings.pointer("/hooks/UserPromptSubmit").is_some());
+
+        // Exec-form fixture: hook entries must carry "args" array, not "command" string
+        // (Claude Code 2.1.139 exec-form spawns binaries directly, no shell quoting issues)
+        let session_start_args = first_hook_args(&settings, "SessionStart");
+        assert_eq!(
+            session_start_args,
+            Some(vec!["cas", "hook", "SessionStart"]),
+            "cas init should emit exec-form args for SessionStart hook"
+        );
+        let stop_args = first_hook_args(&settings, "Stop");
+        assert_eq!(
+            stop_args,
+            Some(vec!["cas", "hook", "Stop"]),
+            "cas init should emit exec-form args for Stop hook"
+        );
     }
 
     // Permissions should always be written
