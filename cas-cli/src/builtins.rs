@@ -1080,6 +1080,113 @@ This is the body content."#;
         }
     }
 
+    /// Extract the `description:` value from a SKILL.md frontmatter block.
+    /// CAS skill descriptions are single-line YAML scalars (long, but a
+    /// single physical line terminated by `\n`). Panics if the field is
+    /// missing — every builtin SKILL.md is required to have one.
+    #[cfg(test)]
+    fn skill_description(content: &str) -> &str {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("description:") {
+                return rest.trim_start();
+            }
+        }
+        panic!("SKILL.md frontmatter missing required `description:` field");
+    }
+
+    #[test]
+    fn test_cas_code_review_description_reflects_supervisor_owned_default() {
+        // Regression for cas-ec8f. The skill's frontmatter description is
+        // the FIRST thing the LLM sees when listing skills — when it
+        // disagrees with the body, the description wins in practice. The
+        // prior framing said "the pre-close quality gate for CAS factory
+        // workers" and called `autofix` at `task.close` "the primary
+        // path", which caused workers to self-dispatch personas at close
+        // even under the v2.13.0+ default `[code_review] owner =
+        // "supervisor"` (~100K input tokens burned per close, observed on
+        // solid-cobra-88 cas-219d session log + reproduced on
+        // daring-swan-93 cas-f645 in the same session this test was
+        // added in).
+        //
+        // The new framing must: (a) not call autofix "the primary path";
+        // (b) not describe this as a worker pre-close gate without the
+        // supervisor-owned caveat; (c) explicitly name the supervisor as
+        // the owner under the default model. Both BUILTIN_SKILLS (.claude
+        // surface) and CODEX_BUILTIN_SKILLS (.codex surface) must agree
+        // — the two are sync-mirrored by `cas update` and any drift
+        // resurfaces the original bug on whichever harness reads stale
+        // copy.
+        for (label, skills) in [
+            ("BUILTIN_SKILLS", BUILTIN_SKILLS),
+            ("CODEX_BUILTIN_SKILLS", CODEX_BUILTIN_SKILLS),
+        ] {
+            let entry = skills
+                .iter()
+                .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+                .unwrap_or_else(|| {
+                    panic!("{label}: skills/cas-code-review/SKILL.md missing")
+                });
+            let description = skill_description(entry.content);
+
+            // (a) `autofix` must not be framed as "the primary path".
+            // The prior phrasing was literally "in `autofix` mode (the
+            // primary path)" — we forbid the co-occurrence of those two
+            // substrings, which is tight enough that any reasonable
+            // phrasing that still framed autofix as primary would fail.
+            assert!(
+                !(description.contains("autofix") && description.contains("primary path")),
+                "{label}: cas-code-review description still frames `autofix` as 'the primary path'. \
+                 Under owner=\"supervisor\" (default since v2.13.0) the primary path is supervisor-driven \
+                 interactive review at cherry-pick / EPIC-merge. Description: {description:?}",
+            );
+
+            // (b) "pre-close quality gate" is the other stale framing.
+            // Allow the substring only if the description also names
+            // the supervisor — i.e. only with proper context.
+            let mentions_pre_close = description.contains("pre-close quality gate");
+            let mentions_supervisor = description.contains("supervisor");
+            assert!(
+                !mentions_pre_close || mentions_supervisor,
+                "{label}: cas-code-review description says 'pre-close quality gate' without naming \
+                 the supervisor — workers will read it as a directive to self-dispatch personas at \
+                 task.close. Description: {description:?}",
+            );
+
+            // (c) The description must affirmatively name supervisor
+            // ownership. Without this, the absence of (a) and (b) is
+            // not enough — a stripped-down description that just says
+            // "code review orchestrator" still leaves workers free to
+            // invoke it pre-close by default.
+            assert!(
+                mentions_supervisor,
+                "{label}: cas-code-review description must explicitly name the supervisor as the \
+                 default invoker so workers do not self-dispatch personas at task.close. \
+                 Description: {description:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_cas_code_review_skill_md_mirrors_are_identical() {
+        // The .claude and .codex builtin copies of cas-code-review/SKILL.md
+        // are sync-mirrored by `cas update`. Drift between them
+        // re-introduces the cas-ec8f regression on whichever harness reads
+        // the stale copy — guard against that at the source.
+        let claude = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+            .expect("BUILTIN_SKILLS missing cas-code-review SKILL.md");
+        let codex = CODEX_BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-code-review/SKILL.md")
+            .expect("CODEX_BUILTIN_SKILLS missing cas-code-review SKILL.md");
+        assert_eq!(
+            claude.content, codex.content,
+            "cas-code-review SKILL.md .claude and .codex copies must be byte-identical; \
+             drift here re-opens cas-ec8f on the harness reading the stale copy",
+        );
+    }
+
     #[test]
     fn test_code_reviewer_agent_is_deprecation_stub() {
         // EPIC cas-0750: the legacy code-reviewer agent is replaced by the
