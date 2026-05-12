@@ -1126,16 +1126,20 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         anyhow::bail!("Not logged in. Run 'cas login' first");
     }
 
-    // Stores synced by CloudSyncer::pull. The previously inline path also pulled
-    // specs / events / prompts / file_changes / commit_links — but it did so
-    // unscoped (no project_id filter) which is exactly the cas-2eb3 contamination
-    // vector this task fixes. CloudSyncer::pull does not currently cover those
-    // five entity kinds; routing through it intentionally drops those imports
-    // until the syncer surface is extended (out of scope here).
+    // Stores synced by CloudSyncer::pull. cas-ed15 collapsed the unscoped
+    // inline path through the scoped syncer for entries/tasks/rules/skills;
+    // cas-bba4 re-adds the remaining 5 entity kinds (specs/events/prompts/
+    // file_changes/commit_links) — also scoped — so `cas cloud pull` once
+    // again imports the full set without re-introducing the leak.
     let store = open_store(cas_root)?;
     let task_store = open_task_store(cas_root)?;
     let rule_store = open_rule_store(cas_root)?;
     let skill_store = open_skill_store(cas_root)?;
+    let spec_store = open_spec_store(cas_root)?;
+    let event_store = open_event_store(cas_root)?;
+    let prompt_store = open_prompt_store(cas_root)?;
+    let file_change_store = open_file_change_store(cas_root)?;
+    let commit_link_store = open_commit_link_store(cas_root)?;
 
     {
         use crate::ui::components::{Spinner, clear_inline, render_inline_view};
@@ -1172,6 +1176,11 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             task_store.as_ref(),
             rule_store.as_ref(),
             skill_store.as_ref(),
+            spec_store.as_ref(),
+            event_store.as_ref(),
+            prompt_store.as_ref(),
+            file_change_store.as_ref(),
+            commit_link_store.as_ref(),
         )?;
 
         // The `--entries-only` / `--tasks-only` flags previously gated the
@@ -1185,13 +1194,11 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         let tasks_count = pull_result.pulled_tasks;
         let rules_count = pull_result.pulled_rules;
         let skills_count = pull_result.pulled_skills;
-        // Kinds not yet handled by CloudSyncer::pull — surfaced as zero so
-        // downstream JSON consumers don't break on a missing field.
-        let specs_count = 0usize;
-        let events_count = 0usize;
-        let prompts_count = 0usize;
-        let file_changes_count = 0usize;
-        let commit_links_count = 0usize;
+        let specs_count = pull_result.pulled_specs;
+        let events_count = pull_result.pulled_events;
+        let prompts_count = pull_result.pulled_prompts;
+        let file_changes_count = pull_result.pulled_file_changes;
+        let commit_links_count = pull_result.pulled_commit_links;
 
         if prev_lines > 0 {
             clear_inline(prev_lines)?;
@@ -1939,6 +1946,16 @@ fn execute_purge_foreign(
     let task_store = open_task_store(cas_root)?;
     let rule_store = open_rule_store(cas_root)?;
     let skill_store = open_skill_store(cas_root)?;
+    // cas-bba4: extra stores required by the extended `CloudSyncer::pull`
+    // signature. purge-foreign only deletes content entities (entries/tasks/
+    // rules/skills), so these are passed through purely to satisfy the
+    // scoped pull contract — the 5 new entity kinds are repopulated from
+    // cloud after the local content wipe.
+    let spec_store = open_spec_store(cas_root)?;
+    let event_store = open_event_store(cas_root)?;
+    let prompt_store = open_prompt_store(cas_root)?;
+    let file_change_store = open_file_change_store(cas_root)?;
+    let commit_link_store = open_commit_link_store(cas_root)?;
 
     // Count entities before purge
     let entries_before = store.list().map(|v| v.len()).unwrap_or(0);
@@ -2024,6 +2041,11 @@ fn execute_purge_foreign(
         task_store.as_ref(),
         rule_store.as_ref(),
         skill_store.as_ref(),
+        spec_store.as_ref(),
+        event_store.as_ref(),
+        prompt_store.as_ref(),
+        file_change_store.as_ref(),
+        commit_link_store.as_ref(),
     )?;
 
     // Count entities after re-pull

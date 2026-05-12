@@ -213,6 +213,13 @@ async fn cloud_syncer_pull_request_carries_project_id_on_the_wire() {
     let task_store = cas::store::open_task_store(&cas_root).expect("open task store");
     let rule_store = cas::store::open_rule_store(&cas_root).expect("open rule store");
     let skill_store = cas::store::open_skill_store(&cas_root).expect("open skill store");
+    let spec_store = cas::store::open_spec_store(&cas_root).expect("open spec store");
+    let event_store = cas::store::open_event_store(&cas_root).expect("open event store");
+    let prompt_store = cas::store::open_prompt_store(&cas_root).expect("open prompt store");
+    let file_change_store =
+        cas::store::open_file_change_store(&cas_root).expect("open file change store");
+    let commit_link_store =
+        cas::store::open_commit_link_store(&cas_root).expect("open commit link store");
 
     let queue = cas::cloud::SyncQueue::open(&cas_root).expect("open queue");
     queue.init().expect("init queue");
@@ -229,6 +236,11 @@ async fn cloud_syncer_pull_request_carries_project_id_on_the_wire() {
             task_store.as_ref(),
             rule_store.as_ref(),
             skill_store.as_ref(),
+            spec_store.as_ref(),
+            event_store.as_ref(),
+            prompt_store.as_ref(),
+            file_change_store.as_ref(),
+            commit_link_store.as_ref(),
         )
         .expect("pull should succeed against the mock");
 
@@ -239,4 +251,229 @@ async fn cloud_syncer_pull_request_carries_project_id_on_the_wire() {
     );
     // wiremock's `.expect(1)` enforces that exactly one matching request fired.
     // If `project_id=` is missing or wrong, no mock matches → 404 → CasError.
+}
+
+/// cas-bba4 regression: the 5 entity kinds re-added to `CloudSyncer::pull`
+/// (specs / events / prompts / file_changes / commit_links) must honor the
+/// same client-side `entity_matches_project` filter as entries/tasks/rules/
+/// skills. This test seeds the mock with one matching + one foreign payload
+/// per kind and asserts that pulled_* counts == 1 (matching only).
+///
+/// `specs` is omitted from the mock — cloud doesn't return that key yet
+/// (see docs/requests/FEATURE-cloud-sync-pull-return-specs.md). When the
+/// cloud ships specs, extend this test to mirror the other 4 kinds.
+#[tokio::test]
+async fn new_entity_kinds_skip_foreign_project_rows() {
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let expected_project_id = cas::cloud::get_project_canonical_id()
+        .expect("get_project_canonical_id should succeed inside the cas-src checkout");
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // One matching + one foreign payload per kind. `entity_matches_project`
+    // skips rows whose `project_canonical_id` doesn't equal the resolved
+    // project; matching rows are imported.
+    let response_body = serde_json::json!({
+        "entries": [],
+        "tasks": [],
+        "rules": [],
+        "skills": [],
+        "events": [
+            {
+                "id": 1,
+                "event_type": "task_created",
+                "entity_type": "task",
+                "entity_id": "cas-aaaa",
+                "summary": "matching",
+                "metadata": null,
+                "created_at": now,
+                "session_id": null,
+                "project_canonical_id": expected_project_id,
+            },
+            {
+                "id": 2,
+                "event_type": "task_created",
+                "entity_type": "task",
+                "entity_id": "cas-bbbb",
+                "summary": "foreign",
+                "metadata": null,
+                "created_at": now,
+                "session_id": null,
+                "project_canonical_id": "some-other-project",
+            },
+        ],
+        "prompts": [
+            {
+                "id": "prompt-matching",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "content": "matching prompt",
+                "content_hash": "deadbeef",
+                "timestamp": now,
+                "project_canonical_id": expected_project_id,
+            },
+            {
+                "id": "prompt-foreign",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "content": "foreign prompt",
+                "content_hash": "cafebabe",
+                "timestamp": now,
+                "project_canonical_id": "some-other-project",
+            },
+        ],
+        "file_changes": [
+            {
+                "id": "fc-matching",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "prompt_id": null,
+                "repository": "repo",
+                "file_path": "foo.rs",
+                "file_id": null,
+                "change_type": "modified",
+                "tool_name": "Edit",
+                "old_content_hash": null,
+                "new_content_hash": "abc",
+                "commit_hash": null,
+                "committed_at": null,
+                "created_at": now,
+                "scope": "project",
+                "project_canonical_id": expected_project_id,
+            },
+            {
+                "id": "fc-foreign",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "prompt_id": null,
+                "repository": "repo",
+                "file_path": "bar.rs",
+                "file_id": null,
+                "change_type": "modified",
+                "tool_name": "Edit",
+                "old_content_hash": null,
+                "new_content_hash": "def",
+                "commit_hash": null,
+                "committed_at": null,
+                "created_at": now,
+                "scope": "project",
+                "project_canonical_id": "some-other-project",
+            },
+        ],
+        "commit_links": [
+            {
+                "commit_hash": "1111111111111111111111111111111111111111",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "branch": "main",
+                "message": "matching commit",
+                "files_changed": [],
+                "prompt_ids": [],
+                "committed_at": now,
+                "author": "tester",
+                "scope": "project",
+                "project_canonical_id": expected_project_id,
+            },
+            {
+                "commit_hash": "2222222222222222222222222222222222222222",
+                "session_id": "session-A",
+                "agent_id": "agent-A",
+                "branch": "main",
+                "message": "foreign commit",
+                "files_changed": [],
+                "prompt_ids": [],
+                "committed_at": now,
+                "author": "tester",
+                "scope": "project",
+                "project_canonical_id": "some-other-project",
+            },
+        ],
+        "pulled_at": now,
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/api/sync/pull"))
+        .and(query_param("project_id", expected_project_id.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cloud_config = cas::cloud::CloudConfig {
+        endpoint: server.uri(),
+        token: Some("test-token".to_string()),
+        ..Default::default()
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cas_root = tmp.path().join(".cas");
+    std::fs::create_dir_all(&cas_root).expect("mkdir .cas");
+
+    let store = cas::store::open_store(&cas_root).expect("open store");
+    let task_store = cas::store::open_task_store(&cas_root).expect("open task store");
+    let rule_store = cas::store::open_rule_store(&cas_root).expect("open rule store");
+    let skill_store = cas::store::open_skill_store(&cas_root).expect("open skill store");
+    let spec_store = cas::store::open_spec_store(&cas_root).expect("open spec store");
+    let event_store = cas::store::open_event_store(&cas_root).expect("open event store");
+    let prompt_store = cas::store::open_prompt_store(&cas_root).expect("open prompt store");
+    let file_change_store =
+        cas::store::open_file_change_store(&cas_root).expect("open file change store");
+    let commit_link_store =
+        cas::store::open_commit_link_store(&cas_root).expect("open commit link store");
+
+    let queue = cas::cloud::SyncQueue::open(&cas_root).expect("open queue");
+    queue.init().expect("init queue");
+
+    let syncer = cas::cloud::CloudSyncer::new(
+        Arc::new(queue),
+        cloud_config,
+        cas::cloud::CloudSyncerConfig::default(),
+    );
+
+    let result = syncer
+        .pull(
+            store.as_ref(),
+            task_store.as_ref(),
+            rule_store.as_ref(),
+            skill_store.as_ref(),
+            spec_store.as_ref(),
+            event_store.as_ref(),
+            prompt_store.as_ref(),
+            file_change_store.as_ref(),
+            commit_link_store.as_ref(),
+        )
+        .expect("pull should succeed against the matching mock");
+
+    assert_eq!(
+        result.pulled_events, 1,
+        "expected exactly one matching event imported, got {} (errors: {:?})",
+        result.pulled_events, result.errors,
+    );
+    assert_eq!(
+        result.pulled_prompts, 1,
+        "expected exactly one matching prompt imported, got {} (errors: {:?})",
+        result.pulled_prompts, result.errors,
+    );
+    assert_eq!(
+        result.pulled_file_changes, 1,
+        "expected exactly one matching file_change imported, got {} (errors: {:?})",
+        result.pulled_file_changes, result.errors,
+    );
+    assert_eq!(
+        result.pulled_commit_links, 1,
+        "expected exactly one matching commit_link imported, got {} (errors: {:?})",
+        result.pulled_commit_links, result.errors,
+    );
+    // `specs` is intentionally omitted from the mock body; verify the
+    // syncer defends against a missing key (forward-compat for the cloud
+    // pull-endpoint extension).
+    assert_eq!(
+        result.pulled_specs, 0,
+        "expected zero specs when the response omits the key, got {}",
+        result.pulled_specs,
+    );
 }

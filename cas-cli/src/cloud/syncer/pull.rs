@@ -6,8 +6,13 @@ use crate::cloud::syncer::{
 };
 use crate::cloud::get_project_canonical_id;
 use crate::error::CasError;
-use crate::store::{RuleStore, SkillStore, Store, TaskStore};
-use crate::types::{Entry, Rule, Session, Skill, Task};
+use crate::store::{
+    CommitLinkStore, EventStore, FileChangeStore, PromptStore, RuleStore, SkillStore, SpecStore,
+    Store, TaskStore,
+};
+use crate::types::{
+    CommitLink, Entry, Event, FileChange, Prompt, Rule, Session, Skill, Spec, Task,
+};
 
 /// Check whether a raw JSON entity belongs to the current project.
 ///
@@ -50,12 +55,18 @@ fn entity_matches_project(
 }
 
 impl CloudSyncer {
+    #[allow(clippy::too_many_arguments)]
     pub fn pull(
         &self,
         store: &dyn Store,
         task_store: &dyn TaskStore,
         rule_store: &dyn RuleStore,
         skill_store: &dyn SkillStore,
+        spec_store: &dyn SpecStore,
+        event_store: &dyn EventStore,
+        prompt_store: &dyn PromptStore,
+        file_change_store: &dyn FileChangeStore,
+        commit_link_store: &dyn CommitLinkStore,
     ) -> Result<SyncResult, CasError> {
         let mut result = SyncResult::default();
         let start = Instant::now();
@@ -208,6 +219,144 @@ impl CloudSyncer {
             }
         }
 
+        // cas-bba4: process the 5 entity kinds the inline `cas cloud pull`
+        // path used to import unscoped (cas-ed15 dropped them when collapsing
+        // through CloudSyncer::pull). Each block mirrors the entries/tasks
+        // shape: filter via `entity_matches_project` so foreign rows are
+        // skipped, then delegate to a per-kind upsert helper. `specs` arrives
+        // empty until cloud ships the matching pull-endpoint extension
+        // (docs/requests/FEATURE-cloud-sync-pull-return-specs.md).
+
+        // Process specs
+        for raw_spec in body.specs.unwrap_or_default() {
+            if !entity_matches_project(&raw_spec, &current_project_id, "spec") {
+                continue;
+            }
+            let remote_spec: Spec = match serde_json::from_value(raw_spec) {
+                Ok(s) => s,
+                Err(e) => {
+                    result.errors.push(format!("Spec deserialize error: {e}"));
+                    continue;
+                }
+            };
+            match self.upsert_spec(spec_store, remote_spec) {
+                Ok(UpsertResult::Created) | Ok(UpsertResult::Updated) => {
+                    result.pulled_specs += 1;
+                }
+                Ok(UpsertResult::Skipped) => {
+                    result.conflicts_resolved += 1;
+                }
+                Err(e) => {
+                    result.errors.push(format!("Spec error: {e}"));
+                }
+            }
+        }
+
+        // Process events. EventStore is append-only (`record()` is straight
+        // INSERT, no dedup); matches the pre-cas-ed15 inline path behavior.
+        // The `since=` watermark on the request limits volume on incremental
+        // pulls. `--full` re-imports duplicates — same as the prior path,
+        // not a regression.
+        for raw_event in body.events.unwrap_or_default() {
+            if !entity_matches_project(&raw_event, &current_project_id, "event") {
+                continue;
+            }
+            let remote_event: Event = match serde_json::from_value(raw_event) {
+                Ok(e) => e,
+                Err(e) => {
+                    result.errors.push(format!("Event deserialize error: {e}"));
+                    continue;
+                }
+            };
+            match event_store.record(&remote_event) {
+                Ok(_) => result.pulled_events += 1,
+                Err(e) => result.errors.push(format!("Event error: {e}")),
+            }
+        }
+
+        // Process prompts. PromptStore exposes `add()` keyed by id; we
+        // dedup-skip on existing rows (the previous inline path used
+        // `let _ = prompt_store.add(&prompt)` and silently double-counted
+        // on duplicate-key error — we instead surface real errors).
+        for raw_prompt in body.prompts.unwrap_or_default() {
+            if !entity_matches_project(&raw_prompt, &current_project_id, "prompt") {
+                continue;
+            }
+            let remote_prompt: Prompt = match serde_json::from_value(raw_prompt) {
+                Ok(p) => p,
+                Err(e) => {
+                    result.errors.push(format!("Prompt deserialize error: {e}"));
+                    continue;
+                }
+            };
+            match prompt_store.get(&remote_prompt.id) {
+                Ok(Some(_)) => {
+                    result.conflicts_resolved += 1;
+                }
+                Ok(None) => match prompt_store.add(&remote_prompt) {
+                    Ok(_) => result.pulled_prompts += 1,
+                    Err(e) => result.errors.push(format!("Prompt error: {e}")),
+                },
+                Err(e) => result.errors.push(format!("Prompt lookup error: {e}")),
+            }
+        }
+
+        // Process file changes (append-only, same shape as prompts).
+        for raw_fc in body.file_changes.unwrap_or_default() {
+            if !entity_matches_project(&raw_fc, &current_project_id, "file_change") {
+                continue;
+            }
+            let remote_fc: FileChange = match serde_json::from_value(raw_fc) {
+                Ok(f) => f,
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("FileChange deserialize error: {e}"));
+                    continue;
+                }
+            };
+            match file_change_store.get(&remote_fc.id) {
+                Ok(Some(_)) => {
+                    result.conflicts_resolved += 1;
+                }
+                Ok(None) => match file_change_store.add(&remote_fc) {
+                    Ok(_) => result.pulled_file_changes += 1,
+                    Err(e) => result.errors.push(format!("FileChange error: {e}")),
+                },
+                Err(e) => result
+                    .errors
+                    .push(format!("FileChange lookup error: {e}")),
+            }
+        }
+
+        // Process commit links (keyed by `commit_hash`).
+        for raw_cl in body.commit_links.unwrap_or_default() {
+            if !entity_matches_project(&raw_cl, &current_project_id, "commit_link") {
+                continue;
+            }
+            let remote_cl: CommitLink = match serde_json::from_value(raw_cl) {
+                Ok(c) => c,
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("CommitLink deserialize error: {e}"));
+                    continue;
+                }
+            };
+            match commit_link_store.get(&remote_cl.commit_hash) {
+                Ok(Some(_)) => {
+                    result.conflicts_resolved += 1;
+                }
+                Ok(None) => match commit_link_store.add(&remote_cl) {
+                    Ok(_) => result.pulled_commit_links += 1,
+                    Err(e) => result.errors.push(format!("CommitLink error: {e}")),
+                },
+                Err(e) => result
+                    .errors
+                    .push(format!("CommitLink lookup error: {e}")),
+            }
+        }
+
         // Update last pull timestamp
         if let Some(pulled_at) = body.pulled_at {
             let _ = self.queue.set_metadata("last_pull_at", &pulled_at);
@@ -291,6 +440,26 @@ impl CloudSyncer {
             }
             Err(cas_store::StoreError::SkillNotFound(_)) => {
                 store.add(&skill)?;
+                Ok(UpsertResult::Created)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn upsert_spec(&self, store: &dyn SpecStore, spec: Spec) -> Result<UpsertResult, CasError> {
+        // SpecStore::get returns `Result<Spec>` (not Option), with
+        // `StoreError::NotFound` when absent — mirrors the task/skill shape.
+        match store.get(&spec.id) {
+            Ok(local) => {
+                if spec.updated_at > local.updated_at {
+                    store.update(&spec)?;
+                    Ok(UpsertResult::Updated)
+                } else {
+                    Ok(UpsertResult::Skipped)
+                }
+            }
+            Err(cas_store::StoreError::NotFound(_)) => {
+                store.add(&spec)?;
                 Ok(UpsertResult::Created)
             }
             Err(e) => Err(e.into()),
@@ -426,23 +595,46 @@ impl CloudSyncer {
     }
 
     /// Full sync: push then pull
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &self,
         store: &dyn Store,
         task_store: &dyn TaskStore,
         rule_store: &dyn RuleStore,
         skill_store: &dyn SkillStore,
+        spec_store: &dyn SpecStore,
+        event_store: &dyn EventStore,
+        prompt_store: &dyn PromptStore,
+        file_change_store: &dyn FileChangeStore,
+        commit_link_store: &dyn CommitLinkStore,
     ) -> Result<SyncResult, CasError> {
-        self.sync_with_sessions(store, task_store, rule_store, skill_store, &[])
+        self.sync_with_sessions(
+            store,
+            task_store,
+            rule_store,
+            skill_store,
+            spec_store,
+            event_store,
+            prompt_store,
+            file_change_store,
+            commit_link_store,
+            &[],
+        )
     }
 
     /// Full sync with sessions: push (including sessions) then pull
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_with_sessions(
         &self,
         store: &dyn Store,
         task_store: &dyn TaskStore,
         rule_store: &dyn RuleStore,
         skill_store: &dyn SkillStore,
+        spec_store: &dyn SpecStore,
+        event_store: &dyn EventStore,
+        prompt_store: &dyn PromptStore,
+        file_change_store: &dyn FileChangeStore,
+        commit_link_store: &dyn CommitLinkStore,
         sessions: &[Session],
     ) -> Result<SyncResult, CasError> {
         let start = Instant::now();
@@ -451,7 +643,17 @@ impl CloudSyncer {
         let push_result = self.push_with_sessions(sessions)?;
 
         // Then pull
-        let pull_result = self.pull(store, task_store, rule_store, skill_store)?;
+        let pull_result = self.pull(
+            store,
+            task_store,
+            rule_store,
+            skill_store,
+            spec_store,
+            event_store,
+            prompt_store,
+            file_change_store,
+            commit_link_store,
+        )?;
 
         // Combine results
         Ok(SyncResult {
@@ -471,6 +673,11 @@ impl CloudSyncer {
             pulled_tasks: pull_result.pulled_tasks,
             pulled_rules: pull_result.pulled_rules,
             pulled_skills: pull_result.pulled_skills,
+            pulled_specs: pull_result.pulled_specs,
+            pulled_events: pull_result.pulled_events,
+            pulled_prompts: pull_result.pulled_prompts,
+            pulled_file_changes: pull_result.pulled_file_changes,
+            pulled_commit_links: pull_result.pulled_commit_links,
             conflicts_resolved: pull_result.conflicts_resolved,
             errors: [push_result.errors, pull_result.errors].concat(),
             duration_ms: start.elapsed().as_millis() as u64,

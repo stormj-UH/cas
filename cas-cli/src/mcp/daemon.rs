@@ -29,7 +29,11 @@ use crate::error::CasError;
 use crate::mcp::socket::{self, DaemonEvent, DaemonResponse};
 use crate::orchestration::names as friendly_names;
 use crate::store::open_agent_store;
-use crate::store::{SqliteStore, open_rule_store, open_skill_store, open_store, open_task_store};
+use crate::store::{
+    SqliteStore, open_commit_link_store, open_event_store, open_file_change_store,
+    open_prompt_store, open_rule_store, open_skill_store, open_spec_store, open_store,
+    open_task_store,
+};
 use crate::types::{Agent, AgentRole};
 
 /// Extension trait for EmbeddedDaemonConfig to convert to DaemonConfig
@@ -1012,6 +1016,14 @@ impl EmbeddedDaemon {
             let task_store = open_task_store(&cas_root)?;
             let rule_store = open_rule_store(&cas_root)?;
             let skill_store = open_skill_store(&cas_root)?;
+            // cas-bba4: extra stores for the extended pull surface (specs +
+            // events + prompts + file_changes + commit_links). The auto-sync
+            // path now imports the full content set just like `cas cloud pull`.
+            let spec_store = open_spec_store(&cas_root)?;
+            let event_store = open_event_store(&cas_root)?;
+            let prompt_store = open_prompt_store(&cas_root)?;
+            let file_change_store = open_file_change_store(&cas_root)?;
+            let commit_link_store = open_commit_link_store(&cas_root)?;
 
             // Get sessions to sync (sessions are stored directly, not queued)
             let sessions = get_sessions_for_sync(&cas_root, syncer.queue());
@@ -1021,6 +1033,11 @@ impl EmbeddedDaemon {
                 task_store.as_ref(),
                 rule_store.as_ref(),
                 skill_store.as_ref(),
+                spec_store.as_ref(),
+                event_store.as_ref(),
+                prompt_store.as_ref(),
+                file_change_store.as_ref(),
+                commit_link_store.as_ref(),
                 &sessions,
             )
         })
