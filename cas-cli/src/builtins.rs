@@ -973,6 +973,45 @@ This is the body content."#;
         );
     }
 
+    /// cas-5787 (EPIC cas-ebea, third-brain borrow): both supervisor and
+    /// worker skill bodies must document the "Context budgeting" 3-layer
+    /// model so future maintainers see the framework before adding to the
+    /// Immutable Core (this skill body). The section names the three
+    /// layers explicitly (Immutable Core / Task Context / Ephemeral),
+    /// cites the 12 KB ceiling, and points at the rationale memory file
+    /// `project_session_start_truncation.md`. Both Claude and Codex
+    /// mirrors are checked so neither surface silently drifts.
+    #[test]
+    fn test_skills_document_context_budgeting_cas_5787() {
+        for (label, content) in [
+            ("claude cas-supervisor.md", SUPERVISOR_GUIDE),
+            ("claude cas-worker.md", WORKER_GUIDE),
+            (
+                "codex cas-supervisor.md",
+                include_str!("builtins/codex/skills/cas-supervisor.md"),
+            ),
+            (
+                "codex cas-worker.md",
+                include_str!("builtins/codex/skills/cas-worker.md"),
+            ),
+        ] {
+            for required in [
+                "## Context budgeting",
+                "Immutable Core",
+                "Task Context",
+                "Ephemeral",
+                "project_session_start_truncation.md",
+                "12 KB",
+                "references/",
+            ] {
+                assert!(
+                    content.contains(required),
+                    "{label} missing required Context-budgeting marker: {required:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_is_managed_by_cas() {
         let managed = "---\nname: test\nmanaged_by: cas\n---\nContent";

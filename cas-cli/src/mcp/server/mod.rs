@@ -667,6 +667,37 @@ impl CasCore {
             return Ok(());
         }
 
+        // cas-8edb: under `[code_review] owner = "supervisor"` (the default
+        // since cas-865b / v2.13.0), the worker's `task.close` is a pure
+        // transition operation — it routes the task to
+        // `PendingSupervisorReview` and the supervisor owns review at
+        // cherry-pick. The legacy verification jail was the lever that
+        // forced workers to dispatch `task-verifier` themselves; under the
+        // new ownership model that lever has no target to act on. Jailing
+        // a worker here just deadlocks every clean close because workers
+        // do not submit a `ReviewOutcome` envelope under owner=supervisor,
+        // so close_ops's self-cert path cannot fire either.
+        //
+        // The downstream gate (close_ops::cas_task_close) still enforces
+        // every other invariant the close must satisfy — lightweight
+        // structural lint, factory-branch merge-state, epic subtask
+        // receipts, additive-only enforcement — so this exemption only
+        // bypasses the verification-jail lever, not the rest of the close
+        // pipeline.
+        if is_factory_worker && tool == "task" && action == "close" {
+            let cr_config = self.load_config();
+            let supervisor_owned = cr_config
+                .code_review
+                .as_ref()
+                .map(|cr| cr.supervisor_owned())
+                .unwrap_or_else(|| {
+                    crate::config::CodeReviewConfig::default().supervisor_owned()
+                });
+            if supervisor_owned {
+                return Ok(());
+            }
+        }
+
         // Check if agent is jailed
         let agent_id = match self.get_agent_id() {
             Ok(id) => id,

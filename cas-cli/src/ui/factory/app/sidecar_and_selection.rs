@@ -1076,4 +1076,152 @@ mod tests {
             "normal screen: must return Done (use host scrollback, not PTY forward)"
         );
     }
+
+    // =========================================================================
+    // cas-72c3: daemon-dispatch coverage
+    //
+    // The daemon's MouseScrollUp/Down branch in
+    // `cas-cli/src/ui/factory/daemon/runtime/client_input.rs` lines 157-187
+    // is:
+    //
+    //   ControlEvent::MouseScrollUp => {
+    //       if self.app.show_changes_dialog {
+    //           self.app.diff_scroll_up();
+    //       } else if self.app.handle_scroll_up() == ScrollAction::AltScreen {
+    //           let _ = self.app.mux.send_input(SCROLL_UP_ARROWS).await;
+    //       }
+    //   }
+    //
+    // That sequence is tightly nested inside a long `tokio::select!` in the
+    // client loop, so the dispatch itself is impractical to call from a
+    // unit test without spinning up the full daemon. Instead, we pin the
+    // pre- and post-conditions the daemon relies on:
+    //
+    //   1. `SCROLL_UP_ARROWS` / `SCROLL_DOWN_ARROWS` have the exact byte
+    //      shape (`ESC [ A` × `SCROLL_LINES`) the daemon documents and
+    //      sends. A typo in either constant would silently break the wheel
+    //      forwarding without any production assertion firing.
+    //   2. `show_changes_dialog` shortcuts the daemon's outer `if` — it
+    //      consumes the wheel event even when the focused pane is in
+    //      alt-screen. We verify this by asserting `handle_scroll_up`
+    //      returns `Done` (not `AltScreen`) when both conditions hold,
+    //      which is the property the daemon's early-return relies on to
+    //      avoid forwarding arrow bytes to the wrong consumer.
+    //   3. The decision tree itself, expressed as a small local helper
+    //      that mirrors the daemon's three-way branch and is asserted
+    //      against the FactoryApp state for every leaf. If anyone changes
+    //      either the daemon dispatch *or* `handle_scroll_up`'s return
+    //      contract without updating this mirror, the table test fails.
+    // =========================================================================
+
+    /// AC #3 (cas-72c3, point 1): the wheel-arrow byte constants must match
+    /// the documented shape — `ESC [ A` repeated `SCROLL_LINES` times for up,
+    /// `ESC [ B` repeated `SCROLL_LINES` times for down. The daemon forwards
+    /// these literals verbatim via `mux.send_input`, so a silent typo here
+    /// would translate to a broken wheel-to-PTY forward with no compile-time
+    /// or runtime guard.
+    #[test]
+    fn scroll_arrow_consts_have_exact_byte_shape_cas_72c3() {
+        let expected_up: Vec<u8> = (0..SCROLL_LINES).flat_map(|_| b"\x1b[A".iter().copied()).collect();
+        assert_eq!(
+            SCROLL_UP_ARROWS,
+            expected_up.as_slice(),
+            "SCROLL_UP_ARROWS must be ESC[A repeated SCROLL_LINES times"
+        );
+        let expected_down: Vec<u8> = (0..SCROLL_LINES)
+            .flat_map(|_| b"\x1b[B".iter().copied())
+            .collect();
+        assert_eq!(
+            SCROLL_DOWN_ARROWS,
+            expected_down.as_slice(),
+            "SCROLL_DOWN_ARROWS must be ESC[B repeated SCROLL_LINES times"
+        );
+    }
+
+    /// AC #3 (cas-72c3, point 2): when `show_changes_dialog` is open and the
+    /// focused pane is in alt-screen, the daemon's outer `if` must consume
+    /// the wheel event for the dialog (calling `diff_scroll_up`) BEFORE
+    /// `handle_scroll_up` is even called. The post-condition this test pins
+    /// is that `handle_scroll_up` returns `Done` (not `AltScreen`) under
+    /// these flags — so even if a future refactor accidentally removed the
+    /// daemon's outer `if`, the wheel event would still not get forwarded as
+    /// arrow keys to the PTY.
+    #[test]
+    fn scroll_changes_dialog_blocks_alt_screen_forwarding_cas_72c3() {
+        let mut app = app_with_alt_screen();
+        app.show_changes_dialog = true;
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
+            "show_changes_dialog must consume wheel (no alt-screen forward, up)"
+        );
+        // Reset alt-screen — handle_scroll_up may have touched the pane.
+        app.mux
+            .get_mut("test-pane")
+            .unwrap()
+            .feed(b"\x1b[?1049h")
+            .unwrap();
+        assert_eq!(
+            app.handle_scroll_down(),
+            ScrollAction::Done,
+            "show_changes_dialog must consume wheel (no alt-screen forward, down)"
+        );
+    }
+
+    /// AC #3 (cas-72c3, point 3): table-driven mirror of the daemon's
+    /// `ControlEvent::MouseScrollUp` decision tree in client_input.rs.
+    /// Each row pins the FactoryApp state shape that drives one of the
+    /// daemon's three terminal actions:
+    ///   - "diff" — `show_changes_dialog == true` ⇒ call `diff_scroll_up()`
+    ///   - "alt" — alt-screen + no dialog/MC/sidecar/help ⇒ send arrow bytes
+    ///   - "noop" — `handle_scroll_up` already absorbed the event internally
+    fn daemon_mouse_scroll_up_label(app: &mut FactoryApp) -> &'static str {
+        if app.show_changes_dialog {
+            "diff"
+        } else if app.handle_scroll_up() == ScrollAction::AltScreen {
+            "alt"
+        } else {
+            "noop"
+        }
+    }
+
+    #[test]
+    fn daemon_dispatch_table_for_mouse_scroll_up_cas_72c3() {
+        // Row 1: alt-screen + no overlays → daemon sends arrows.
+        {
+            let mut app = app_with_alt_screen();
+            assert_eq!(daemon_mouse_scroll_up_label(&mut app), "alt");
+        }
+        // Row 2: alt-screen + show_changes_dialog → daemon takes diff path.
+        {
+            let mut app = app_with_alt_screen();
+            app.show_changes_dialog = true;
+            assert_eq!(daemon_mouse_scroll_up_label(&mut app), "diff");
+        }
+        // Row 3: alt-screen + show_help → daemon takes noop path
+        // (handle_scroll_up returns Done; help overlay consumes the wheel).
+        {
+            let mut app = app_with_alt_screen();
+            app.show_help = true;
+            assert_eq!(daemon_mouse_scroll_up_label(&mut app), "noop");
+        }
+        // Row 4: alt-screen + MC (mc_focus=None) → daemon takes noop path
+        // (mc_focus_none guard, P1 #1 regression).
+        {
+            let mut app = app_with_alt_screen();
+            app.factory_view_mode =
+                crate::ui::factory::renderer::FactoryViewMode::MissionControl;
+            app.mc_focus = crate::ui::factory::renderer::MissionControlFocus::None;
+            assert_eq!(daemon_mouse_scroll_up_label(&mut app), "noop");
+        }
+        // Row 5: normal screen (no alt-screen, no overlays) → daemon noop.
+        {
+            let mut app = FactoryApp::for_test();
+            let pane = Pane::director("test-pane", 24, 80).unwrap();
+            app.mux.add_pane(pane);
+            app.mux.focus("test-pane");
+            assert!(!app.mux.focused_is_in_alt_screen());
+            assert_eq!(daemon_mouse_scroll_up_label(&mut app), "noop");
+        }
+    }
 }

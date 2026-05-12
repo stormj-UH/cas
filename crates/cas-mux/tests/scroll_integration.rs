@@ -614,37 +614,70 @@ fn test_alt_screen_enter_then_exit_same_chunk() {
     );
 }
 
-/// Scroll on an alt-screen pane returns an error (no scrollback), confirming
-/// why we must forward to the PTY instead.
+/// Scroll on an alt-screen pane silently no-ops at the ghostty layer
+/// (`Pane::scroll` returns `Ok(())` but the viewport offset does not move).
+/// That's why the UI must forward wheel events to the inner process via the
+/// PTY rather than rely on the host scrollback — the host has none to give.
+///
+/// This test pins both halves of the contract: the call succeeds and the
+/// viewport offset is unchanged. Either drifting in isolation is a
+/// regression worth catching.
 #[test]
 fn test_alt_screen_scroll_is_noop() {
     let mut pane = Pane::director("test", 24, 80).unwrap();
 
-    // Fill some scrollback in normal-screen mode first
+    // Fill some scrollback in normal-screen mode first.
     for i in 0..50 {
         pane.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
     }
 
-    // Enter alt-screen
+    // Enter alt-screen.
     pane.feed(b"\x1b[?1049h").unwrap();
     assert!(pane.is_in_alt_screen());
 
-    // scrollback_info should report no viewport offset (cannot scroll back)
     let info_before = pane.scrollback_info();
-    // Attempt to scroll — should return an error (ghostty no-ops on alt-screen)
+    // Attempt to scroll. Ghostty silently no-ops on the alt-screen buffer.
     let result = pane.scroll(-5);
     let info_after = pane.scrollback_info();
 
-    // Whether it errors or silently no-ops, the viewport offset must not move
-    // The key assertion: scroll_focused_pane would produce no visible change.
+    assert!(
+        result.is_ok(),
+        "Pane::scroll on alt-screen must return Ok(()) (silent no-op), got {result:?}"
+    );
     assert_eq!(
         info_before.viewport_offset, info_after.viewport_offset,
-        "viewport must not change when scrolling in alt-screen"
+        "viewport must not move when scrolling in alt-screen"
     );
-    // Log the result so CI output is informative
-    if result.is_err() {
-        // Expected: ghostty returns error code for alt-screen scroll
-    }
+}
+
+// =============================================================================
+// cas-e0b9: pane exit resets in_alt_screen
+// =============================================================================
+//
+// When the inner process exits while still in alt-screen mode (e.g., a
+// `kill -9` on a TUI that never had a chance to emit `\x1b[?1049l`), the
+// pane's `in_alt_screen` flag must be cleared on exit. Otherwise the next
+// process / a redraw would have wheel events mis-routed (forwarded to the
+// PTY as arrow keys instead of driving host scrollback).
+
+#[test]
+fn test_pane_exit_resets_alt_screen_cas_e0b9() {
+    let mut pane = Pane::director("test", 24, 80).unwrap();
+
+    // Enter alt-screen.
+    pane.feed(b"\x1b[?1049h").unwrap();
+    assert!(pane.is_in_alt_screen(), "precondition: pane is in alt-screen");
+
+    // Simulate the inner process exiting without sending `\x1b[?1049l`.
+    pane.mark_exited(Some(137)); // SIGKILL exit code
+
+    assert!(pane.has_exited(), "precondition: mark_exited took effect");
+    assert_eq!(pane.exit_code(), Some(137), "exit_code is preserved");
+
+    assert!(
+        !pane.is_in_alt_screen(),
+        "in_alt_screen must be cleared on pane exit (cas-e0b9)"
+    );
 }
 
 /// Mux::focused_is_in_alt_screen reflects the focused pane's alt-screen state.
