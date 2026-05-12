@@ -1,5 +1,6 @@
 use crate::cli::hook::*;
-use crate::cli::hook::config_gen::has_cas_hook_entries;
+use crate::cli::hook::config_gen::{get_cas_hooks_config, has_cas_hook_entries};
+use crate::config::HookConfig;
 use tempfile::TempDir;
 use toml::map::Map;
 
@@ -295,3 +296,142 @@ env = { CAS_LOG = "debug" }
 
 // Note: configure_mcp_server tests removed because they require the claude CLI
 // which isn't available in test environments. The function now uses `claude mcp add`.
+
+// =============================================================================
+// Characterization tests for hook emission format (cas-7ecd)
+//
+// These tests lock in the current "command" string form before the migration to
+// exec-form "args" arrays.  They are updated (not deleted) as part of the
+// migration commit so the diff shows exactly what changed.
+// =============================================================================
+
+/// Extract the first hook entry's "command" value for a given event name.
+/// Returns None when the event is absent or the hook has no "command" key
+/// (i.e. it is already using exec-form "args").
+fn first_hook_command<'a>(config: &'a serde_json::Value, event: &str) -> Option<&'a str> {
+    config
+        .get("hooks")?
+        .get(event)?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            entry
+                .get("hooks")?
+                .as_array()?
+                .iter()
+                .find_map(|h| h.get("command")?.as_str())
+        })
+}
+
+/// Extract the first hook entry's "args" array for a given event name.
+/// Returns None when the event is absent or the hook has no "args" key.
+fn first_hook_args<'a>(config: &'a serde_json::Value, event: &str) -> Option<Vec<&'a str>> {
+    config
+        .get("hooks")?
+        .get(event)?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            entry.get("hooks")?.as_array()?.iter().find_map(|h| {
+                let args = h.get("args")?.as_array()?;
+                Some(args.iter().filter_map(|v| v.as_str()).collect())
+            })
+        })
+}
+
+/// Characterize: hooks emitted by get_cas_hooks_config currently use the
+/// "command": "cas hook <Event>" shell-string form.
+///
+/// This is the CURRENT behaviour snapshot.  After the exec-form migration this
+/// test is updated to assert "args" array form instead (see
+/// hook_entries_emit_exec_form_args_array below).
+#[test]
+fn hook_entries_emit_command_string_form() {
+    let config = get_cas_hooks_config(&HookConfig::default());
+
+    assert_eq!(
+        first_hook_command(&config, "SessionStart"),
+        Some("cas hook SessionStart"),
+        "SessionStart hook should use command string form"
+    );
+    assert_eq!(
+        first_hook_command(&config, "Stop"),
+        Some("cas hook Stop"),
+        "Stop hook should use command string form"
+    );
+    assert_eq!(
+        first_hook_command(&config, "PostToolUse"),
+        Some("cas hook PostToolUse"),
+        "PostToolUse hook should use command string form"
+    );
+    assert_eq!(
+        first_hook_command(&config, "PreToolUse"),
+        Some("cas hook PreToolUse"),
+        "PreToolUse hook should use command string form"
+    );
+    assert_eq!(
+        first_hook_command(&config, "SessionEnd"),
+        Some("cas hook SessionEnd"),
+        "SessionEnd hook should use command string form"
+    );
+    assert_eq!(
+        first_hook_command(&config, "UserPromptSubmit"),
+        Some("cas hook UserPromptSubmit"),
+        "UserPromptSubmit hook should use command string form"
+    );
+}
+
+/// After the exec-form migration the above test will be replaced by this one.
+/// Disabled until migration lands (will fail on current code).
+#[test]
+#[ignore = "exec-form not yet implemented — enabled as part of cas-7ecd migration commit"]
+fn hook_entries_emit_exec_form_args_array() {
+    let config = get_cas_hooks_config(&HookConfig::default());
+
+    assert_eq!(
+        first_hook_args(&config, "SessionStart"),
+        Some(vec!["cas", "hook", "SessionStart"]),
+        "SessionStart hook should use exec-form args array"
+    );
+    assert_eq!(
+        first_hook_args(&config, "Stop"),
+        Some(vec!["cas", "hook", "Stop"]),
+        "Stop hook should use exec-form args array"
+    );
+    assert_eq!(
+        first_hook_args(&config, "PostToolUse"),
+        Some(vec!["cas", "hook", "PostToolUse"]),
+        "PostToolUse hook should use exec-form args array"
+    );
+    assert_eq!(
+        first_hook_args(&config, "PreToolUse"),
+        Some(vec!["cas", "hook", "PreToolUse"]),
+        "PreToolUse hook should use exec-form args array"
+    );
+    assert_eq!(
+        first_hook_args(&config, "SessionEnd"),
+        Some(vec!["cas", "hook", "SessionEnd"]),
+        "SessionEnd hook should use exec-form args array"
+    );
+    assert_eq!(
+        first_hook_args(&config, "UserPromptSubmit"),
+        Some(vec!["cas", "hook", "UserPromptSubmit"]),
+        "UserPromptSubmit hook should use exec-form args array"
+    );
+
+    // Sanity: no hook should have a "command" key any more (exec form only)
+    for event in &[
+        "SessionStart",
+        "Stop",
+        "PostToolUse",
+        "PreToolUse",
+        "SessionEnd",
+        "UserPromptSubmit",
+    ] {
+        assert_eq!(
+            first_hook_command(&config, event),
+            None,
+            "{event} hook must not carry legacy command string after exec-form migration"
+        );
+    }
+}
