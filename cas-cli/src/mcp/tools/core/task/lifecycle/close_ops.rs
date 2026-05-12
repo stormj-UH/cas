@@ -283,6 +283,35 @@ impl CasCore {
                 policy.task_required()
             };
 
+        // cas-8edb: under `[code_review] owner = "supervisor"` (default
+        // since cas-865b / v2.13.0), a worker close is a pure transition
+        // operation — for reviewable diffs the `supervisor_review_mode`
+        // block further down transitions the task to
+        // `PendingSupervisorReview`; for additive-only / docs-only /
+        // zero-diff shapes the rest of the close pipeline handles the
+        // close normally. Either way, the verification-jail path (which
+        // arms `pending_verification=true` and dispatches `task-verifier`)
+        // is the legacy `owner=worker` mechanism and must not fire for a
+        // worker under supervisor-owned review — workers don't submit a
+        // `ReviewOutcome` envelope in this mode, so the self-cert
+        // short-circuit cannot fire either, leaving every clean close
+        // deadlocked. Skip the gate here; the supervisor review queue
+        // replaces it.
+        //
+        // Supervisor-driven close paths are unaffected: `is_factory_worker`
+        // is false for supervisors, so `worker_under_supervisor_review`
+        // is false and the existing gate runs (with supervisor exemptions
+        // already in place).
+        let worker_under_supervisor_review = is_factory_worker
+            && task.task_type != TaskType::Epic
+            && config
+                .code_review
+                .as_ref()
+                .map(|cr| cr.supervisor_owned())
+                .unwrap_or_else(|| {
+                    crate::config::CodeReviewConfig::default().supervisor_owned()
+                });
+
         // Skip verification for orphaned tasks: if caller is supervisor and the
         // task's assignee is inactive (heartbeat expired or lease gone), allow
         // close without verification. cas-3bd4: compute the reason as a typed
@@ -305,7 +334,7 @@ impl CasCore {
                 .map(|aid| task.assignee.as_deref() == Some(aid.as_str()))
                 .unwrap_or(false);
 
-        if verification_enabled && !skip_verification {
+        if verification_enabled && !skip_verification && !worker_under_supervisor_review {
             let is_worker_without_subagents = is_worker_without_subagents_from_env();
 
             // Check for approved verification

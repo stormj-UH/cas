@@ -1786,7 +1786,20 @@ fn task_req(value: serde_json::Value) -> cas_mcp::TaskRequest {
 async fn test_factory_worker_close_hits_narrowed_jail() {
     let (temp, core) = setup_cas();
     let _env_lock = env_test_lock();
-    let _cas_dir = temp.path().join(".cas");
+    let cas_dir = temp.path().join(".cas");
+
+    // cas-8edb: under default `[code_review] owner = "supervisor"`, worker
+    // closes are no longer jailed (the verification-jail lever is replaced
+    // by the supervisor-review queue). This test exists to pin the legacy
+    // `owner = "worker"` jail behavior, so opt back in explicitly.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("should write legacy code_review config");
+
     let service = CasService::new(core, None);
     let _env = FactoryWorkerEnv::enter();
 
@@ -1837,6 +1850,200 @@ async fn test_factory_worker_close_hits_narrowed_jail() {
     assert!(
         !msg.contains("Task(subagent_type=\"task-verifier\""),
         "factory worker jail error must NOT instruct spawning task-verifier (workers can't), got: {msg}"
+    );
+}
+
+// =============================================================================
+// cas-8edb: clean worker closes under `[code_review] owner = "supervisor"`
+// must NOT hit VERIFICATION_JAIL_BLOCKED.
+//
+// Background: cas-865b (v2.13.0, May 4) flipped the default code-review
+// owner from "worker" to "supervisor". Under the new default, workers do
+// not run cas-code-review at close — review happens at supervisor
+// cherry-pick. But the verification jail + the close_ops verification gate
+// were both still gated on a worker-supplied ReviewOutcome envelope (which
+// workers no longer submit), so every clean worker close re-stranded.
+//
+// These tests pin the post-fix behavior: under owner=supervisor (default),
+// workers can close cleanly without supervisor intervention for the two
+// shapes that were broken in production:
+//   1. Diagnostic / zero-diff close (no reviewable changes).
+//   2. Additive-only close (one or more new commits, additive-only marker).
+//
+// We also keep a regression for the third shape — a normal reviewable
+// close that hits the `PendingSupervisorReview` transition — to ensure the
+// supervisor_review_mode block at close_ops.rs:1084 still runs after the
+// gate is bypassed.
+// =============================================================================
+
+#[tokio::test]
+async fn test_worker_close_zero_diff_passes_jail_under_supervisor_owned_review_cas_8edb() {
+    let (_temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    // No config.toml written ⇒ load_config falls back to default, and the
+    // default code_review owner is "supervisor" (cas-865b).
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8edb: clean zero-diff worker close",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    // Close. Pre-fix this hit VERIFICATION_JAIL_BLOCKED because the worker
+    // held an InProgress leased task with no Approved/Skipped verification
+    // row and the auth gate fired. With cas-8edb the jail is bypassed for
+    // workers under owner=supervisor, and the close completes because
+    // `has_reviewable_changes` returns false on the test's non-git temp dir
+    // (supervisor_review_mode block falls through; run_code_review_gate
+    // proceeds; task closes normally).
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Diagnostic only — no code changes.",
+        }))))
+        .await
+        .expect("worker close must not hit jail under owner=supervisor");
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "owner=supervisor worker close must bypass MCP jail, got: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "owner=supervisor worker close must bypass close_ops gate, got: {text}"
+    );
+    assert!(
+        text.contains("Closed"),
+        "close response should indicate the task is closed, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_close_additive_only_passes_jail_under_supervisor_owned_review_cas_8edb() {
+    let (_temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+
+    // Default config ⇒ owner=supervisor.
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8edb: additive-only worker close",
+            "priority": 2,
+            "task_type": "task",
+            "execution_note": "additive-only",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    // Additive-only tasks have an explicit gate skip in run_code_review_gate
+    // (line ~2361). Combined with the cas-8edb verification-jail bypass,
+    // the close completes without any envelope or supervisor intervention.
+    let result = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Additive-only docs change — no existing files modified.",
+        }))))
+        .await
+        .expect("worker close must not hit jail under owner=supervisor (additive-only)");
+    let text = extract_text(result);
+    assert!(
+        !text.contains("VERIFICATION_JAIL_BLOCKED"),
+        "owner=supervisor additive-only worker close must bypass MCP jail, got: {text}"
+    );
+    assert!(
+        !text.contains("VERIFICATION REQUIRED"),
+        "owner=supervisor additive-only worker close must bypass close_ops gate, got: {text}"
+    );
+    assert!(
+        text.contains("Closed"),
+        "close response should indicate the task is closed, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_owner_worker_still_jails_clean_close_without_envelope_cas_8edb() {
+    let (temp, core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+
+    // Opt back in to legacy `owner = "worker"` mode. This must still jail a
+    // worker close that does not submit a `code_review_findings` envelope —
+    // the legacy contract is unchanged by cas-8edb.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("should write legacy code_review config");
+
+    let service = CasService::new(core, None);
+    let _env = FactoryWorkerEnv::enter();
+
+    let created = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "create",
+            "title": "cas-8edb: legacy owner=worker still jails",
+            "priority": 2,
+            "task_type": "task",
+        }))))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("id")
+        .to_string();
+    service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "start",
+            "id": id.clone(),
+        }))))
+        .await
+        .expect("start");
+
+    let err = service
+        .task(Parameters(task_req(serde_json::json!({
+            "action": "close",
+            "id": id.clone(),
+            "reason": "Done.",
+        }))))
+        .await
+        .expect_err("owner=worker must still jail clean close without envelope");
+    let msg = err.message.to_string();
+    assert!(
+        msg.contains("VERIFICATION_JAIL_BLOCKED"),
+        "legacy owner=worker must still hit the narrowed jail, got: {msg}"
     );
 }
 
@@ -2618,6 +2825,17 @@ async fn test_worker_close_with_clean_review_envelope_proceeds() {
     let (temp, service) = setup_cas();
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
+    // cas-8edb: this test pins the legacy `owner = "worker"` self-cert path.
+    // Under the new default `owner = "supervisor"`, the verification gate is
+    // bypassed entirely and no Skipped row is written — see the cas-8edb
+    // tests below for the new default behavior.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("legacy code_review config");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
     let _env = FactoryWorkerEnv::enter();
@@ -2728,6 +2946,14 @@ async fn test_worker_close_with_p0_residual_pre_existing_true_still_blocked() {
     let (temp, service) = setup_cas();
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
+    // cas-8edb: legacy `owner = "worker"` envelope path. See note above.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("legacy code_review config");
     let task_store = open_task_store(&cas_dir).unwrap();
     let _env = FactoryWorkerEnv::enter();
 
@@ -2806,6 +3032,14 @@ async fn test_worker_close_with_p0_residual_still_blocked() {
     let (temp, service) = setup_cas();
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
+    // cas-8edb: legacy `owner = "worker"` envelope path.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("legacy code_review config");
     let task_store = open_task_store(&cas_dir).unwrap();
     let _env = FactoryWorkerEnv::enter();
 
@@ -2883,6 +3117,14 @@ async fn test_worker_close_with_malformed_envelope_still_blocked() {
     let (temp, service) = setup_cas();
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
+    // cas-8edb: legacy `owner = "worker"` envelope path.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("legacy code_review config");
     let task_store = open_task_store(&cas_dir).unwrap();
     let _env = FactoryWorkerEnv::enter();
 
@@ -2969,6 +3211,14 @@ async fn test_worker_self_cert_blocked_when_fresh_dispatch_row_exists() {
     let (temp, service) = setup_cas();
     let _env_lock = env_test_lock();
     let cas_dir = temp.path().join(".cas");
+    // cas-8edb: legacy `owner = "worker"` self-cert path.
+    std::fs::write(
+        cas_dir.join("config.toml"),
+        r#"[code_review]
+owner = "worker"
+"#,
+    )
+    .expect("legacy code_review config");
     let task_store = open_task_store(&cas_dir).unwrap();
     let verification_store = open_verification_store(&cas_dir).unwrap();
     let _env = FactoryWorkerEnv::enter();
