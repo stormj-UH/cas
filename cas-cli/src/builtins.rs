@@ -195,6 +195,15 @@ pub const BUILTIN_SKILLS: &[BuiltinFile] = &[
         path: "skills/cas-worker/references/details.md",
         content: include_str!("builtins/skills/cas-worker/references/details.md"),
     },
+    // verify-before-claim skill (cas-5b2a, EPIC cas-ebea third-brain borrow).
+    // Pre-close agent-discipline layer that forces workers to name, run, and
+    // capture a proof command before claiming done. Advisory in v1; the
+    // verification_store + close-gate.md self-checks remain the mechanical
+    // gate underneath.
+    BuiltinFile {
+        path: "skills/verify-before-claim/SKILL.md",
+        content: include_str!("builtins/skills/verify-before-claim/SKILL.md"),
+    },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",
         content: include_str!("builtins/skills/cas-brainstorm/SKILL.md"),
@@ -382,6 +391,12 @@ pub const CODEX_BUILTIN_SKILLS: &[BuiltinFile] = &[
     BuiltinFile {
         path: "skills/cas-worker/references/details.md",
         content: include_str!("builtins/codex/skills/cas-worker/references/details.md"),
+    },
+    // verify-before-claim skill (cas-5b2a) — codex mirror. See claude-side
+    // entry above for context.
+    BuiltinFile {
+        path: "skills/verify-before-claim/SKILL.md",
+        content: include_str!("builtins/codex/skills/verify-before-claim/SKILL.md"),
     },
     BuiltinFile {
         path: "skills/cas-brainstorm/SKILL.md",

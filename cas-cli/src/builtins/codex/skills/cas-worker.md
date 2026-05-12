@@ -15,7 +15,7 @@ You execute tasks assigned by the Supervisor. You may be working in an isolated 
 3. Read task details and acceptance criteria: `mcp__cas__task action=show id=<task-id>`. Also read `CLAUDE.md` for project-specific build/test/convention guidance.
 4. Implement. Commit after each logical unit. Follow project commit style (`git log --oneline -10`). Include task ID in commit messages.
 5. Report progress: `mcp__cas__task action=notes id=<task-id> notes="..." note_type=progress`
-6. Run pre-close self-verification — see [references/close-gate.md](cas-worker/references/close-gate.md).
+6. Run pre-close self-verification — see [references/close-gate.md](cas-worker/references/close-gate.md). Then invoke the [`verify-before-claim`](../verify-before-claim/SKILL.md) skill: name the proof command for your claim, run it fresh, and capture exit code + tail before calling `task action=close`.
 7. Close: `mcp__cas__task action=close id=<task-id> reason="..."`
    - **Success** → message the supervisor.
    - **queued for supervisor review** → task is in `pending_supervisor_review`. No action needed; wait for supervisor feedback.
