@@ -422,6 +422,63 @@ impl FactoryApp {
     /// This does **not** spawn any PTYs, open any stores, or read any files.
     /// It is only compiled under `#[cfg(test)]` and must not be used in
     /// production paths.
+    ///
+    /// # Field-handling notes
+    ///
+    /// `FactoryApp` has ~70 fields and no `Default` impl (cas-11b0
+    /// non-goal — adding `Default` to production types just for tests
+    /// would leak test-shaped defaults into release builds). Every field
+    /// is therefore set explicitly. The non-obvious ones, with the
+    /// reasoning a future maintainer needs to add or rebalance tests:
+    ///
+    /// - **`mux`**: built via [`Mux::new(rows, cols)`], **not**
+    ///   [`Mux::factory(MuxConfig)`]. `factory` spawns the supervisor and
+    ///   worker PTYs as part of construction and is the wrong shape for
+    ///   unit tests. `new` returns a PTY-less `Mux` whose pane logic
+    ///   (focus, layout, render state) still works.
+    /// - **`event_detector`**: constructed with
+    ///   [`DirectorEventDetector::new(workers, supervisor)`] and then
+    ///   `.initialize(&director_data)` is called — same sequence as the
+    ///   production path. Skipping `initialize` leaves the detector
+    ///   without baseline snapshots and the first `detect_changes` call
+    ///   fires spurious "new task" events.
+    /// - **`director_stores`**: `None`. Production code opens stores
+    ///   via `DirectorStores::open(&cas_dir).ok()`. Tests intentionally
+    ///   skip this so the app does not attempt to read SQLite from the
+    ///   placeholder `cas_dir`; any code path that requires director
+    ///   stores in a test must guard on `Some(_)` or short-circuit.
+    /// - **`director_data`**: a fully-defaulted `DirectorData` literal
+    ///   (every field explicit). `DirectorData` is not `Default` because
+    ///   production code reads it from disk via `load_fast`; tests bake
+    ///   the empty state inline.
+    /// - **`notifier`**: `Notifier::new(NotifyConfig::default())`. With
+    ///   the default config notifications are inert (no desktop popups,
+    ///   no audio); the notifier is still constructed so any code path
+    ///   that calls `.notify(...)` does not panic on `Option::None`.
+    /// - **`pane_grid`**: `PaneGrid::new(&[], supervisor, tabbed=false)`.
+    ///   Layout math works against an empty worker set; if a test needs
+    ///   non-trivial pane layout it should construct `PaneGrid`
+    ///   separately and assign.
+    /// - **`theme`**: `ActiveTheme::default()` (no on-disk theme config
+    ///   read). Tests that exercise theme-aware rendering should assign
+    ///   a specific theme after construction.
+    /// - **`worktree_manager`**: `None`. The production path may
+    ///   construct a `WorktreeManager` (which touches git); tests skip
+    ///   it. Any code path that worktree-walks must guard on `Some(_)`.
+    /// - **`cas_dir` / `project_dir`**: `PathBuf::from("/tmp/cas-test")`.
+    ///   Placeholders — they exist so paths inside the app don't panic
+    ///   on `.is_some()` checks, but **must not** be assumed to exist on
+    ///   disk. Tests that need a real CAS root should use `tempfile`.
+    /// - **`terminal_cols` / `terminal_rows`**: 80x24 — matches the Mux
+    ///   dimensions above. Keep these in sync if you change the Mux
+    ///   size; viewport math reads both.
+    /// - **`epic_state` / `current_epic_id` / `epic_branch`**: Idle /
+    ///   None / None. Tests that exercise EPIC-specific guard logic must
+    ///   assign these explicitly after construction.
+    ///
+    /// If you add a field to `FactoryApp`, you must also add it here —
+    /// the test constructor will fail to compile otherwise, which is the
+    /// intended canary.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         use cas_factory::EpicState;
