@@ -1117,22 +1117,25 @@ fn execute_push(args: &CloudPushArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
-    let mut config = CloudConfig::load()?;
-    let token = config
-        .token
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run 'cas login' first"))?
-        .clone();
+    use std::sync::Arc;
 
+    use crate::cloud::{CloudSyncer, CloudSyncerConfig, SyncQueue};
+
+    let config = CloudConfig::load()?;
+    if config.token.is_none() {
+        anyhow::bail!("Not logged in. Run 'cas login' first");
+    }
+
+    // Stores synced by CloudSyncer::pull. The previously inline path also pulled
+    // specs / events / prompts / file_changes / commit_links — but it did so
+    // unscoped (no project_id filter) which is exactly the cas-2eb3 contamination
+    // vector this task fixes. CloudSyncer::pull does not currently cover those
+    // five entity kinds; routing through it intentionally drops those imports
+    // until the syncer surface is extended (out of scope here).
     let store = open_store(cas_root)?;
     let task_store = open_task_store(cas_root)?;
     let rule_store = open_rule_store(cas_root)?;
     let skill_store = open_skill_store(cas_root)?;
-    let spec_store = open_spec_store(cas_root)?;
-    let event_store = open_event_store(cas_root)?;
-    let prompt_store = open_prompt_store(cas_root)?;
-    let file_change_store = open_file_change_store(cas_root)?;
-    let commit_link_store = open_commit_link_store(cas_root)?;
 
     {
         use crate::ui::components::{Spinner, clear_inline, render_inline_view};
@@ -1145,155 +1148,50 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             0u16
         };
 
-        // Build pull URL with optional since parameter
-        let mut pull_url = format!("{}/api/sync/pull", config.endpoint);
-        if !args.full {
-            if let Some(since) = &config.last_entry_sync {
-                pull_url = format!("{pull_url}?since={since}");
-            }
+        // Construct the scoped syncer. Same pattern as `execute_sync` /
+        // `execute_purge_foreign` (cli/cloud.rs:2106). `CloudSyncer::pull`
+        // hard-fails when `get_project_canonical_id()` is `None` and always
+        // appends `?project_id=<urlencoded>` to `/api/sync/pull`.
+        let queue = SyncQueue::open(cas_root)?;
+        queue.init()?;
+
+        // --full: clear the watermark so the syncer issues a full (no `since=`)
+        // pull. This preserves the prior `--full` semantics under the new path.
+        if args.full {
+            queue.delete_metadata("last_pull_at")?;
         }
 
-        let response = ureq::get(&pull_url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .call()?;
+        let syncer = CloudSyncer::new(
+            Arc::new(queue),
+            config,
+            CloudSyncerConfig::default(),
+        );
 
-        let body: serde_json::Value = response.into_json()?;
+        let pull_result = syncer.pull(
+            store.as_ref(),
+            task_store.as_ref(),
+            rule_store.as_ref(),
+            skill_store.as_ref(),
+        )?;
 
-        let mut entries_count = 0;
-        let mut tasks_count = 0;
-        let mut rules_count = 0;
-        let mut skills_count = 0;
-        let mut specs_count = 0;
-        let mut events_count = 0;
-        let mut prompts_count = 0;
-        let mut file_changes_count = 0;
-        let mut commit_links_count = 0;
+        // The `--entries-only` / `--tasks-only` flags previously gated the
+        // client-side imports of those two kinds. CloudSyncer::pull does not
+        // take filter arguments; preserving these as no-ops keeps the CLI
+        // contract stable for callers that pass them. The flags will become
+        // semantically meaningful again if syncer-level filtering is added.
+        let _ = (args.entries_only, args.tasks_only);
 
-        // Import entries
-        if !args.tasks_only {
-            if let Some(entries) = body.get("entries").and_then(|e| e.as_array()) {
-                for entry_json in entries {
-                    if let Ok(entry) =
-                        serde_json::from_value::<crate::types::Entry>(entry_json.clone())
-                    {
-                        match store.get(&entry.id) {
-                            Ok(_) => store.update(&entry)?,
-                            Err(_) => store.add(&entry)?,
-                        }
-                        entries_count += 1;
-                    }
-                }
-            }
-        }
-
-        // Import tasks
-        if !args.entries_only {
-            if let Some(tasks) = body.get("tasks").and_then(|t| t.as_array()) {
-                for task_json in tasks {
-                    if let Ok(task) =
-                        serde_json::from_value::<crate::types::Task>(task_json.clone())
-                    {
-                        match task_store.get(&task.id) {
-                            Ok(_) => task_store.update(&task)?,
-                            Err(_) => task_store.add(&task)?,
-                        }
-                        tasks_count += 1;
-                    }
-                }
-            }
-        }
-
-        // Import rules
-        if let Some(rules) = body.get("rules").and_then(|r| r.as_array()) {
-            for rule_json in rules {
-                if let Ok(rule) = serde_json::from_value::<crate::types::Rule>(rule_json.clone()) {
-                    match rule_store.get(&rule.id) {
-                        Ok(_) => rule_store.update(&rule)?,
-                        Err(_) => rule_store.add(&rule)?,
-                    }
-                    rules_count += 1;
-                }
-            }
-        }
-
-        // Import skills
-        if let Some(skills) = body.get("skills").and_then(|s| s.as_array()) {
-            for skill_json in skills {
-                if let Ok(skill) = serde_json::from_value::<crate::types::Skill>(skill_json.clone())
-                {
-                    match skill_store.get(&skill.id) {
-                        Ok(_) => skill_store.update(&skill)?,
-                        Err(_) => skill_store.add(&skill)?,
-                    }
-                    skills_count += 1;
-                }
-            }
-        }
-
-        // Import specs
-        if let Some(specs) = body.get("specs").and_then(|s| s.as_array()) {
-            for spec_json in specs {
-                if let Ok(spec) = serde_json::from_value::<crate::types::Spec>(spec_json.clone()) {
-                    match spec_store.get(&spec.id) {
-                        Ok(_) => spec_store.update(&spec)?,
-                        Err(_) => spec_store.add(&spec)?,
-                    }
-                    specs_count += 1;
-                }
-            }
-        }
-
-        // Import events
-        if let Some(events) = body.get("events").and_then(|e| e.as_array()) {
-            for event_json in events {
-                if let Ok(event) = serde_json::from_value::<crate::types::Event>(event_json.clone())
-                {
-                    let _ = event_store.record(&event);
-                    events_count += 1;
-                }
-            }
-        }
-
-        // Import prompts
-        if let Some(prompts) = body.get("prompts").and_then(|p| p.as_array()) {
-            for prompt_json in prompts {
-                if let Ok(prompt) =
-                    serde_json::from_value::<crate::types::Prompt>(prompt_json.clone())
-                {
-                    let _ = prompt_store.add(&prompt);
-                    prompts_count += 1;
-                }
-            }
-        }
-
-        // Import file changes
-        if let Some(fcs) = body.get("file_changes").and_then(|f| f.as_array()) {
-            for fc_json in fcs {
-                if let Ok(fc) = serde_json::from_value::<crate::types::FileChange>(fc_json.clone())
-                {
-                    let _ = file_change_store.add(&fc);
-                    file_changes_count += 1;
-                }
-            }
-        }
-
-        // Import commit links
-        if let Some(cls) = body.get("commit_links").and_then(|c| c.as_array()) {
-            for cl_json in cls {
-                if let Ok(cl) = serde_json::from_value::<crate::types::CommitLink>(cl_json.clone())
-                {
-                    let _ = commit_link_store.add(&cl);
-                    commit_links_count += 1;
-                }
-            }
-        }
-
-        // Update last sync time
-        if let Some(pulled_at) = body.get("pulled_at").and_then(|p| p.as_str()) {
-            config.last_entry_sync = Some(pulled_at.to_string());
-            config.last_task_sync = Some(pulled_at.to_string());
-            config.save()?;
-        }
+        let entries_count = pull_result.pulled_entries;
+        let tasks_count = pull_result.pulled_tasks;
+        let rules_count = pull_result.pulled_rules;
+        let skills_count = pull_result.pulled_skills;
+        // Kinds not yet handled by CloudSyncer::pull — surfaced as zero so
+        // downstream JSON consumers don't break on a missing field.
+        let specs_count = 0usize;
+        let events_count = 0usize;
+        let prompts_count = 0usize;
+        let file_changes_count = 0usize;
+        let commit_links_count = 0usize;
 
         if prev_lines > 0 {
             clear_inline(prev_lines)?;
@@ -1313,6 +1211,7 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
                     "prompts": prompts_count,
                     "file_changes": file_changes_count,
                     "commit_links": commit_links_count,
+                    "errors": pull_result.errors,
                 })
             );
         } else {
@@ -1337,6 +1236,17 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             fmt.newline()?;
             fmt.write_raw(&format!("    {commit_links_count} commit links synced"))?;
             fmt.newline()?;
+            if !pull_result.errors.is_empty() {
+                let warning_color = fmt.theme().palette.status_warning;
+                fmt.write_colored("  \u{26A0} ", warning_color)?;
+                fmt.write_raw(&format!("{} pull errors:", pull_result.errors.len()))?;
+                fmt.newline()?;
+                for err in &pull_result.errors {
+                    fmt.write_muted("    - ")?;
+                    fmt.write_raw(err)?;
+                    fmt.newline()?;
+                }
+            }
         }
     }
 
