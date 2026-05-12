@@ -146,6 +146,22 @@ brew tap codingagentsystem/cas
 brew install cas
 ```
 
+> **Homebrew users — auto-upgrade Claude Code in the background:**
+> If you installed Claude Code via Homebrew, set this env var to let it
+> self-upgrade automatically (added in Claude Code 2.1.129):
+>
+> ```bash
+> export CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1
+> ```
+>
+> Add it to your shell profile (`~/.zprofile`, `~/.bashrc`, etc.) to make it
+> permanent. Claude Code will run `brew upgrade claude` in the background and
+> prompt you to restart.
+>
+> **This is for Claude Code only — not CAS.** CAS updates via `cas update`.
+>
+> Reference: [Claude Code 2.1.129 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
+
 ### Build from source
 
 ```bash
@@ -186,6 +202,38 @@ Add to your Claude Code MCP config (`.claude/settings.json` or project `.mcp.jso
   }
 }
 ```
+
+#### Managing CAS skill exposure with `skillOverrides`
+
+CAS ships several builtin skills (e.g. `cas-code-review`, `cas-worker`, `fallow`, `codemap`).
+If you are running CAS alongside other skill packs, or simply want to reduce context noise,
+Claude Code 2.1.129 added `skillOverrides` in `settings.json` that lets you control per-skill
+visibility without disabling CAS entirely.
+
+Three modes are available:
+
+| Mode | Effect |
+|------|--------|
+| `"off"` | Skill is completely hidden — invisible to the model and absent from the `/` command list |
+| `"user-invocable-only"` | Skill is hidden from the model's context but the user can still invoke it via `/skill-name` |
+| `"name-only"` | Skill name appears in suggestions but the full description is collapsed (saves context tokens) |
+
+**Example** — add to your global `~/.claude/settings.json` or project `.claude/settings.json`:
+
+```json
+{
+  "skillOverrides": {
+    "cas-brainstorm": "off",
+    "cas-ideate": "user-invocable-only",
+    "cas-memory-management": "name-only"
+  }
+}
+```
+
+> **Tip:** To suppress all CAS skills temporarily, set each to `"off"`. To keep them available
+> for manual use while decluttering the model context, prefer `"user-invocable-only"`.
+>
+> Reference: [Claude Code 2.1.129 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 
 ## Architecture
 

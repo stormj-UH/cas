@@ -16,14 +16,11 @@ async fn run_server_impl() -> anyhow::Result<()> {
     use crate::cloud::{CloudConfig, CloudSyncer, CloudSyncerConfig, SyncQueue};
     use crate::mcp::daemon::{EmbeddedDaemonConfig, spawn_daemon};
     use crate::mcp::tools::CasService;
-    use crate::store::find_cas_root;
     use crate::store::{open_rule_store, open_skill_store, open_store, open_task_store};
     use rmcp::ServiceExt;
     use rmcp::transport::stdio;
 
-    let cas_root = find_cas_root().map_err(|_| {
-        anyhow::anyhow!("CAS not initialized. Run `cas init` in your project first.")
-    })?;
+    let cas_root = resolve_mcp_serve_root()?;
 
     // Install panic hook before anything else can panic. Routes panics to a
     // dedicated file under `.cas/logs/cas-serve-{date}.log` with timestamp,
@@ -437,6 +434,48 @@ fn install_serve_panic_hook(cas_root: &std::path::Path) {
     }));
 }
 
+/// Resolve the CAS project root for an MCP stdio server.
+///
+/// Called once at `cas serve` startup.  Priority order:
+///
+/// 1. `CLAUDE_PROJECT_DIR` — Claude Code 2.1.139+ sets this env var when it
+///    spawns `cas serve` as a stdio MCP server.  Using it avoids a cwd-mismatch
+///    when Claude Code starts the server from an unexpected working directory.
+/// 2. Existing `find_cas_root()` — `CAS_ROOT` override, git-worktree detection,
+///    directory walk from cwd.
+///
+/// Logs the chosen resolution strategy at DEBUG level for diagnosability.
+pub(crate) fn resolve_mcp_serve_root() -> anyhow::Result<std::path::PathBuf> {
+    use crate::store::find_cas_root_from;
+
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+        let project_dir = std::path::PathBuf::from(&dir);
+        if project_dir.is_dir() {
+            tracing::debug!(
+                path = %project_dir.display(),
+                "resolve_mcp_serve_root: using CLAUDE_PROJECT_DIR"
+            );
+            return find_cas_root_from(&project_dir).map_err(|_| {
+                anyhow::anyhow!(
+                    "CAS not initialized in CLAUDE_PROJECT_DIR={dir}. Run `cas init` first."
+                )
+            });
+        }
+        tracing::debug!(
+            path = %dir,
+            "resolve_mcp_serve_root: CLAUDE_PROJECT_DIR is not a readable directory, \
+             falling back to cwd detection"
+        );
+    } else {
+        tracing::debug!(
+            "resolve_mcp_serve_root: CLAUDE_PROJECT_DIR not set, using cwd-based detection"
+        );
+    }
+
+    crate::store::find_cas_root()
+        .map_err(|_| anyhow::anyhow!("CAS not initialized. Run `cas init` in your project first."))
+}
+
 /// Release all tasks claimed by an agent on shutdown and unregister the agent
 fn release_agent_tasks(cas_root: &std::path::Path, agent_id: &str) -> anyhow::Result<()> {
     let agent_store = open_agent_store(cas_root)?;
@@ -477,5 +516,167 @@ pub async fn write_proxy_catalog_cache(
         Err(e) => {
             eprintln!("[CAS] Failed to serialize proxy catalog: {e}");
         }
+    }
+}
+
+// =============================================================================
+// Unit tests for resolve_mcp_serve_root (cas-7cc3)
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::resolve_mcp_serve_root;
+    use crate::store::init_cas_dir;
+    use tempfile::TempDir;
+
+    /// Serialize tests that mutate environment variables.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores CLAUDE_PROJECT_DIR and CAS_ROOT on drop,
+    /// even if the test closure panics.
+    struct EnvGuard {
+        orig_cpd: Option<String>,
+        orig_cr: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.orig_cpd {
+                    Some(v) => std::env::set_var("CLAUDE_PROJECT_DIR", v),
+                    None => std::env::remove_var("CLAUDE_PROJECT_DIR"),
+                }
+                match &self.orig_cr {
+                    Some(v) => std::env::set_var("CAS_ROOT", v),
+                    None => std::env::remove_var("CAS_ROOT"),
+                }
+            }
+        }
+    }
+
+    // Helper: save + restore CLAUDE_PROJECT_DIR and CAS_ROOT around a closure.
+    // Panic-safe: EnvGuard restores env vars via Drop even if `f` unwinds.
+    // Mutex-poisoning-safe: uses unwrap_or_else so a prior test panic does not
+    // permanently block subsequent tests.
+    fn with_env<F: FnOnce()>(claude_project_dir: Option<&str>, cas_root_override: Option<&str>, f: F) {
+        let _mutex_guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let orig_cpd = std::env::var("CLAUDE_PROJECT_DIR").ok();
+        let orig_cr = std::env::var("CAS_ROOT").ok();
+
+        unsafe {
+            match claude_project_dir {
+                Some(v) => std::env::set_var("CLAUDE_PROJECT_DIR", v),
+                None => std::env::remove_var("CLAUDE_PROJECT_DIR"),
+            }
+            match cas_root_override {
+                Some(v) => std::env::set_var("CAS_ROOT", v),
+                None => std::env::remove_var("CAS_ROOT"),
+            }
+        }
+
+        // EnvGuard is declared after _mutex_guard, so it is dropped first
+        // (Rust drops locals in reverse declaration order).  Env vars are
+        // restored before the mutex is released, keeping the two concerns
+        // properly ordered.
+        let _env_guard = EnvGuard { orig_cpd, orig_cr };
+        f();
+    }
+
+    /// When CLAUDE_PROJECT_DIR is set to a directory that contains a `.cas/`,
+    /// resolve_mcp_serve_root must return that `.cas/` path even if the process
+    /// cwd is somewhere completely different.
+    #[test]
+    fn resolves_from_claude_project_dir_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        init_cas_dir(&tmp_path).unwrap();
+
+        with_env(
+            Some(tmp_path.to_str().unwrap()),
+            None, // clear CAS_ROOT so it cannot shadow the result
+            || {
+                let result = resolve_mcp_serve_root()
+                    .expect("should succeed when CLAUDE_PROJECT_DIR points to initialized project");
+                assert_eq!(
+                    result,
+                    tmp_path.join(".cas"),
+                    "should resolve from CLAUDE_PROJECT_DIR, not cwd"
+                );
+            },
+        );
+    }
+
+    /// When CLAUDE_PROJECT_DIR points at a path that does not exist (not a
+    /// directory), the function must fall back to cwd / CAS_ROOT detection.
+    #[test]
+    fn falls_back_when_claude_project_dir_is_invalid() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        init_cas_dir(&tmp_path).unwrap();
+        let cas_root_str = tmp_path.join(".cas").to_string_lossy().into_owned();
+
+        with_env(
+            Some("/nonexistent/path/that/definitely/does/not/exist"),
+            Some(&cas_root_str), // anchor fallback to our tmp project
+            || {
+                let result = resolve_mcp_serve_root()
+                    .expect("should succeed via CAS_ROOT fallback");
+                assert_eq!(
+                    result,
+                    tmp_path.join(".cas"),
+                    "should fall back to CAS_ROOT when CLAUDE_PROJECT_DIR is invalid"
+                );
+            },
+        );
+    }
+
+    /// When CLAUDE_PROJECT_DIR points to a real, readable directory that has
+    /// NOT been `cas init`-ed (no `.cas/` subdirectory exists inside it), the
+    /// function must return an Err whose message explicitly mentions
+    /// CLAUDE_PROJECT_DIR — so the user knows which path to initialise.
+    #[test]
+    fn errors_when_claude_project_dir_has_no_cas_dir() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        // Deliberately do NOT call init_cas_dir — no .cas/ exists here.
+
+        with_env(
+            Some(tmp_path.to_str().unwrap()),
+            None, // also clear CAS_ROOT so there is no accidental fallback
+            || {
+                let err = resolve_mcp_serve_root()
+                    .expect_err("should fail: CLAUDE_PROJECT_DIR has no .cas/");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("CLAUDE_PROJECT_DIR"),
+                    "error message should mention CLAUDE_PROJECT_DIR so the user knows which \
+                     path to run `cas init` in; got: {msg}"
+                );
+            },
+        );
+    }
+
+    /// When CLAUDE_PROJECT_DIR is not set, the function must still work via the
+    /// normal CAS_ROOT / cwd-walk path.
+    #[test]
+    fn falls_back_to_cas_root_when_claude_project_dir_absent() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        init_cas_dir(&tmp_path).unwrap();
+        let cas_root_str = tmp_path.join(".cas").to_string_lossy().into_owned();
+
+        with_env(
+            None,              // no CLAUDE_PROJECT_DIR
+            Some(&cas_root_str), // use CAS_ROOT so we don't depend on cwd
+            || {
+                let result = resolve_mcp_serve_root()
+                    .expect("should succeed via CAS_ROOT fallback");
+                assert_eq!(
+                    result,
+                    tmp_path.join(".cas"),
+                    "should resolve via CAS_ROOT when CLAUDE_PROJECT_DIR absent"
+                );
+            },
+        );
     }
 }

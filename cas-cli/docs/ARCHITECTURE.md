@@ -51,6 +51,8 @@ The root `Cargo.toml` defines a workspace. `cas-cli/` is the main binary crate; 
 
 **CasCore (MCP server)**: Lives in `cas-cli/src/mcp/server/mod.rs`. Caches all store instances in `OnceLock` fields — each store type opened exactly once per server lifetime. Has an embedded daemon for background maintenance (embedding generation every 2min, full maintenance every 30min).
 
+**`cas serve` project-root resolution** (`cas-cli/src/mcp/server/runtime.rs::resolve_mcp_serve_root`): Priority order: (1) `CLAUDE_PROJECT_DIR` env var — Claude Code 2.1.139+ sets this when spawning a stdio MCP server, eliminating cwd-mismatch failures; (2) `CAS_ROOT` env var (explicit override); (3) git-worktree detection; (4) directory walk from cwd. Falls back silently to (2)–(4) when `CLAUDE_PROJECT_DIR` is unset or points at a non-existent path.
+
 **CasContext**: In `cas-cli/src/store/mod.rs`. Resolves the `.cas/` directory once at CLI entry points and passes it through — enables deterministic test behavior.
 
 **Hook scoring**: `cas-cli/src/hooks/scorer.rs` ranks context items (memories, tasks, rules, skills) by relevance for injection into SessionStart context, staying within a token budget.
