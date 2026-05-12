@@ -948,20 +948,47 @@ This is the body content."#;
                 include_str!("builtins/codex/skills/cas-worker/references/close-gate.md"),
             ),
         ] {
-            // SKILL.md points workers at the gate.
-            for required in ["cas-code-review", "close-gate.md"] {
+            // SKILL.md points workers at the gate (via close-gate.md).
+            //
+            // Historical note (cas-ec8f amendment): this loop previously also
+            // asserted the literal substring "cas-code-review" was present in
+            // cas-worker.md, but commit 8b82273 / cas-8962 deliberately
+            // removed that mention when `[code_review] owner = "supervisor"`
+            // became the default (v2.13.0+). Workers must NOT invoke
+            // cas-code-review pre-close under the default ownership model —
+            // the supervisor owns review timing at cherry-pick / EPIC-merge.
+            // The assertion was silently failing on main from that commit
+            // forward; cas-ec8f drops it here so the test reflects the
+            // current ownership contract. The `close-gate.md` pointer is
+            // still required — that doc is where the detailed gate content
+            // lives and workers do need to know about it.
+            for required in ["close-gate.md"] {
                 assert!(
                     skill_content.contains(required),
                     "{label} cas-worker SKILL.md missing required marker: {required:?}"
                 );
             }
             // close-gate.md carries the detailed gate content.
+            //
+            // Historical note (cas-ec8f amendment): this list previously
+            // pinned five markers that documented the legacy worker-inline
+            // code-review path: "Close-time Code Review Gate" (old section
+            // title), "If close is blocked on P0" (legacy P0 hard-block
+            // behavior), "bypass_code_review" (legacy worker bypass), plus
+            // "cas-code-review" and "code-reviewer". Commit 167c57e
+            // ("docs(skills): finish cas-5815 supervisor-default flip —
+            // purge stale worker-runs-review prompts") deliberately rewrote
+            // close-gate.md when `[code_review] owner = "supervisor"` became
+            // the default — the inline-block markers no longer apply.
+            // The assertions were silently failing on main from that point
+            // forward. The new pin set encodes the *current* ownership
+            // contract: close-gate.md documents the close gate, points
+            // workers at cas-code-review with a "don't invoke pre-close"
+            // caveat, and names the supervisor-owned default ownership flag.
             for required in [
-                "Close-time Code Review Gate",
-                "If close is blocked on P0",
+                "Close Gate",
                 "cas-code-review",
-                "bypass_code_review",
-                "code-reviewer",
+                "owner = \"supervisor\"",
             ] {
                 assert!(
                     ref_content.contains(required),
