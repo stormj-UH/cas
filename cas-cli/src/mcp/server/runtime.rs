@@ -531,9 +531,35 @@ mod tests {
     /// Serialize tests that mutate environment variables.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard that restores CLAUDE_PROJECT_DIR and CAS_ROOT on drop,
+    /// even if the test closure panics.
+    struct EnvGuard {
+        orig_cpd: Option<String>,
+        orig_cr: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.orig_cpd {
+                    Some(v) => std::env::set_var("CLAUDE_PROJECT_DIR", v),
+                    None => std::env::remove_var("CLAUDE_PROJECT_DIR"),
+                }
+                match &self.orig_cr {
+                    Some(v) => std::env::set_var("CAS_ROOT", v),
+                    None => std::env::remove_var("CAS_ROOT"),
+                }
+            }
+        }
+    }
+
     // Helper: save + restore CLAUDE_PROJECT_DIR and CAS_ROOT around a closure.
+    // Panic-safe: EnvGuard restores env vars via Drop even if `f` unwinds.
+    // Mutex-poisoning-safe: uses unwrap_or_else so a prior test panic does not
+    // permanently block subsequent tests.
     fn with_env<F: FnOnce()>(claude_project_dir: Option<&str>, cas_root_override: Option<&str>, f: F) {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _mutex_guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
         let orig_cpd = std::env::var("CLAUDE_PROJECT_DIR").ok();
         let orig_cr = std::env::var("CAS_ROOT").ok();
 
@@ -548,18 +574,12 @@ mod tests {
             }
         }
 
+        // EnvGuard is declared after _mutex_guard, so it is dropped first
+        // (Rust drops locals in reverse declaration order).  Env vars are
+        // restored before the mutex is released, keeping the two concerns
+        // properly ordered.
+        let _env_guard = EnvGuard { orig_cpd, orig_cr };
         f();
-
-        unsafe {
-            match orig_cpd {
-                Some(v) => std::env::set_var("CLAUDE_PROJECT_DIR", v),
-                None => std::env::remove_var("CLAUDE_PROJECT_DIR"),
-            }
-            match orig_cr {
-                Some(v) => std::env::set_var("CAS_ROOT", v),
-                None => std::env::remove_var("CAS_ROOT"),
-            }
-        }
     }
 
     /// When CLAUDE_PROJECT_DIR is set to a directory that contains a `.cas/`,
@@ -605,6 +625,32 @@ mod tests {
                     result,
                     tmp_path.join(".cas"),
                     "should fall back to CAS_ROOT when CLAUDE_PROJECT_DIR is invalid"
+                );
+            },
+        );
+    }
+
+    /// When CLAUDE_PROJECT_DIR points to a real, readable directory that has
+    /// NOT been `cas init`-ed (no `.cas/` subdirectory exists inside it), the
+    /// function must return an Err whose message explicitly mentions
+    /// CLAUDE_PROJECT_DIR — so the user knows which path to initialise.
+    #[test]
+    fn errors_when_claude_project_dir_has_no_cas_dir() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().canonicalize().unwrap();
+        // Deliberately do NOT call init_cas_dir — no .cas/ exists here.
+
+        with_env(
+            Some(tmp_path.to_str().unwrap()),
+            None, // also clear CAS_ROOT so there is no accidental fallback
+            || {
+                let err = resolve_mcp_serve_root()
+                    .expect_err("should fail: CLAUDE_PROJECT_DIR has no .cas/");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("CLAUDE_PROJECT_DIR"),
+                    "error message should mention CLAUDE_PROJECT_DIR so the user knows which \
+                     path to run `cas init` in; got: {msg}"
                 );
             },
         );
