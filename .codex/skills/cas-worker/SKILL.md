@@ -86,3 +86,12 @@ Open these on demand — they are not pre-loaded.
 | About to close (step 6) | close-gate |
 | Anything went wrong (jail, MCP, worktree, reassignment) | recovery |
 | Need an exact field name or action name | details |
+
+## Context budgeting
+
+Three layers (`project_session_start_truncation.md`):
+- **Immutable Core** — skill body; 12 KB SessionStart cap (`test_*_guidance_under_12kb`); over = silent 2 KB preview.
+- **Task Context** — EPIC/task/memories, on demand.
+- **Ephemeral** — outputs, transcript; expendable.
+
+Adding here? Only if every session needs it; else `references/<name>.md`.

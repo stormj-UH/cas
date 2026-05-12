@@ -89,3 +89,12 @@ Each file below is a focused chunk of the operational guide. Open the one you ne
 | A worker pane looks broken or stuck | worker-recovery |
 | Hit "No active lease" / "missing field" / dispatch confusion | reference |
 | Tasks in `pending_supervisor_review`; running code review queue | code-review-queue |
+
+## Context budgeting
+
+Three layers (`project_session_start_truncation.md`):
+- **Immutable Core** — skill body; 12 KB SessionStart cap (`test_*_guidance_under_12kb`); over = silent 2 KB preview.
+- **Task Context** — EPIC/task/memories, on demand.
+- **Ephemeral** — outputs, transcript; expendable.
+
+Adding here? Only if every session needs it; else `references/<name>.md`.
