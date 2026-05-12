@@ -203,6 +203,38 @@ Add to your Claude Code MCP config (`.claude/settings.json` or project `.mcp.jso
 }
 ```
 
+#### Managing CAS skill exposure with `skillOverrides`
+
+CAS ships several builtin skills (e.g. `cas-code-review`, `cas-worker`, `fallow`, `codemap`).
+If you are running CAS alongside other skill packs, or simply want to reduce context noise,
+Claude Code 2.1.129 added `skillOverrides` in `settings.json` that lets you control per-skill
+visibility without disabling CAS entirely.
+
+Three modes are available:
+
+| Mode | Effect |
+|------|--------|
+| `"off"` | Skill is completely hidden — invisible to the model and absent from the `/` command list |
+| `"user-invocable-only"` | Skill is hidden from the model's context but the user can still invoke it via `/skill-name` |
+| `"name-only"` | Skill name appears in suggestions but the full description is collapsed (saves context tokens) |
+
+**Example** — add to your global `~/.claude/settings.json` or project `.claude/settings.json`:
+
+```json
+{
+  "skillOverrides": {
+    "cas-brainstorm": "off",
+    "cas-ideate": "user-invocable-only",
+    "cas-memory-management": "name-only"
+  }
+}
+```
+
+> **Tip:** To suppress all CAS skills temporarily, set each to `"off"`. To keep them available
+> for manual use while decluttering the model context, prefer `"user-invocable-only"`.
+>
+> Reference: [Claude Code 2.1.129 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
+
 ## Architecture
 
 ### Data storage
