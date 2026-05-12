@@ -614,37 +614,40 @@ fn test_alt_screen_enter_then_exit_same_chunk() {
     );
 }
 
-/// Scroll on an alt-screen pane returns an error (no scrollback), confirming
-/// why we must forward to the PTY instead.
+/// Scroll on an alt-screen pane silently no-ops at the ghostty layer
+/// (`Pane::scroll` returns `Ok(())` but the viewport offset does not move).
+/// That's why the UI must forward wheel events to the inner process via the
+/// PTY rather than rely on the host scrollback — the host has none to give.
+///
+/// This test pins both halves of the contract: the call succeeds and the
+/// viewport offset is unchanged. Either drifting in isolation is a
+/// regression worth catching.
 #[test]
 fn test_alt_screen_scroll_is_noop() {
     let mut pane = Pane::director("test", 24, 80).unwrap();
 
-    // Fill some scrollback in normal-screen mode first
+    // Fill some scrollback in normal-screen mode first.
     for i in 0..50 {
         pane.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
     }
 
-    // Enter alt-screen
+    // Enter alt-screen.
     pane.feed(b"\x1b[?1049h").unwrap();
     assert!(pane.is_in_alt_screen());
 
-    // scrollback_info should report no viewport offset (cannot scroll back)
     let info_before = pane.scrollback_info();
-    // Attempt to scroll — should return an error (ghostty no-ops on alt-screen)
+    // Attempt to scroll. Ghostty silently no-ops on the alt-screen buffer.
     let result = pane.scroll(-5);
     let info_after = pane.scrollback_info();
 
-    // Whether it errors or silently no-ops, the viewport offset must not move
-    // The key assertion: scroll_focused_pane would produce no visible change.
+    assert!(
+        result.is_ok(),
+        "Pane::scroll on alt-screen must return Ok(()) (silent no-op), got {result:?}"
+    );
     assert_eq!(
         info_before.viewport_offset, info_after.viewport_offset,
-        "viewport must not change when scrolling in alt-screen"
+        "viewport must not move when scrolling in alt-screen"
     );
-    // Log the result so CI output is informative
-    if result.is_err() {
-        // Expected: ghostty returns error code for alt-screen scroll
-    }
 }
 
 // =============================================================================
