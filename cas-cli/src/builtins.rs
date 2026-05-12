@@ -552,9 +552,48 @@ pub fn preview_builtin(
     }
 }
 
-/// Sync a built-in file to the target directory
-/// Returns true if file was written/updated
-pub fn sync_builtin(builtin: &BuiltinFile, target_dir: &Path) -> std::io::Result<bool> {
+/// Outcome of a single `sync_builtin_detailed` call. The interesting
+/// variant is `SkippedNotManaged` — that is the cas-4900 silent-skip
+/// case (target exists, content differs from source, but the
+/// managed-by-cas gate refused to write because neither side carries the
+/// frontmatter marker). Callers that summarize a sync report should
+/// surface these so the staleness becomes observable instead of silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// Wrote a new file (target did not exist on disk).
+    Created,
+    /// Overwrote an existing file (content differed and the managed-by
+    /// gate let us through).
+    Updated,
+    /// Target existed and content already matched source byte-for-byte.
+    /// Happy-path no-op.
+    Unchanged,
+    /// Target exists, content differs from source, but neither version
+    /// carries `managed_by: cas` in its frontmatter — the gate kept us
+    /// from clobbering. **This is the visible-staleness signal**
+    /// (cas-4900): the file at the destination is provably stale and
+    /// the caller should surface it in CLI output.
+    SkippedNotManaged,
+}
+
+impl SyncOutcome {
+    /// True for the two write-bearing outcomes (`Created` / `Updated`).
+    /// Preserves the back-compat surface for callers that previously
+    /// read `sync_builtin` as a plain `bool`.
+    pub fn wrote(self) -> bool {
+        matches!(self, SyncOutcome::Created | SyncOutcome::Updated)
+    }
+}
+
+/// Rich variant of [`sync_builtin`]: returns a [`SyncOutcome`] so the
+/// caller can distinguish silent-skip (stale-source-not-managed) from
+/// happy-path no-op, which the legacy `bool` return value collapsed
+/// into the same value and produced the cas-4900 silent-staleness
+/// regression.
+pub fn sync_builtin_detailed(
+    builtin: &BuiltinFile,
+    target_dir: &Path,
+) -> std::io::Result<SyncOutcome> {
     let target = target_dir.join(builtin.path);
     let content = builtin.content;
 
@@ -569,18 +608,47 @@ pub fn sync_builtin(builtin: &BuiltinFile, target_dir: &Path) -> std::io::Result
 
         // Only overwrite if it's managed by CAS
         if !is_managed_by_cas(&existing) && !is_managed_by_cas(content) {
-            // Neither version is managed - don't overwrite user content
-            return Ok(false);
+            // Neither version is managed — don't overwrite user content.
+            // Distinguish "content actually differs" (the silent-staleness
+            // case worth warning about) from "content matches anyway"
+            // (genuine no-op): emit `SkippedNotManaged` only on the
+            // former so callers can warn-and-link the user to the
+            // managed-by-cas marker fix.
+            if existing == content {
+                return Ok(SyncOutcome::Unchanged);
+            }
+            tracing::warn!(
+                path = %builtin.path,
+                "sync_builtin: silent skip — destination differs from source but \
+                 neither side carries `managed_by: cas` frontmatter; file is stale. \
+                 Add `managed_by: cas` to the source frontmatter to enable updates \
+                 (cas-4900)."
+            );
+            return Ok(SyncOutcome::SkippedNotManaged);
         }
 
         // Check if content is the same
         if existing == content {
-            return Ok(false);
+            return Ok(SyncOutcome::Unchanged);
         }
-    }
 
-    std::fs::write(&target, content)?;
-    Ok(true)
+        std::fs::write(&target, content)?;
+        Ok(SyncOutcome::Updated)
+    } else {
+        std::fs::write(&target, content)?;
+        Ok(SyncOutcome::Created)
+    }
+}
+
+/// Sync a built-in file to the target directory.
+/// Returns true if file was written/updated.
+///
+/// Back-compat wrapper over [`sync_builtin_detailed`]; new call sites
+/// should prefer the detailed variant so they can surface the
+/// `SkippedNotManaged` case (cas-4900). Internal callers like
+/// [`sync_all_builtins_inner`] already migrated.
+pub fn sync_builtin(builtin: &BuiltinFile, target_dir: &Path) -> std::io::Result<bool> {
+    Ok(sync_builtin_detailed(builtin, target_dir)?.wrote())
 }
 
 /// Sync all built-in files to the target directory
@@ -593,17 +661,29 @@ fn sync_all_builtins_inner(
 
     // Sync agents
     for builtin in agents {
-        if sync_builtin(builtin, target_dir)? {
-            result.agents_updated += 1;
-            result.updated_files.push(builtin.path.to_string());
+        match sync_builtin_detailed(builtin, target_dir)? {
+            SyncOutcome::Created | SyncOutcome::Updated => {
+                result.agents_updated += 1;
+                result.updated_files.push(builtin.path.to_string());
+            }
+            SyncOutcome::SkippedNotManaged => {
+                result.skipped_files.push(builtin.path.to_string());
+            }
+            SyncOutcome::Unchanged => {}
         }
     }
 
     // Sync skills
     for builtin in skills {
-        if sync_builtin(builtin, target_dir)? {
-            result.skills_updated += 1;
-            result.updated_files.push(builtin.path.to_string());
+        match sync_builtin_detailed(builtin, target_dir)? {
+            SyncOutcome::Created | SyncOutcome::Updated => {
+                result.skills_updated += 1;
+                result.updated_files.push(builtin.path.to_string());
+            }
+            SyncOutcome::SkippedNotManaged => {
+                result.skipped_files.push(builtin.path.to_string());
+            }
+            SyncOutcome::Unchanged => {}
         }
     }
 
@@ -636,11 +716,26 @@ pub struct SyncResult {
     pub agents_updated: usize,
     pub skills_updated: usize,
     pub updated_files: Vec<String>,
+    /// Paths (relative to `target_dir`) whose source content differs from
+    /// the on-disk destination, but the managed-by gate refused to
+    /// overwrite because neither version carries `managed_by: cas`. This
+    /// is the cas-4900 silent-staleness signal — callers like
+    /// `cas update --sync` should surface these as warnings so the user
+    /// can either add the marker to the source or accept the staleness
+    /// knowingly. Distinct from "no-op" (`Unchanged`) where source and
+    /// destination already match.
+    pub skipped_files: Vec<String>,
 }
 
 impl SyncResult {
     pub fn total_updated(&self) -> usize {
         self.agents_updated + self.skills_updated
+    }
+
+    /// True when the sync left at least one file behind because the
+    /// managed-by gate would not let us overwrite. cas-4900.
+    pub fn has_silent_skips(&self) -> bool {
+        !self.skipped_files.is_empty()
     }
 }
 
@@ -1424,6 +1519,177 @@ This is the body content."#;
             task_verifier.content.contains("description:"),
             "task-verifier must have description"
         );
+    }
+
+    /// cas-4900 regression: `sync_all_builtins` was reported to silently
+    /// skip reference files (anything under `<skill>/references/*.md`)
+    /// when invoked against a project-style target_dir, even though the
+    /// same code path worked against `~/.claude` (user-level). This test
+    /// runs the same `sync_all_builtins` function against a tempdir that
+    /// has been pre-populated with stale content for a reference file,
+    /// asserts the stale content gets overwritten with fresh source, and
+    /// asserts a separately-deleted reference file gets recreated.
+    ///
+    /// If this test PASSES on main, `sync_all_builtins` itself is innocent
+    /// and the bug must live in the orchestration around it
+    /// (`sync_claude_files` in `cli/update.rs`), most likely the
+    /// `SkillSyncer::sync_all` invocation that runs immediately before.
+    /// The locked-in assertion here is the safety net: any future
+    /// refactor that breaks reference-file write logic at this layer
+    /// fails this test loudly instead of slipping into silent staleness.
+    #[test]
+    fn test_sync_all_builtins_overwrites_stale_and_recreates_deleted_reference_files() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let claude_dir = temp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        // Initial sync — populate everything fresh.
+        sync_all_builtins(&claude_dir).unwrap();
+
+        // Pick two real reference files that exist in BUILTIN_SKILLS today.
+        // Both carry `managed_by: cas` frontmatter (planning.md was the
+        // exemplar in the 2026-05-06 cas-4900 repro).
+        let planning_path = claude_dir.join("skills/cas-supervisor/references/planning.md");
+        let close_gate_path = claude_dir.join("skills/cas-worker/references/close-gate.md");
+        assert!(planning_path.exists(), "initial sync must have written planning.md");
+        assert!(close_gate_path.exists(), "initial sync must have written close-gate.md");
+
+        let planning_src = BUILTIN_SKILLS
+            .iter()
+            .find(|b| b.path == "skills/cas-supervisor/references/planning.md")
+            .expect("planning.md must be registered in BUILTIN_SKILLS")
+            .content;
+
+        // Stage 1: overwrite planning.md with stale content (keep the
+        // managed_by:cas frontmatter so the gate at sync_builtin:571
+        // routes us into the write path).
+        let stale_marker = "STALE CAS-4900 SENTINEL — should be overwritten on next sync";
+        std::fs::write(
+            &planning_path,
+            format!("---\nname: planning\nmanaged_by: cas\n---\n\n{stale_marker}\n"),
+        )
+        .unwrap();
+
+        // Stage 2: delete close-gate.md outright. The next sync must
+        // recreate it from BUILTIN_SKILLS source.
+        std::fs::remove_file(&close_gate_path).unwrap();
+        assert!(!close_gate_path.exists(), "precondition: deletion took effect");
+
+        // Re-run sync. This is the call that was reported to silently
+        // no-op in per-project context.
+        let result = sync_all_builtins(&claude_dir).unwrap();
+
+        // Recreation invariant.
+        assert!(
+            close_gate_path.exists(),
+            "cas-4900 regression: sync_all_builtins did NOT recreate the \
+             deleted close-gate.md reference file"
+        );
+        let close_gate_after = std::fs::read_to_string(&close_gate_path).unwrap();
+        assert!(
+            close_gate_after.contains("managed_by: cas"),
+            "recreated close-gate.md must carry the source frontmatter"
+        );
+
+        // Overwrite invariant.
+        let planning_after = std::fs::read_to_string(&planning_path).unwrap();
+        assert!(
+            !planning_after.contains(stale_marker),
+            "cas-4900 regression: sync_all_builtins did NOT overwrite the \
+             stale planning.md reference file"
+        );
+        assert_eq!(
+            planning_after, planning_src,
+            "planning.md must match the BUILTIN_SKILLS source byte-for-byte after sync"
+        );
+
+        // Update count must reflect both files (recreated + overwritten).
+        // Other built-ins were already current after the initial sync, so
+        // the second-sync update count should be exactly 2.
+        assert_eq!(
+            result.total_updated(),
+            2,
+            "second sync should report exactly 2 updated files (the \
+             recreated close-gate.md + the overwritten planning.md); got: {:?}",
+            result.updated_files,
+        );
+    }
+
+    /// cas-4900 surfacing: when the destination has an *unmanaged* file
+    /// whose content differs from the source AND the source is also
+    /// unmanaged, the gate correctly refuses to overwrite — but the
+    /// outcome must be observable. Pin the `SkippedNotManaged` variant
+    /// and the population of `SyncResult::skipped_files` so future
+    /// refactors can't slip back into the pre-9362ee0 silent-skip mode.
+    ///
+    /// Note: with current `BUILTIN_SKILLS` content (post-9362ee0 — every
+    /// builtin file carries `managed_by: cas`), this gate is effectively
+    /// untriggerable in production via the real builtins. The test
+    /// constructs a synthetic `BuiltinFile` whose source content lacks
+    /// the marker so we can exercise the path. This is the regression
+    /// safety net for the OTHER half of cas-4900 (the AC bullet
+    /// "Reference files WITHOUT the marker either sync correctly OR
+    /// emit a clear warning so silent-skip is no longer possible").
+    #[test]
+    fn test_sync_builtin_detailed_surfaces_silent_skip_for_unmanaged_drift() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let target_dir = temp.path();
+
+        // Synthetic builtin whose source has NO managed_by marker — the
+        // exact case the pre-9362ee0 gate would silently swallow.
+        let synthetic = BuiltinFile {
+            path: "skills/cas-test-synthetic/references/example.md",
+            content: "# Synthetic ref file — unmanaged source\n\nupdated body\n",
+        };
+
+        // Seed destination with DIFFERENT unmanaged content. The gate
+        // must refuse to overwrite (preserves user content) AND must
+        // signal SkippedNotManaged so the caller can warn.
+        let target_path = target_dir.join(synthetic.path);
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(&target_path, "# Different unmanaged content\n").unwrap();
+
+        let outcome = sync_builtin_detailed(&synthetic, target_dir).unwrap();
+        assert_eq!(
+            outcome,
+            SyncOutcome::SkippedNotManaged,
+            "drift between unmanaged source and unmanaged dest must surface as \
+             SkippedNotManaged, not collapse into a silent false return"
+        );
+        assert!(
+            !outcome.wrote(),
+            "SkippedNotManaged must be a no-write outcome (preserves user content)"
+        );
+
+        // Identical unmanaged content → Unchanged (genuine no-op,
+        // distinct from SkippedNotManaged so callers don't false-positive
+        // warn on the happy path).
+        std::fs::write(&target_path, synthetic.content).unwrap();
+        let outcome = sync_builtin_detailed(&synthetic, target_dir).unwrap();
+        assert_eq!(
+            outcome,
+            SyncOutcome::Unchanged,
+            "matching unmanaged content must surface as Unchanged, not \
+             SkippedNotManaged — surfacing it would noise up the warn channel"
+        );
+    }
+
+    /// cas-4900 regression: `SyncResult::skipped_files` must be populated
+    /// when the inner sync loop encounters a `SkippedNotManaged` outcome,
+    /// and `has_silent_skips()` must report it. This is what the
+    /// `cas update --sync` CLI surfacing reads from to print warnings.
+    #[test]
+    fn test_sync_result_tracks_silent_skips_for_cli_surfacing() {
+        let mut result = SyncResult::default();
+        assert!(!result.has_silent_skips());
+        result.skipped_files.push("skills/foo/references/bar.md".to_string());
+        assert!(
+            result.has_silent_skips(),
+            "any populated skipped_files entry must flip has_silent_skips() to true"
+        );
+        assert_eq!(result.skipped_files.len(), 1);
     }
 
     #[test]
