@@ -202,32 +202,47 @@ mod cases {
         assert!(!Pane::update_alt_screen(&data, true));
     }
 
-    // ---- cas-e0b9 characterization tests (BUGGY current behavior) -----------
+    // ---- cas-e0b9: CSI sub-parameter handling --------------------------------
     //
-    // These tests assert what the scanner *currently* does on inputs it
-    // should handle but doesn't. They will be flipped to the correct
-    // assertions in the cas-e0b9 fix commit. Until then they prove the bug
-    // is reachable from a unit test.
+    // ECMA-48 §5.4.2 allows sub-parameters after a parameter via `;` (param
+    // separator) or `:` (sub-parameter separator). xterm emitters routinely
+    // produce e.g. `\x1b[?1049;1h`. The scanner consumes any run of
+    // `[0-9;:]` after the first parameter and then evaluates `h`/`l` against
+    // the leading mode number — so the sub-parameter does not block
+    // alt-screen detection.
 
     #[test]
-    fn update_alt_screen_sub_param_currently_misses_bug_cas_e0b9() {
-        // ECMA-48 §5.4.2 allows sub-parameters after a parameter using `;` /
-        // `:` separators. xterm-style emitters can produce e.g.
-        // `\x1b[?1049;1h` (enter alt-screen with extra sub-arg). The current
-        // parser stops at `;`, sees a non-`h`/`l` final byte, and abandons
-        // the sequence — missing a real alt-screen entry.
-        let data = b"\x1b[?1049;1h";
-        // BUG: should be `true`. We assert the broken value to lock it in.
-        assert!(
-            !Pane::update_alt_screen(data, false),
-            "characterization: sub-param `1049;1h` is silently dropped today"
-        );
-        // Same shape with `:` per ECMA-48 sub-parameter separator.
-        let data = b"\x1b[?1049:1h";
-        assert!(
-            !Pane::update_alt_screen(data, false),
-            "characterization: sub-param `1049:1h` is silently dropped today"
-        );
+    fn update_alt_screen_handles_sub_param_with_semicolon_cas_e0b9() {
+        assert!(Pane::update_alt_screen(b"\x1b[?1049;1h", false));
+        assert!(!Pane::update_alt_screen(b"\x1b[?1049;1l", true));
+    }
+
+    #[test]
+    fn update_alt_screen_handles_sub_param_with_colon_cas_e0b9() {
+        assert!(Pane::update_alt_screen(b"\x1b[?1049:1h", false));
+        assert!(!Pane::update_alt_screen(b"\x1b[?1049:1l", true));
+    }
+
+    #[test]
+    fn update_alt_screen_handles_multi_param_chain_cas_e0b9() {
+        // Chain of additional parameters/sub-params — leading mode still wins.
+        assert!(Pane::update_alt_screen(b"\x1b[?1049;1;2:3h", false));
+        assert!(Pane::update_alt_screen(b"\x1b[?47;0h", false));
+    }
+
+    #[test]
+    fn update_alt_screen_sub_param_truncated_no_terminator() {
+        // Truncated mid-sub-param: scanner must not flip state, must not panic.
+        assert!(!Pane::update_alt_screen(b"\x1b[?1049;", false));
+        assert!(!Pane::update_alt_screen(b"\x1b[?1049;1", false));
+    }
+
+    #[test]
+    fn update_alt_screen_unknown_mode_with_sub_param_ignored() {
+        // A non-alt-screen mode (e.g. 25 = cursor visibility) with sub-params
+        // must not accidentally flip alt-screen state.
+        assert!(!Pane::update_alt_screen(b"\x1b[?25;1h", false));
+        assert!(Pane::update_alt_screen(b"\x1b[?25;1h", true));
     }
 
     #[test]

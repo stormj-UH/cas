@@ -488,25 +488,50 @@ impl Pane {
                 i += 1;
                 continue;
             }
-            // Scan past digits for the parameter value
+            // Scan past digits for the (first) parameter value.
             let param_start = i + 3;
             let mut j = param_start;
             while j < data.len() && data[j].is_ascii_digit() {
                 j += 1;
             }
             if j >= data.len() || j == param_start {
-                // Either truncated (j >= data.len()) or no digits — skip
+                // Either truncated (j >= data.len()) or no digits — skip.
                 i += 1;
                 continue;
             }
+            // Snapshot the first parameter before we (optionally) walk past
+            // ECMA-48 §5.4.2 sub-parameters / additional CSI parameters.
+            let param_end = j;
+            // ECMA-48 §5.4.2: parameters may carry sub-parameters separated
+            // by `:`, and multiple parameters may be joined by `;`. xterm
+            // emitters routinely produce e.g. `\x1b[?1049;1h`. We don't
+            // interpret the trailing parameters, but we must walk past any
+            // run of `[0-9;:]` so the final byte check sees `h`/`l` rather
+            // than the separator. (cas-e0b9 fix.)
+            if j < data.len() && (data[j] == b';' || data[j] == b':') {
+                while j < data.len()
+                    && (data[j].is_ascii_digit() || data[j] == b';' || data[j] == b':')
+                {
+                    j += 1;
+                }
+                if j >= data.len() {
+                    // Sequence is truncated mid-parameter — leave it for the
+                    // next chunk via the carry buffer. Skip to next ESC.
+                    i += 1;
+                    continue;
+                }
+            }
             let final_byte = data[j];
-            // Only care about h (set) or l (reset)
+            // Only care about h (set) or l (reset).
             if final_byte != b'h' && final_byte != b'l' {
                 i += 1;
                 continue;
             }
-            // Parse the parameter (ASCII digits only, bounded length — safe)
-            let param: u32 = data[param_start..j]
+            // Parse the first parameter (ASCII digits only, bounded length —
+            // safe). Sub-parameters/additional parameters are ignored: per
+            // xterm semantics, the leading mode value is what controls the
+            // alt-screen toggle.
+            let param: u32 = data[param_start..param_end]
                 .iter()
                 .fold(0u32, |acc, &b| acc.wrapping_mul(10).wrapping_add((b - b'0') as u32));
             match (param, final_byte) {
@@ -553,6 +578,9 @@ impl Pane {
 
         // Check whether the tail matches the prefix of a DEC private mode sequence.
         // Pattern: ESC [ ? {digits…}   — any strict prefix is "partial".
+        // `;` and `:` are also accepted in the parameter body to keep ECMA-48
+        // sub-parameter sequences (e.g. `ESC [ ? 1049 ; 1 h`) intact when the
+        // chunk boundary lands inside the parameters. (cas-e0b9 fix.)
         let is_partial = match tail {
             // Bare ESC at end
             [0x1b] => true,
@@ -560,8 +588,15 @@ impl Pane {
             [0x1b, b'['] => true,
             // ESC [ ?
             [0x1b, b'[', b'?'] => true,
-            // ESC [ ? {digits…} — no terminator yet
-            [0x1b, b'[', b'?', rest @ ..] if !rest.is_empty() && rest.iter().all(|b| b.is_ascii_digit()) => true,
+            // ESC [ ? {digits / sub-param separators…} — no terminator yet
+            [0x1b, b'[', b'?', rest @ ..]
+                if !rest.is_empty()
+                    && rest
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':') =>
+            {
+                true
+            }
             _ => false,
         };
 
@@ -751,12 +786,18 @@ impl Pane {
     /// Exposed publicly so external tests can simulate process termination on
     /// a non-PTY backend (e.g., `Pane::director`).
     ///
-    /// NOTE: this method intentionally does *not* reset `in_alt_screen` —
-    /// see cas-e0b9 characterization tests pinning the current behavior. The
-    /// fix commit on that task will change this.
+    /// Resets `in_alt_screen` to `false`. A TUI that exits abnormally (kill,
+    /// panic) never gets a chance to emit `\x1b[?1049l`, so without this
+    /// reset the flag would leak across the process boundary — leaving the
+    /// next process (or simply a redraw of the pane) with mis-routed wheel
+    /// events. (cas-e0b9 fix.)
     pub fn mark_exited(&mut self, code: Option<i32>) {
         self.exited = true;
         self.exit_code = code;
+        self.in_alt_screen = false;
+        // Drop any partial-sequence carry too: it belonged to the now-dead
+        // process and cannot be completed by the next one.
+        self.partial_esc.clear();
     }
 
     pub fn poll(&mut self) -> Option<PtyEvent> {
