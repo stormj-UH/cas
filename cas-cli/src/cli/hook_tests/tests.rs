@@ -339,52 +339,35 @@ fn first_hook_args<'a>(config: &'a serde_json::Value, event: &str) -> Option<Vec
         })
 }
 
-/// Characterize: hooks emitted by get_cas_hooks_config currently use the
-/// "command": "cas hook <Event>" shell-string form.
-///
-/// This is the CURRENT behaviour snapshot.  After the exec-form migration this
-/// test is updated to assert "args" array form instead (see
-/// hook_entries_emit_exec_form_args_array below).
+/// Characterize: hooks emitted by get_cas_hooks_config previously used the
+/// "command": "cas hook <Event>" shell-string form (pre-cas-7ecd baseline).
+/// Now that exec-form migration has landed this test asserts the *old* form is
+/// gone — kept as a regression guard rather than a forward assertion.
 #[test]
-fn hook_entries_emit_command_string_form() {
+fn hook_entries_no_longer_emit_command_string_form() {
     let config = get_cas_hooks_config(&HookConfig::default());
 
-    assert_eq!(
-        first_hook_command(&config, "SessionStart"),
-        Some("cas hook SessionStart"),
-        "SessionStart hook should use command string form"
-    );
-    assert_eq!(
-        first_hook_command(&config, "Stop"),
-        Some("cas hook Stop"),
-        "Stop hook should use command string form"
-    );
-    assert_eq!(
-        first_hook_command(&config, "PostToolUse"),
-        Some("cas hook PostToolUse"),
-        "PostToolUse hook should use command string form"
-    );
-    assert_eq!(
-        first_hook_command(&config, "PreToolUse"),
-        Some("cas hook PreToolUse"),
-        "PreToolUse hook should use command string form"
-    );
-    assert_eq!(
-        first_hook_command(&config, "SessionEnd"),
-        Some("cas hook SessionEnd"),
-        "SessionEnd hook should use command string form"
-    );
-    assert_eq!(
-        first_hook_command(&config, "UserPromptSubmit"),
-        Some("cas hook UserPromptSubmit"),
-        "UserPromptSubmit hook should use command string form"
-    );
+    for event in &[
+        "SessionStart",
+        "Stop",
+        "PostToolUse",
+        "PreToolUse",
+        "SessionEnd",
+        "UserPromptSubmit",
+    ] {
+        assert_eq!(
+            first_hook_command(&config, event),
+            None,
+            "{event} hook must not carry legacy command string after exec-form migration"
+        );
+    }
 }
 
-/// After the exec-form migration the above test will be replaced by this one.
-/// Disabled until migration lands (will fail on current code).
+/// After the exec-form migration (cas-7ecd) hooks emitted by
+/// get_cas_hooks_config use "args": ["cas", "hook", "<Event>"] so that Claude
+/// Code 2.1.139+ spawns them directly without a shell, eliminating quoting
+/// bugs when the `cas` binary path contains spaces or shell metacharacters.
 #[test]
-#[ignore = "exec-form not yet implemented — enabled as part of cas-7ecd migration commit"]
 fn hook_entries_emit_exec_form_args_array() {
     let config = get_cas_hooks_config(&HookConfig::default());
 
@@ -418,20 +401,4 @@ fn hook_entries_emit_exec_form_args_array() {
         Some(vec!["cas", "hook", "UserPromptSubmit"]),
         "UserPromptSubmit hook should use exec-form args array"
     );
-
-    // Sanity: no hook should have a "command" key any more (exec form only)
-    for event in &[
-        "SessionStart",
-        "Stop",
-        "PostToolUse",
-        "PreToolUse",
-        "SessionEnd",
-        "UserPromptSubmit",
-    ] {
-        assert_eq!(
-            first_hook_command(&config, event),
-            None,
-            "{event} hook must not carry legacy command string after exec-form migration"
-        );
-    }
 }

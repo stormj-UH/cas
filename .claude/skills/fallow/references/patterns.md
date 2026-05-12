@@ -707,6 +707,8 @@ Manual files:
 
 ### `.claude/settings.json`
 
+<!-- Shell-string form is intentional: the command uses $CLAUDE_PROJECT_DIR shell variable
+     expansion, which the exec-form "args" array does not support. -->
 ```json
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",

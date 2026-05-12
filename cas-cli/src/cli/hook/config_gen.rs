@@ -22,11 +22,15 @@ pub fn global_has_cas_hooks() -> bool {
 }
 
 /// Check if a settings JSON value contains any CAS hook entries.
+///
+/// Recognises both the legacy shell-string form (`"command": "cas hook ..."`)
+/// and the exec-form introduced in Claude Code 2.1.139
+/// (`"args": ["cas", "hook", ...]`) so that detection is backwards-compatible
+/// with existing settings.json files that have not yet been re-generated.
 pub fn has_cas_hook_entries(settings: &serde_json::Value) -> bool {
     let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
         return false;
     };
-    // Check if any hook event has a "cas hook" command
     for (_event, entries) in hooks {
         let Some(entries_arr) = entries.as_array() else {
             continue;
@@ -36,15 +40,40 @@ pub fn has_cas_hook_entries(settings: &serde_json::Value) -> bool {
                 continue;
             };
             for hook in hook_list {
+                // Legacy shell-string form
                 if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
                     if cmd.starts_with("cas hook ") {
                         return true;
                     }
                 }
+                // Exec form: ["cas", "hook", ...]
+                if is_cas_hook_args(hook) {
+                    return true;
+                }
             }
         }
     }
     false
+}
+
+/// Returns true when a hook JSON object uses exec-form `"args"` whose first two
+/// elements are `"cas"` and `"hook"`.
+fn is_cas_hook_args(hook: &serde_json::Value) -> bool {
+    let Some(args) = hook.get("args").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    args.first().and_then(|v| v.as_str()) == Some("cas")
+        && args.get(1).and_then(|v| v.as_str()) == Some("hook")
+}
+
+/// Returns true when a hook JSON object is a CAS exec-form or shell-form factory
+/// hook (`"args": ["cas", "factory", ...]` or `"command": "cas factory ..."`).
+fn is_cas_factory_args(hook: &serde_json::Value) -> bool {
+    let Some(args) = hook.get("args").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    args.first().and_then(|v| v.as_str()) == Some("cas")
+        && args.get(1).and_then(|v| v.as_str()) == Some("factory")
 }
 
 /// Strip CAS hook entries from a settings JSON value.
@@ -70,12 +99,19 @@ pub fn strip_cas_hooks(settings: &mut serde_json::Value) -> bool {
             let Some(hook_list) = entry.get("hooks").and_then(|h| h.as_array()) else {
                 return true; // keep non-standard entries
             };
-            // Remove entry if ALL its hooks are CAS hooks
+            // Remove entry if ALL its hooks are CAS hooks (shell form OR exec form)
             let all_cas = hook_list.iter().all(|hook| {
-                hook.get("command")
+                // Legacy shell-string form
+                let cmd_match = hook
+                    .get("command")
                     .and_then(|c| c.as_str())
-                    .map(|cmd| cmd.starts_with("cas hook ") || cmd.starts_with("cas factory "))
-                    .unwrap_or(false)
+                    .map(|cmd| {
+                        cmd.starts_with("cas hook ") || cmd.starts_with("cas factory ")
+                    })
+                    .unwrap_or(false);
+                // Exec-form (Claude Code 2.1.139+)
+                let args_match = is_cas_hook_args(hook) || is_cas_factory_args(hook);
+                cmd_match || args_match
             });
             !all_cas
         });
@@ -122,7 +158,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook SessionStart",
+                            "args": ["cas", "hook", "SessionStart"],
                             "timeout": config.session_start.timeout
                         }
                     ]
@@ -133,7 +169,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas factory check-staleness",
+                            "args": ["cas", "factory", "check-staleness"],
                             "timeout": 5000
                         }
                     ]
@@ -152,7 +188,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook SessionEnd",
+                            "args": ["cas", "hook", "SessionEnd"],
                             "timeout": config.session_start.timeout,
                             "async": true
                         }
@@ -170,7 +206,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook Stop",
+                            "args": ["cas", "hook", "Stop"],
                             "timeout": config.stop.timeout
                         }
                     ]
@@ -190,7 +226,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook SubagentStart",
+                            "args": ["cas", "hook", "SubagentStart"],
                             "timeout": 2000,
                             "async": true
                         }
@@ -210,7 +246,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook SubagentStop",
+                            "args": ["cas", "hook", "SubagentStop"],
                             "timeout": config.stop.timeout / 2, // Subagent cleanup is quicker
                             "async": true
                         }
@@ -231,7 +267,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PostToolUse",
+                            "args": ["cas", "hook", "PostToolUse"],
                             "timeout": config.post_tool_use.timeout,
                             "async": true
                         }
@@ -251,7 +287,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PreToolUse",
+                            "args": ["cas", "hook", "PreToolUse"],
                             "timeout": config.pre_tool_use.timeout
                         }
                     ]
@@ -268,7 +304,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook UserPromptSubmit",
+                            "args": ["cas", "hook", "UserPromptSubmit"],
                             "timeout": config.user_prompt_submit.timeout
                         }
                     ]
@@ -285,7 +321,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PermissionRequest",
+                            "args": ["cas", "hook", "PermissionRequest"],
                             "timeout": config.permission_request.timeout
                         }
                     ]
@@ -305,7 +341,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook Notification",
+                            "args": ["cas", "hook", "Notification"],
                             "timeout": config.notification.timeout,
                             "async": true
                         }
@@ -323,7 +359,7 @@ pub(crate) fn get_cas_hooks_config(config: &crate::config::HookConfig) -> serde_
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PreCompact",
+                            "args": ["cas", "hook", "PreCompact"],
                             "timeout": config.pre_compact.timeout
                         }
                     ]
