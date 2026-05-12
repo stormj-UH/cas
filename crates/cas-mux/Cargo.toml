@@ -41,8 +41,16 @@ indexmap = "2"
 # Unicode width detection for wide character support
 unicode-width = "0.2"
 
+# Fast SIMD byte search for hot scanner paths (e.g. update_alt_screen ESC fast-path)
+memchr = "2.7.6"
+
 [features]
 default = []
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = "0.6"
+
+[[bench]]
+name = "alt_screen_scan"
+harness = false

@@ -162,6 +162,60 @@ mod cases {
         assert!(!Pane::update_alt_screen(b"", false));
     }
 
+    // ---- memchr fast-path regression coverage (cas-219d) --------------------
+    //
+    // The scanner has a SIMD `memchr` fast-path that skips bulk non-ESC bytes.
+    // These tests pin down the behavioural invariants that the optimisation
+    // must preserve: large ESC-free inputs return the current state unchanged
+    // (and don't burn CPU), and ESC bytes embedded in bulk text are still
+    // matched against the DEC pattern correctly.
+
+    #[test]
+    fn update_alt_screen_esc_free_64k_preserves_state() {
+        // 64 KiB of ASCII with no 0x1b byte — must return the current state
+        // verbatim, regardless of polarity.
+        let mut data = Vec::with_capacity(64 * 1024);
+        let line = b"the quick brown fox jumps over the lazy dog 0123456789\n";
+        while data.len() < 64 * 1024 {
+            data.extend_from_slice(line);
+        }
+        data.truncate(64 * 1024);
+        assert!(!data.contains(&0x1b));
+
+        assert!(!Pane::update_alt_screen(&data, false));
+        assert!(Pane::update_alt_screen(&data, true));
+    }
+
+    #[test]
+    fn update_alt_screen_finds_match_after_long_run_of_ascii() {
+        // A real DEC 1049 h sequence buried at the end of a 64 KiB ASCII blob.
+        // This is the regression scenario for the memchr fast-path: it must
+        // still find and act on the embedded sequence rather than bailing
+        // because there was no ESC near the start.
+        let mut data = vec![b'.'; 64 * 1024];
+        data.extend_from_slice(b"\x1b[?1049h");
+        assert!(Pane::update_alt_screen(&data, false));
+
+        // Same shape, exiting: a 1049 l after a long run must flip state back.
+        let mut data = vec![b'.'; 64 * 1024];
+        data.extend_from_slice(b"\x1b[?1049l");
+        assert!(!Pane::update_alt_screen(&data, true));
+    }
+
+    #[test]
+    fn update_alt_screen_sparse_non_dec_esc_ignored() {
+        // ESC bytes followed by non-'[' must not be treated as DEC sequences.
+        // The fast-path advances past each ESC; correctness is verified by
+        // the final state being the unchanged `current` value.
+        let mut data = Vec::with_capacity(8 * 1024);
+        let chunk = b"normal text\x1bX more text\x1bY tail";
+        while data.len() < 8 * 1024 {
+            data.extend_from_slice(chunk);
+        }
+        assert!(!Pane::update_alt_screen(&data, false));
+        assert!(Pane::update_alt_screen(&data, true));
+    }
+
     // =========================================================================
     // trailing_dec_partial unit tests — verify carry-buffer detection
     // =========================================================================

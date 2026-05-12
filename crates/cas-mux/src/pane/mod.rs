@@ -467,12 +467,19 @@ impl Pane {
         let mut state = current;
         let mut i = 0;
         while i < data.len() {
-            // Fast pre-check: must start with ESC [ ?
-            // We need at least 5 bytes for the shortest sequence: ESC [ ? N h/l
-            if data[i] != 0x1b {
-                i += 1;
-                continue;
+            // Fast-path: skip directly to the next ESC byte using SIMD memchr.
+            // Typical PTY output (Claude Code, factory worker streams) is dense
+            // ASCII with ~1 ESC per 50-200 bytes — this turns the steady-state
+            // cost of the scanner from O(n) byte-by-byte into O(n/16) SIMD.
+            //
+            // Semantics-preserving: every byte that is not 0x1b would otherwise
+            // hit the `data[i] != 0x1b => i += 1; continue;` branch, so jumping
+            // straight to the next ESC is observationally identical.
+            match memchr::memchr(0x1b, &data[i..]) {
+                Some(off) => i += off,
+                None => break,
             }
+            // i now points at an ESC byte. Re-run the existing structural checks.
             if i + 1 >= data.len() || data[i + 1] != b'[' {
                 i += 1;
                 continue;
@@ -510,6 +517,16 @@ impl Pane {
             i = j + 1;
         }
         state
+    }
+
+    /// Bench-only re-export of `update_alt_screen`.
+    ///
+    /// Bench harnesses live outside the lib crate and only see `pub` items, so
+    /// this thin wrapper exposes the otherwise-private scanner without
+    /// widening the public surface. Not intended for production callers.
+    #[doc(hidden)]
+    pub fn update_alt_screen_for_bench(data: &[u8], current: bool) -> bool {
+        Self::update_alt_screen(data, current)
     }
 
     /// Return the trailing bytes of `data` that look like the start of a DEC
