@@ -104,6 +104,14 @@ pub struct Config {
     /// gate or is deferred to the supervisor's review queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<CodeReviewConfig>,
+
+    /// `[memory]` — opt-in auto-extraction via the `session-learn` skill
+    /// (cas-39f5, EPIC cas-ebea). Defaults to `None` (i.e. the auto-trigger
+    /// from the `Stop` hook is disabled); set `session_learn_auto = true`
+    /// to enable classifier-driven memory drafts. Manual skill invocation
+    /// is unaffected by this flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
 }
 
 impl Config {

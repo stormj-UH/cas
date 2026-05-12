@@ -121,3 +121,71 @@ fn test_sync_conflict_creation() {
     // Should not panic
     conflict.log();
 }
+
+// ---------------------------------------------------------------------------
+// PushResponse: defensive client read of server-side cross-project skips.
+// cas-f645 — paired with cas-d656 / cas-0bdc on the server.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn push_response_default_has_no_skipped_field() {
+    // Sanity: the legacy "trust the 200" path relies on the default having
+    // `skipped == None` so skipped_count_for(_) returns 0.
+    let resp = PushResponse::default();
+    assert!(resp.skipped.is_none());
+    assert_eq!(resp.skipped_count_for("entries"), 0);
+    assert_eq!(resp.skipped_count_for("tasks"), 0);
+}
+
+#[test]
+fn push_response_parses_skipped_field() {
+    // The forward-looking wire shape: server returns a per-entity-type map.
+    let body = r#"{"skipped":{"entries":3,"tasks":0}}"#;
+    let resp: PushResponse = serde_json::from_str(body).expect("must parse");
+    assert_eq!(resp.skipped_count_for("entries"), 3);
+    // Explicit 0 in the map is still reported as 0.
+    assert_eq!(resp.skipped_count_for("tasks"), 0);
+    // Entity types not in the map are also 0 — distinguishes "no skip" from
+    // "we never sent any of these" downstream.
+    assert_eq!(resp.skipped_count_for("rules"), 0);
+}
+
+#[test]
+fn push_response_is_backward_compatible_with_legacy_payload() {
+    // Older cloud builds may return shapes like {"synced": {...}} or just
+    // an empty body. Either must deserialize into a PushResponse whose
+    // skipped field is None, so the client falls back to legacy
+    // mark-synced behavior rather than treating the absence as "all
+    // skipped".
+    let legacy_synced_shape =
+        r#"{"synced":{"entries":5,"tasks":0,"rules":0,"skills":0,"sessions":0,
+                     "verifications":0,"events":0,"prompts":0,"file_changes":0,
+                     "commit_links":0,"agents":0,"worktrees":0}}"#;
+    let resp: PushResponse = serde_json::from_str(legacy_synced_shape)
+        .expect("legacy {synced:...} body must still deserialize");
+    assert!(resp.skipped.is_none());
+    assert_eq!(resp.skipped_count_for("entries"), 0);
+
+    // Truly empty object — same expectation.
+    let resp: PushResponse =
+        serde_json::from_str("{}").expect("empty JSON object must deserialize");
+    assert!(resp.skipped.is_none());
+    assert_eq!(resp.skipped_count_for("entries"), 0);
+}
+
+#[test]
+fn push_response_skipped_count_threshold_drives_warn_path() {
+    // This is the contract `push_batch` reads to decide whether to call
+    // `mark_synced`: any non-zero count for the targeted entity type
+    // triggers the warn-and-skip path; zero (or absent) triggers the
+    // legacy mark-synced path. The test locks in the threshold so future
+    // refactors of `skipped_count_for` can't silently change the gate.
+    let body = r#"{"skipped":{"entries":1}}"#;
+    let resp: PushResponse = serde_json::from_str(body).unwrap();
+    assert!(resp.skipped_count_for("entries") > 0, "warn-path must fire");
+    assert_eq!(
+        resp.skipped_count_for("tasks"),
+        0,
+        "non-targeted entity types must not fire the warn-path"
+    );
+}

@@ -667,6 +667,30 @@ impl CodeReviewConfig {
     }
 }
 
+/// `[memory]` — gates auto-extraction behavior for the session-learn skill
+/// (cas-39f5, EPIC cas-ebea). Default-off so the v1 rollout opts in per-user
+/// rather than spending a Haiku call (~$0.001, ~1–3 s) on every `Stop` hook
+/// invocation without explicit consent.
+///
+/// ```toml
+/// [memory]
+/// session_learn_auto = true   # opt in to auto-extraction on Stop
+/// ```
+///
+/// Manual invocation of the `session-learn` skill works regardless of this
+/// flag — the flag only gates the auto-trigger from the `Stop` hook
+/// handler.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    /// When `true`, the `Stop` hook runs the `session-learn` classifier
+    /// against the session transcript and writes draft memories through
+    /// the existing `mcp__cas__memory remember` overlap-detection gate.
+    /// Defaults to `false` — v1 ships as opt-in until the false-positive
+    /// rate is measured against real session traffic.
+    #[serde(default)]
+    pub session_learn_auto: bool,
+}
+
 /// `[integrations]` — gates Phase-3 doctor-and-banner behavior for the
 /// vercel/neon/github auto-integration family (EPIC cas-b65f). Default-off
 /// across the board so an absent or empty section preserves the prior UX.
@@ -714,6 +738,48 @@ mod tests {
         let fc = parsed.get("factory").expect("section present");
         assert_eq!(fc.cargo_build_jobs, FactoryConfig::default().cargo_build_jobs);
         assert_eq!(fc.nice_cargo, FactoryConfig::default().nice_cargo);
+    }
+
+    /// cas-39f5: the `[memory]` section must default `session_learn_auto`
+    /// to `false`. A regression that flips the default to `true` would
+    /// silently start spending Haiku tokens on every `Stop` hook in every
+    /// install — exactly the failure mode the kill-switch was designed
+    /// to prevent. Round-trip an empty `[memory]` section to confirm the
+    /// serde default, and parse the explicit-true form to confirm the
+    /// opt-in path still works.
+    #[test]
+    fn memory_config_defaults_session_learn_auto_off() {
+        let default_cfg = MemoryConfig::default();
+        assert!(
+            !default_cfg.session_learn_auto,
+            "MemoryConfig::default().session_learn_auto must be false — the \
+             v1 rollout is opt-in. Flipping this default is the wrong way to \
+             enable session-learn; users must set the flag in .cas/config.toml."
+        );
+    }
+
+    #[test]
+    fn memory_config_roundtrips_through_toml_empty_section() {
+        let toml_str = "[memory]\n";
+        let parsed: std::collections::HashMap<String, MemoryConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let mc = parsed.get("memory").expect("section present");
+        assert!(
+            !mc.session_learn_auto,
+            "empty [memory] section must deserialize with session_learn_auto = false"
+        );
+    }
+
+    #[test]
+    fn memory_config_roundtrips_explicit_opt_in() {
+        let toml_str = "[memory]\nsession_learn_auto = true\n";
+        let parsed: std::collections::HashMap<String, MemoryConfig> =
+            toml::from_str(toml_str).expect("valid toml");
+        let mc = parsed.get("memory").expect("section present");
+        assert!(
+            mc.session_learn_auto,
+            "explicit session_learn_auto = true must deserialize as opt-in"
+        );
     }
 
     // ── LlmConfig::reasoning_effort_for_role ─────────────────────────────────

@@ -3,8 +3,9 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
 use std::time::Instant;
+use tracing::warn;
 
-use crate::cloud::syncer::{CloudSyncer, SyncResult};
+use crate::cloud::syncer::{CloudSyncer, PushResponse, SyncResult};
 use crate::cloud::{QueuedSync, SyncOperation, get_project_canonical_id};
 use crate::error::CasError;
 use crate::types::Session;
@@ -288,10 +289,44 @@ impl CloudSyncer {
                     sub_batch.into_iter().unzip();
 
                 match self.push_sub_batch(values, entity_type, token) {
-                    Ok(()) => {
-                        for item in &batch_items {
-                            let _ = self.queue.mark_synced(item.id);
-                            synced_count += 1;
+                    Ok(response) => {
+                        // Defensive cross-check against the server-side
+                        // `ON CONFLICT DO UPDATE ... WHERE false` silent-skip
+                        // path (cas-0bdc / cas-d656): if the server reports
+                        // any rows skipped for this entity type, we cannot
+                        // know *which* items in `batch_items` were dropped
+                        // (the server returns a count, not IDs). Conservative
+                        // policy: leave the entire sub-batch un-marked-synced
+                        // so all items remain retryable in the local queue.
+                        // The next push cycle will re-send them; if the
+                        // underlying cross-project conflict still stands the
+                        // user will keep seeing the warning until the
+                        // project_canonical_id mismatch is resolved.
+                        //
+                        // Backward-compat: older cloud builds omit `skipped`
+                        // entirely, in which case `skipped_count` is 0 and
+                        // we fall through to the legacy mark-synced path.
+                        let skipped_count = response.skipped_count_for(entity_type);
+                        if skipped_count > 0 {
+                            let batch_size = batch_items.len();
+                            warn!(
+                                entity_type = entity_type,
+                                skipped = skipped_count,
+                                batch_size = batch_size,
+                                "Cloud server skipped {skipped_count} {entity_type} row(s) in a sub-batch of {batch_size} \
+                                 (likely cross-project project_canonical_id conflict); leaving sub-batch un-synced for retry",
+                            );
+                            // Do NOT mark items synced and do NOT return an
+                            // Err here: the HTTP call itself succeeded; only
+                            // some rows were silently rejected. Leaving items
+                            // un-touched keeps them retryable in the local
+                            // queue. Continuing the loop lets later
+                            // sub-batches and entity types proceed normally.
+                        } else {
+                            for item in &batch_items {
+                                let _ = self.queue.mark_synced(item.id);
+                                synced_count += 1;
+                            }
                         }
                     }
                     Err(e) => {
@@ -388,12 +423,22 @@ impl CloudSyncer {
     }
 
     /// Push a single sub-batch of upsert values with retry.
+    ///
+    /// Returns the parsed [`PushResponse`] on success. Callers should
+    /// inspect `PushResponse::skipped_count_for(entity_type)` and treat any
+    /// non-zero count as a signal that the server silently skipped some
+    /// rows (see `PushResponse` docs and cas-f645 for the cross-project
+    /// conflict contract). When the response body is empty or fails to
+    /// parse (e.g. older cloud build returning a different shape), a
+    /// `PushResponse::default()` is returned — `skipped` is then `None`,
+    /// which `skipped_count_for` reports as `0`, preserving legacy
+    /// "trust the 200" behavior.
     fn push_sub_batch(
         &self,
         values: Vec<serde_json::Value>,
         entity_type: &str,
         token: &str,
-    ) -> Result<(), CasError> {
+    ) -> Result<PushResponse, CasError> {
         let push_url = format!("{}/api/sync/push", self.cloud_config.endpoint);
 
         let mut payload = serde_json::Map::new();
@@ -437,7 +482,19 @@ impl CloudSyncer {
             match response {
                 Ok(resp) => {
                     if resp.status() == 200 || resp.status() == 201 {
-                        return Ok(());
+                        // Read body so we can defensively inspect the
+                        // server's `skipped` field. Treat parse failures
+                        // (empty body, older cloud shape) as
+                        // `PushResponse::default()` for backward compat —
+                        // the 2xx status is the source of truth that the
+                        // HTTP exchange itself succeeded.
+                        let body = resp.into_string().unwrap_or_default();
+                        let parsed: PushResponse = if body.is_empty() {
+                            PushResponse::default()
+                        } else {
+                            serde_json::from_str(&body).unwrap_or_default()
+                        };
+                        return Ok(parsed);
                     } else {
                         let status = resp.status();
                         let body = resp.into_string().unwrap_or_default();

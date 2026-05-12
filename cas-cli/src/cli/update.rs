@@ -372,6 +372,31 @@ fn sync_claude_files(cli: &Cli, cas_root_param: Option<&Path>) -> anyhow::Result
             fmt.success("Built-ins up to date")?;
         }
 
+        // cas-4900: surface silent skips so stale destinations stop
+        // accumulating invisibly. Each entry here is a file whose
+        // on-disk content differs from the source but lacks
+        // `managed_by: cas` in either frontmatter, so the gate refused
+        // to overwrite. Pre-9362ee0 this whole class of files was
+        // silently skipped with no signal whatsoever; now the user
+        // sees the list and can decide.
+        if builtin_result.has_silent_skips() {
+            fmt.write_raw("  ")?;
+            fmt.warning(&format!(
+                "{} file(s) at destination differ from source but were NOT updated \
+                 because neither side carries `managed_by: cas` frontmatter (cas-4900):",
+                builtin_result.skipped_files.len()
+            ))?;
+            for file in &builtin_result.skipped_files {
+                fmt.write_raw(&format!("    ! {file}"))?;
+                fmt.newline()?;
+            }
+            fmt.write_raw("    ")?;
+            fmt.write_raw(
+                "(add `managed_by: cas` to the source frontmatter to enable updates)",
+            )?;
+            fmt.newline()?;
+        }
+
         // Report database rule sync
         if rule_report.synced > 0 || rule_report.removed > 0 {
             fmt.write_raw("  ")?;

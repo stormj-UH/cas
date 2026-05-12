@@ -3,6 +3,7 @@
 //! Handles pushing queued changes to cloud and pulling updates from cloud.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -354,6 +355,59 @@ pub struct TeamProject {
 #[derive(Debug, Deserialize)]
 struct TeamPushResponse {
     synced: SyncedCounts,
+}
+
+/// Response shape from the personal push endpoint (`POST /api/sync/push`).
+///
+/// Backward-compatible contract: every field is `#[serde(default)]` so a
+/// JSON body that omits one or all of them still deserializes cleanly to
+/// `PushResponse::default()`. Older cloud builds that do not yet emit
+/// `skipped` will be observed as `skipped: None`, and the client falls back
+/// to legacy "trust the 200" behavior.
+///
+/// # `skipped` semantics (paired with cas-d656 server change)
+///
+/// When the cloud server's push route encounters a row whose
+/// `project_canonical_id` does not match the existing row at the same primary
+/// key, Postgres `ON CONFLICT DO UPDATE ... WHERE false ... RETURNING`
+/// silently excludes that row from the result set. The server tallies the
+/// excluded count per entity type and surfaces it here so the client can:
+///
+/// 1. Emit a structured warning to ops/users.
+/// 2. Leave the affected local queue items un-marked-synced so they remain
+///    retryable instead of being silently dropped from the local sync queue.
+///
+/// The shape is a `HashMap<String, usize>` (rather than a fixed-field struct)
+/// so the wire format can grow new entity types without forcing a
+/// client-version bump. Keys are the same entity-type strings the client
+/// already uses (`"entries"`, `"tasks"`, `"rules"`, `"skills"`, etc.).
+///
+/// See cas-f645 for the client defensive read; cas-d656 for the server.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct PushResponse {
+    /// Per-entity-type count of rows the server skipped (cross-project
+    /// conflicts). `None` when the server build predates this field.
+    #[serde(default)]
+    pub skipped: Option<HashMap<String, usize>>,
+}
+
+impl PushResponse {
+    /// Number of rows the server reported skipped for `entity_type`.
+    ///
+    /// Returns `0` both when no skip was reported for that entity type and
+    /// when the server omitted the `skipped` field entirely (older build).
+    /// Callers cannot distinguish "no skip" from "old server" — that
+    /// ambiguity is intentional: under either condition the safe behavior
+    /// is the legacy mark-synced path. The server-side schema NOT-NULL
+    /// constraint from cas-d656 + the route-level rejection from cas-0bdc
+    /// remain the actual guards; this client read is a defensive cross-check.
+    pub fn skipped_count_for(&self, entity_type: &str) -> usize {
+        self.skipped
+            .as_ref()
+            .and_then(|m| m.get(entity_type))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Sync counts in push response
