@@ -50,6 +50,16 @@ pub struct SyncResult {
     pub pulled_rules: usize,
     /// Number of skills pulled
     pub pulled_skills: usize,
+    /// Number of specs pulled
+    pub pulled_specs: usize,
+    /// Number of events pulled
+    pub pulled_events: usize,
+    /// Number of prompts pulled
+    pub pulled_prompts: usize,
+    /// Number of file changes pulled
+    pub pulled_file_changes: usize,
+    /// Number of commit links pulled
+    pub pulled_commit_links: usize,
     /// Number of conflicts resolved
     pub conflicts_resolved: usize,
     /// Errors encountered during sync
@@ -75,7 +85,15 @@ impl SyncResult {
     }
 
     pub fn total_pulled(&self) -> usize {
-        self.pulled_entries + self.pulled_tasks + self.pulled_rules + self.pulled_skills
+        self.pulled_entries
+            + self.pulled_tasks
+            + self.pulled_rules
+            + self.pulled_skills
+            + self.pulled_specs
+            + self.pulled_events
+            + self.pulled_prompts
+            + self.pulled_file_changes
+            + self.pulled_commit_links
     }
 
     pub fn has_errors(&self) -> bool {
@@ -277,6 +295,22 @@ struct PullResponse {
     rules: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     skills: Option<Vec<serde_json::Value>>,
+    // cas-bba4: re-added entity kinds, formerly imported unscoped by the
+    // inline `cas cloud pull` path that cas-ed15 collapsed. Each is
+    // `Option<Vec<_>>` with `#[serde(default)]` so a cloud build that
+    // omits the field deserializes cleanly (zero rows). `specs` is not
+    // yet returned by the cloud as of 2026-05-12 — tracked in
+    // `docs/requests/FEATURE-cloud-sync-pull-return-specs.md`.
+    #[serde(default)]
+    specs: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    events: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    prompts: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    file_changes: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    commit_links: Option<Vec<serde_json::Value>>,
     pulled_at: Option<String>,
 }
 

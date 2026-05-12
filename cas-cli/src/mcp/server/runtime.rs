@@ -16,7 +16,10 @@ async fn run_server_impl() -> anyhow::Result<()> {
     use crate::cloud::{CloudConfig, CloudSyncer, CloudSyncerConfig, SyncQueue};
     use crate::mcp::daemon::{EmbeddedDaemonConfig, spawn_daemon};
     use crate::mcp::tools::CasService;
-    use crate::store::{open_rule_store, open_skill_store, open_store, open_task_store};
+    use crate::store::{
+        open_commit_link_store, open_event_store, open_file_change_store, open_prompt_store,
+        open_rule_store, open_skill_store, open_spec_store, open_store, open_task_store,
+    };
     use rmcp::ServiceExt;
     use rmcp::transport::stdio;
 
@@ -103,12 +106,32 @@ async fn run_server_impl() -> anyhow::Result<()> {
                     let Ok(skill_store) = open_skill_store(&cas_root_bg) else {
                         return;
                     };
+                    let Ok(spec_store) = open_spec_store(&cas_root_bg) else {
+                        return;
+                    };
+                    let Ok(event_store) = open_event_store(&cas_root_bg) else {
+                        return;
+                    };
+                    let Ok(prompt_store) = open_prompt_store(&cas_root_bg) else {
+                        return;
+                    };
+                    let Ok(file_change_store) = open_file_change_store(&cas_root_bg) else {
+                        return;
+                    };
+                    let Ok(commit_link_store) = open_commit_link_store(&cas_root_bg) else {
+                        return;
+                    };
 
                     match syncer.pull(
                         store.as_ref(),
                         task_store.as_ref(),
                         rule_store.as_ref(),
                         skill_store.as_ref(),
+                        spec_store.as_ref(),
+                        event_store.as_ref(),
+                        prompt_store.as_ref(),
+                        file_change_store.as_ref(),
+                        commit_link_store.as_ref(),
                     ) {
                         Ok(result) if result.total_pulled() > 0 => {
                             eprintln!("[CAS] Synced {} items from cloud", result.total_pulled());
