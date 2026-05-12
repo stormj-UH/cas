@@ -1,5 +1,43 @@
 use crate::ui::factory::app::imports::*;
 
+// =============================================================================
+// Scroll dispatch types and constants
+// =============================================================================
+
+/// Outcome returned by [`FactoryApp::handle_scroll_up`] /
+/// [`FactoryApp::handle_scroll_down`].
+///
+/// The caller uses this to decide whether to forward an escape sequence to the
+/// focused PTY (alt-screen path) or to leave the result as-is (the handler
+/// already performed the scroll).
+#[derive(Debug, PartialEq)]
+pub enum ScrollAction {
+    /// Scroll was handled internally — by a dialog overlay, sidecar, Mission
+    /// Control panel, or regular host-side scrollback.
+    Done,
+    /// The focused pane is in alt-screen mode and no overlay is suppressing
+    /// forwarding.  The caller must send the appropriate PTY escape sequence:
+    /// [`SCROLL_UP_ARROWS`] / [`SCROLL_DOWN_ARROWS`] for wheel events, or
+    /// `\x1b[5~` / `\x1b[6~` for PgUp / PgDn.
+    AltScreen,
+}
+
+/// Number of lines scrolled per wheel tick (host scrollback) *and* the number
+/// of arrow-key repeats forwarded to an alt-screen PTY.
+pub const SCROLL_LINES: usize = 3;
+
+/// Arrow-up bytes forwarded to an alt-screen PTY on scroll-up (ESC\[A × [`SCROLL_LINES`]).
+pub const SCROLL_UP_ARROWS: &[u8] = b"\x1b[A\x1b[A\x1b[A";
+/// Arrow-down bytes forwarded to an alt-screen PTY on scroll-down (ESC\[B × [`SCROLL_LINES`]).
+pub const SCROLL_DOWN_ARROWS: &[u8] = b"\x1b[B\x1b[B\x1b[B";
+
+// Compile-time assertion: byte count must stay in sync with SCROLL_LINES.
+// Each arrow sequence is 3 bytes (ESC [ A/B).
+const _: () = {
+    assert!(SCROLL_UP_ARROWS.len() == SCROLL_LINES * 3);
+    assert!(SCROLL_DOWN_ARROWS.len() == SCROLL_LINES * 3);
+};
+
 impl FactoryApp {
     // ========================================================================
     // Sidecar navigation
@@ -278,8 +316,19 @@ impl FactoryApp {
         names
     }
 
-    /// Handle mouse scroll up
-    pub fn handle_scroll_up(&mut self) {
+    /// Handle mouse scroll up.
+    ///
+    /// Returns [`ScrollAction::AltScreen`] when the focused pane is in
+    /// alt-screen mode and no overlay suppresses forwarding — the caller must
+    /// send [`SCROLL_UP_ARROWS`] (wheel) or `\x1b[5~` (PgUp) to the PTY.
+    /// Returns [`ScrollAction::Done`] in all other cases (the scroll was
+    /// handled internally by a dialog, sidecar, MC panel, or host scrollback).
+    ///
+    /// This is the **single source of truth** for the "where does scroll go?"
+    /// decision.  Adding a new dialog flag requires only one additional
+    /// `else if` branch here; alt-screen suppression is automatic because the
+    /// alt-screen check lives in the final `else` arm.
+    pub fn handle_scroll_up(&mut self) -> ScrollAction {
         if self.show_task_dialog {
             self.task_dialog_scroll = self.task_dialog_scroll.saturating_sub(1);
         } else if self.show_reminder_dialog {
@@ -293,12 +342,26 @@ impl FactoryApp {
         } else if self.sidecar_focus != SidecarFocus::None {
             self.sidecar_scroll_up();
         } else {
-            self.scroll_focused_pane(-3);
+            // No dialog, active MC panel, or sidecar consuming the scroll.
+            // Suppress alt-screen forwarding when the help overlay is open or
+            // when Mission Control is active at the overview level (mc_focus ==
+            // None) — in both cases fall through to normal host scrollback.
+            let suppress_alt = self.show_help || self.is_mission_control();
+            if !suppress_alt && self.mux.focused_is_in_alt_screen() {
+                return ScrollAction::AltScreen;
+            }
+            self.scroll_focused_pane(-(SCROLL_LINES as i32));
         }
+        ScrollAction::Done
     }
 
-    /// Handle mouse scroll down
-    pub fn handle_scroll_down(&mut self) {
+    /// Handle mouse scroll down.
+    ///
+    /// Mirror of [`handle_scroll_up`].  Returns [`ScrollAction::AltScreen`]
+    /// when the focused pane is in alt-screen mode and no overlay suppresses
+    /// forwarding — the caller must send [`SCROLL_DOWN_ARROWS`] (wheel) or
+    /// `\x1b[6~` (PgDn) to the PTY.
+    pub fn handle_scroll_down(&mut self) -> ScrollAction {
         if self.show_task_dialog {
             self.task_dialog_scroll =
                 (self.task_dialog_scroll + 1).min(self.task_dialog_max_scroll);
@@ -314,8 +377,13 @@ impl FactoryApp {
         } else if self.sidecar_focus != SidecarFocus::None {
             self.sidecar_scroll_down();
         } else {
-            self.scroll_focused_pane(3);
+            let suppress_alt = self.show_help || self.is_mission_control();
+            if !suppress_alt && self.mux.focused_is_in_alt_screen() {
+                return ScrollAction::AltScreen;
+            }
+            self.scroll_focused_pane(SCROLL_LINES as i32);
         }
+        ScrollAction::Done
     }
 
     /// Convert screen coordinates to the pane at that position.
@@ -360,47 +428,6 @@ impl FactoryApp {
     pub fn scroll_focused_pane(&mut self, delta: i32) {
         if let Err(e) = self.mux.scroll_focused(delta) {
             tracing::warn!("Failed to scroll focused pane: {}", e);
-        }
-    }
-
-    /// Return the bytes to forward to the focused PTY when a mouse-wheel scroll
-    /// event arrives while the inner process is in alt-screen mode.
-    ///
-    /// Returns `Some(bytes)` only when **all** of the following are true:
-    /// 1. No overlay is open (help, task dialog, reminder dialog, changes
-    ///    dialog) — those handle scroll themselves or should suppress forwarding.
-    /// 2. The sidecar is not focused.
-    /// 3. Mission Control is not active.
-    /// 4. The focused pane's inner process is in alt-screen mode.
-    ///
-    /// When `Some` is returned the caller should forward the bytes to the
-    /// focused PTY (e.g., `mux.send_input(bytes).await`) instead of calling
-    /// `handle_scroll_up/down`. The payload is 3× arrow-up or arrow-down
-    /// (matching the `scroll_focused_pane(±3)` line granularity).
-    ///
-    /// Returns `None` in all other cases — the normal `handle_scroll_up/down`
-    /// path should be used.
-    pub fn alt_screen_scroll_input(&self, scroll_up: bool) -> Option<&'static [u8]> {
-        // Suppress forwarding whenever any overlay/dialog is visible, the
-        // sidecar has focus, or Mission Control is the active view.
-        if self.show_help
-            || self.show_task_dialog
-            || self.show_reminder_dialog
-            || self.show_changes_dialog
-            || self.sidecar_focus != SidecarFocus::None
-            || self.is_mission_control()
-        {
-            return None;
-        }
-        if self.mux.focused_is_in_alt_screen() {
-            // 3 arrows = same line granularity as scroll_focused_pane(±3)
-            if scroll_up {
-                Some(b"\x1b[A\x1b[A\x1b[A")
-            } else {
-                Some(b"\x1b[B\x1b[B\x1b[B")
-            }
-        } else {
-            None
         }
     }
 
@@ -869,7 +896,7 @@ impl FactoryApp {
 }
 
 // =============================================================================
-// Unit tests for alt_screen_scroll_input guard logic (cas-d5fa)
+// Unit tests for scroll dispatch guard logic (cas-d5fa / cas-5cfd)
 // =============================================================================
 #[cfg(test)]
 mod tests {
@@ -893,19 +920,21 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Baseline: returns Some when nothing blocks forwarding
+    // Baseline: AltScreen returned when nothing blocks forwarding
     // -------------------------------------------------------------------------
 
     #[test]
-    fn alt_screen_scroll_input_returns_some_when_clear() {
-        let app = app_with_alt_screen();
-        assert!(
-            app.alt_screen_scroll_input(true).is_some(),
-            "should forward scroll when no overlay and focused pane is in alt-screen"
+    fn scroll_returns_alt_screen_when_clear() {
+        let mut app = app_with_alt_screen();
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::AltScreen,
+            "should signal AltScreen when no overlay and focused pane is in alt-screen"
         );
-        assert!(
-            app.alt_screen_scroll_input(false).is_some(),
-            "down should also forward"
+        assert_eq!(
+            app.handle_scroll_down(),
+            ScrollAction::AltScreen,
+            "down should also signal AltScreen"
         );
     }
 
@@ -916,15 +945,19 @@ mod tests {
     /// When the help overlay is open, wheel events must NOT be forwarded to the
     /// PTY even if the focused pane is in alt-screen.
     #[test]
-    fn alt_screen_scroll_input_blocked_by_show_help() {
+    fn scroll_blocked_by_show_help() {
         let mut app = app_with_alt_screen();
         app.show_help = true;
-        assert!(
-            app.alt_screen_scroll_input(true).is_none(),
-            "show_help must suppress alt-screen wheel forwarding"
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
+            "show_help must suppress alt-screen wheel forwarding (up)"
         );
-        assert!(
-            app.alt_screen_scroll_input(false).is_none(),
+        // Re-arm alt-screen (handle_scroll_up performed host scrollback)
+        app.mux.get_mut("test-pane").unwrap().feed(b"\x1b[?1049h").unwrap();
+        assert_eq!(
+            app.handle_scroll_down(),
+            ScrollAction::Done,
             "show_help must suppress alt-screen wheel forwarding (down)"
         );
     }
@@ -934,10 +967,9 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// When Mission Control is active with mc_focus == None (overview, no panel
-    /// focused), alt_screen_scroll_input must still return None so that wheel
-    /// events do not silently forward to a background worker PTY.
+    /// focused), scroll must NOT be forwarded to the background worker PTY.
     #[test]
-    fn alt_screen_scroll_input_blocked_by_mc_focus_none() {
+    fn scroll_blocked_by_mc_focus_none() {
         let mut app = app_with_alt_screen();
         // Activate MC and ensure mc_focus is None (default after entering MC)
         app.factory_view_mode = crate::ui::factory::renderer::FactoryViewMode::MissionControl;
@@ -946,61 +978,63 @@ mod tests {
             app.is_mission_control(),
             "precondition: MC is active"
         );
-        assert!(
-            app.alt_screen_scroll_input(true).is_none(),
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
             "MC active + mc_focus==None must suppress alt-screen wheel forwarding"
         );
     }
 
     /// When Mission Control is active with a non-None mc_focus, forwarding must
-    /// also be suppressed (this was correctly handled before the P1 #1 fix and
-    /// must remain working).
+    /// also be suppressed (MC panel handles the scroll).
     #[test]
-    fn alt_screen_scroll_input_blocked_by_mc_focus_workers() {
+    fn scroll_blocked_by_mc_focus_workers() {
         let mut app = app_with_alt_screen();
         app.factory_view_mode = crate::ui::factory::renderer::FactoryViewMode::MissionControl;
         app.mc_focus = crate::ui::factory::renderer::MissionControlFocus::Workers;
-        assert!(
-            app.alt_screen_scroll_input(true).is_none(),
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
             "MC active + mc_focus==Workers must suppress alt-screen wheel forwarding"
         );
     }
 
     // -------------------------------------------------------------------------
-    // P2 #5: PgUp/PgDn dispatch pre-condition tests
+    // PgUp/PgDn dispatch pre-condition tests
     //
     // The actual byte dispatch happens in `client_input.rs`; these tests verify
-    // that `alt_screen_scroll_input` (used as the dispatch gate) returns the
-    // correct signal for the PgUp/PgDn branch.
+    // that `handle_scroll_up/down` returns the correct signal for the
+    // PgUp/PgDn branch.
     // -------------------------------------------------------------------------
 
     /// When the focused pane is in alt-screen and no overlay is active,
-    /// `alt_screen_scroll_input(true)` returns `Some` — so the PgUp dispatch
-    /// path in `client_input.rs` will call `mux.send_input(b"\x1b[5~")`.
+    /// `handle_scroll_up()` returns `AltScreen` — the PgUp dispatch path in
+    /// `client_input.rs` will call `mux.send_input(b"\x1b[5~")`.
     #[test]
     fn pgup_dispatch_fires_when_alt_screen_active() {
-        let app = app_with_alt_screen();
-        assert!(
-            app.alt_screen_scroll_input(true).is_some(),
-            "PgUp: should return Some (dispatch sends \\x1b[5~) when alt-screen active"
+        let mut app = app_with_alt_screen();
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::AltScreen,
+            "PgUp: should return AltScreen (dispatch sends \\x1b[5~) when alt-screen active"
         );
     }
 
     /// When the focused pane is in alt-screen and no overlay is active,
-    /// `alt_screen_scroll_input(false)` returns `Some` — so the PgDn dispatch
-    /// path in `client_input.rs` will call `mux.send_input(b"\x1b[6~")`.
+    /// `handle_scroll_down()` returns `AltScreen` — the PgDn dispatch path in
+    /// `client_input.rs` will call `mux.send_input(b"\x1b[6~")`.
     #[test]
     fn pgdn_dispatch_fires_when_alt_screen_active() {
-        let app = app_with_alt_screen();
-        assert!(
-            app.alt_screen_scroll_input(false).is_some(),
-            "PgDn: should return Some (dispatch sends \\x1b[6~) when alt-screen active"
+        let mut app = app_with_alt_screen();
+        assert_eq!(
+            app.handle_scroll_down(),
+            ScrollAction::AltScreen,
+            "PgDn: should return AltScreen (dispatch sends \\x1b[6~) when alt-screen active"
         );
     }
 
-    /// When the focused pane is NOT in alt-screen, `alt_screen_scroll_input`
-    /// returns `None` — so PgUp falls through to `handle_scroll_up` (normal
-    /// scrollback scroll), and PgDn falls through to `handle_scroll_down`.
+    /// When the focused pane is NOT in alt-screen, `handle_scroll_up/down`
+    /// returns `Done` — PgUp/PgDn fall through to normal host scrollback.
     #[test]
     fn pgup_pgdn_fall_through_when_not_in_alt_screen() {
         let mut app = FactoryApp::for_test();
@@ -1010,18 +1044,20 @@ mod tests {
         // Normal screen (no alt-screen entry)
         assert!(!app.mux.focused_is_in_alt_screen());
 
-        assert!(
-            app.alt_screen_scroll_input(true).is_none(),
-            "PgUp: should fall through to handle_scroll_up when not in alt-screen"
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
+            "PgUp: normal screen must return Done (host scrollback, not PTY forward)"
         );
-        assert!(
-            app.alt_screen_scroll_input(false).is_none(),
-            "PgDn: should fall through to handle_scroll_down when not in alt-screen"
+        assert_eq!(
+            app.handle_scroll_down(),
+            ScrollAction::Done,
+            "PgDn: normal screen must return Done (host scrollback, not PTY forward)"
         );
     }
 
-    /// Wheel scroll (non-alt-screen) must NOT change when PgUp/PgDn code is
-    /// present — regression guard for normal scrollback path.
+    /// Wheel scroll on a normal (non-alt-screen) pane must return Done so the
+    /// caller performs host scrollback rather than forwarding to the PTY.
     #[test]
     fn wheel_scroll_no_regress_when_not_in_alt_screen() {
         let mut app = FactoryApp::for_test();
@@ -1034,10 +1070,10 @@ mod tests {
                 p.feed(format!("Line {i}\r\n").as_bytes()).unwrap();
             }
         }
-        // alt_screen_scroll_input returns None → handle_scroll_up is used
-        assert!(
-            app.alt_screen_scroll_input(true).is_none(),
-            "normal screen: must use handle_scroll_up path, not PTY forward"
+        assert_eq!(
+            app.handle_scroll_up(),
+            ScrollAction::Done,
+            "normal screen: must return Done (use host scrollback, not PTY forward)"
         );
     }
 }

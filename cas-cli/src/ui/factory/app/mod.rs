@@ -30,6 +30,12 @@ mod sidecar_and_selection;
 // Re-export from cas-factory for backward compatibility
 pub use cas_factory::{AutoPromptConfig, EpicState, FactoryConfig};
 
+// Re-export scroll dispatch types so callers in sibling crates can use them
+// without reaching into the private `sidecar_and_selection` submodule.
+pub use sidecar_and_selection::{
+    SCROLL_DOWN_ARROWS, SCROLL_LINES, SCROLL_UP_ARROWS, ScrollAction,
+};
+
 /// Booting state for a worker that is being spawned (after prepare, before finish)
 #[derive(Debug, Clone)]
 pub struct PendingWorkerState {

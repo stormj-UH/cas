@@ -157,36 +157,33 @@ impl FactoryDaemon {
                                 ControlEvent::MouseScrollUp => {
                                     if self.app.show_changes_dialog {
                                         self.app.diff_scroll_up();
-                                    } else if let Some(bytes) =
-                                        self.app.alt_screen_scroll_input(true)
+                                    } else if self.app.handle_scroll_up() == ScrollAction::AltScreen
                                     {
                                         // Focused pane is in alt-screen — forward as
                                         // arrow-up keys so the inner TUI can scroll.
                                         tracing::debug!(
                                             "alt-screen scroll up: forwarding {} arrow-up bytes to PTY",
-                                            bytes.len() / 3
+                                            SCROLL_LINES
                                         );
-                                        let _ = self.app.mux.send_input(bytes).await;
-                                    } else {
-                                        self.app.handle_scroll_up();
+                                        let _ = self.app.mux.send_input(SCROLL_UP_ARROWS).await;
                                     }
+                                    // ScrollAction::Done: scroll was handled by handle_scroll_up.
                                 }
                                 ControlEvent::MouseScrollDown => {
                                     if self.app.show_changes_dialog {
                                         self.app.diff_scroll_down();
-                                    } else if let Some(bytes) =
-                                        self.app.alt_screen_scroll_input(false)
+                                    } else if self.app.handle_scroll_down()
+                                        == ScrollAction::AltScreen
                                     {
                                         // Focused pane is in alt-screen — forward as
                                         // arrow-down keys so the inner TUI can scroll.
                                         tracing::debug!(
                                             "alt-screen scroll down: forwarding {} arrow-down bytes to PTY",
-                                            bytes.len() / 3
+                                            SCROLL_LINES
                                         );
-                                        let _ = self.app.mux.send_input(bytes).await;
-                                    } else {
-                                        self.app.handle_scroll_down();
+                                        let _ = self.app.mux.send_input(SCROLL_DOWN_ARROWS).await;
                                     }
+                                    // ScrollAction::Done: scroll was handled by handle_scroll_down.
                                 }
                                 ControlEvent::MouseClick { col, row } => {
                                     self.app.handle_mouse_click(col, row);
@@ -375,8 +372,12 @@ impl FactoryDaemon {
                         }
                     } else {
                         match input[i + 2] {
-                            b'A' => self.app.handle_scroll_up(),   // Up arrow
-                            b'B' => self.app.handle_scroll_down(), // Down arrow
+                            // Arrow keys in task-dialog / help overlay:
+                            // handle_scroll_up/down will route to the dialog's scroll
+                            // or host scrollback; AltScreen is suppressed in those
+                            // contexts so we discard the return value.
+                            b'A' => { self.app.handle_scroll_up(); }   // Up arrow
+                            b'B' => { self.app.handle_scroll_down(); } // Down arrow
                             _ => {}
                         }
                     }
@@ -427,8 +428,11 @@ impl FactoryDaemon {
                     }
                 } else {
                     match byte {
-                        b'j' => self.app.handle_scroll_down(),
-                        b'k' => self.app.handle_scroll_up(),
+                        // Vim-style scroll bindings.  AltScreen is not forwarded
+                        // here (these bindings predate the alt-screen path); the
+                        // return value is intentionally discarded.
+                        b'j' => { self.app.handle_scroll_down(); }
+                        b'k' => { self.app.handle_scroll_up(); }
                         b'?' => {
                             if self.app.show_help {
                                 self.app.show_help = false;
@@ -629,21 +633,26 @@ impl FactoryDaemon {
                     } else {
                         self.app.diff_scroll_down();
                     }
-                } else if self.app.alt_screen_scroll_input(is_pgup).is_some() {
-                    // Focused pane is in alt-screen — send the native page-scroll
-                    // sequence so the inner TUI can handle it (PgUp/PgDn is more
-                    // than 3 lines; let the app decide).
-                    let seq: &[u8] = if is_pgup { b"\x1b[5~" } else { b"\x1b[6~" };
-                    tracing::debug!(
-                        "alt-screen pg{}: forwarding {:?} to PTY",
-                        if is_pgup { "up" } else { "dn" },
-                        seq,
-                    );
-                    let _ = self.app.mux.send_input(seq).await;
-                } else if is_pgup {
-                    self.app.handle_scroll_up();
                 } else {
-                    self.app.handle_scroll_down();
+                    // Route through the unified dispatch helper.  When the focused pane
+                    // is in alt-screen the helper returns AltScreen — send the native
+                    // page-scroll sequence so the inner TUI can handle paging (PgUp/PgDn
+                    // is more than 3 lines; let the app decide).  Otherwise Done means
+                    // the scroll was handled internally (dialog, sidecar, MC, scrollback).
+                    let action = if is_pgup {
+                        self.app.handle_scroll_up()
+                    } else {
+                        self.app.handle_scroll_down()
+                    };
+                    if action == ScrollAction::AltScreen {
+                        let seq: &[u8] = if is_pgup { b"\x1b[5~" } else { b"\x1b[6~" };
+                        tracing::debug!(
+                            "alt-screen pg{}: forwarding {:?} to PTY",
+                            if is_pgup { "up" } else { "dn" },
+                            seq,
+                        );
+                        let _ = self.app.mux.send_input(seq).await;
+                    }
                 }
                 i += 4;
                 continue;
