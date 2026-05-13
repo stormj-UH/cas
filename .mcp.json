@@ -21,20 +21,15 @@
       "url": "https://api.githubcopilot.com/mcp/"
     },
     "neon": {
-      "args": [
-        "-y",
-        "@neondatabase/mcp-server-neon@0.6.5",
-        "start",
-        "${NEON_API_KEY}"
-      ],
-      "command": "npx"
+      "type": "http",
+      "url": "https://mcp.neon.tech/mcp"
     },
     "playwright": {
       "args": [
         "-y",
         "@playwright/mcp@0.0.70",
         "--user-data-dir",
-        "/home/pippenz/.playwright-mcp-profile",
+        "${HOME}/.playwright-mcp-profile",
         "--browser",
         "chrome"
       ],
