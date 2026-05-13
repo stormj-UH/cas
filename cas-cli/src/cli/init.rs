@@ -230,6 +230,7 @@ impl WizardConfig {
             integrations: None,
             code_review: None,
             memory: None,
+            project: None,
         }
     }
 }

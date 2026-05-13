@@ -33,6 +33,9 @@ pub enum CloudCommands {
     /// Configure the active team for team-scoped sync operations
     #[command(subcommand)]
     Team(CloudTeamCommands),
+    /// Configure the project canonical slug (overrides auto-derivation)
+    #[command(subcommand)]
+    Project(CloudProjectCommands),
     /// List team projects in cloud
     Projects(CloudProjectsArgs),
     /// Pull team memories for the current project
@@ -64,6 +67,24 @@ pub enum CloudTeamCommands {
 pub struct CloudTeamSetArgs {
     /// Team UUID (e.g., 550e8400-e29b-41d4-a716-446655440000)
     pub id: String,
+}
+
+/// Subcommands for `cas cloud project` (cas-1ced).
+///
+/// Manual override for the project canonical slug used to scope cloud-sync
+/// pushes/pulls. Normally `cas cloud team set` auto-derives the slug from
+/// `.cas/config.toml` then from the git remote — use this subcommand when
+/// auto-derivation fails (monorepo, custom layout, non-git checkout).
+#[derive(Subcommand)]
+pub enum CloudProjectCommands {
+    /// Set the project canonical id (writes `.cas/config.toml [project] canonical_id`)
+    Set(CloudProjectSetArgs),
+}
+
+#[derive(Parser)]
+pub struct CloudProjectSetArgs {
+    /// Canonical project slug (e.g., `github.com/foo/bar`)
+    pub canonical_id: String,
 }
 
 #[derive(Parser)]
@@ -154,7 +175,8 @@ pub fn execute(cmd: &CloudCommands, cli: &Cli, cas_root: &Path) -> anyhow::Resul
         CloudCommands::Push(args) => execute_push(args, cli, cas_root),
         CloudCommands::Pull(args) => execute_pull(args, cli, cas_root),
         CloudCommands::Sync(args) => execute_sync(args, cli, cas_root),
-        CloudCommands::Team(cmd) => execute_team(cmd, cli),
+        CloudCommands::Team(cmd) => execute_team(cmd, cli, cas_root),
+        CloudCommands::Project(cmd) => execute_project(cmd, cli, cas_root),
         CloudCommands::Projects(args) => execute_projects(args, cli),
         CloudCommands::TeamMemories(args) => execute_team_memories(args, cli, cas_root),
         CloudCommands::PurgeForeign(args) => execute_purge_foreign(args, cli, cas_root),
@@ -244,18 +266,83 @@ fn probe_team_membership(endpoint: &str, token: &str, team_uuid: &str) -> TeamPr
     }
 }
 
-fn execute_team(cmd: &CloudTeamCommands, cli: &Cli) -> anyhow::Result<()> {
+/// Dispatcher for `cas cloud team` subcommands.
+///
+/// `pub` + `#[doc(hidden)]` so `cas-cli/tests/team_set_slug_resolution_test.rs`
+/// can exercise the slug-resolution wiring against a wiremock server (matches
+/// the same pattern used by `execute_sync` / `execute_team_pull`).
+#[doc(hidden)]
+pub fn execute_team(
+    cmd: &CloudTeamCommands,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
     match cmd {
-        CloudTeamCommands::Set(args) => execute_team_set(args, cli),
-        CloudTeamCommands::Show => execute_team_show(cli),
+        CloudTeamCommands::Set(args) => execute_team_set(args, cli, cas_root),
+        CloudTeamCommands::Show => execute_team_show(cli, cas_root).map(|_| ()),
         CloudTeamCommands::Clear => execute_team_clear(cli),
     }
 }
 
-fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
+/// Dispatcher for `cas cloud project` subcommands (cas-1ced).
+///
+/// Manual override path for `[project] canonical_id` in `.cas/config.toml`.
+/// `pub` + `#[doc(hidden)]` for the same integration-test reason as
+/// `execute_team`.
+#[doc(hidden)]
+pub fn execute_project(
+    cmd: &CloudProjectCommands,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    match cmd {
+        CloudProjectCommands::Set(args) => execute_project_set(args, cli, cas_root),
+    }
+}
+
+/// Write `[project] canonical_id = "<value>"` to `<cas_root>/config.toml`
+/// and confirm. Used by `cas cloud project set` when auto-derivation in
+/// `cas cloud team set` cannot resolve a slug (monorepo / custom layout /
+/// non-git directory).
+fn execute_project_set(
+    args: &CloudProjectSetArgs,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
+    crate::cloud::set_canonical_id_in_config_toml(cas_root, &args.canonical_id)?;
+    if cli.json {
+        let out = serde_json::json!({
+            "status": "ok",
+            "canonical_id": args.canonical_id,
+        });
+        println!("{}", out);
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let success_color = fmt.theme().palette.status_success;
+        fmt.newline()?;
+        fmt.write_colored("  \u{2713} ", success_color)?;
+        fmt.write_raw("Project canonical id set")?;
+        fmt.newline()?;
+        fmt.write_muted("  canonical_id: ")?;
+        fmt.write_raw(&args.canonical_id)?;
+        fmt.newline()?;
+    }
+    Ok(())
+}
+
+fn execute_team_set(
+    args: &CloudTeamSetArgs,
+    cli: &Cli,
+    cas_root: &Path,
+) -> anyhow::Result<()> {
     // Load config before parsing so the error path can build an
     // endpoint-aware dashboard URL ("find your team UUID at …").
-    let mut config = CloudConfig::load()?;
+    // `load_from_cas_dir` (rather than `load()`) so the test harness can
+    // point team_set at a tempdir via the same `cas_root` it threads
+    // through the rest of the cloud-cmd dispatcher.
+    let mut config = CloudConfig::load_from_cas_dir(cas_root)?;
 
     let uuid = parse_team_uuid(&args.id).map_err(|short| {
         anyhow::anyhow!("{}", format_uuid_error(&short, &config.endpoint))
@@ -277,13 +364,27 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
             // in T7 docs) can populate team_slug when it lands.
             config.team_id = Some(uuid.clone());
             config.team_slug = None;
-            config.save()?;
+            config.save_to_cas_dir(cas_root)?;
+
+            // cas-1ced: eagerly resolve project canonical_id so the first
+            // sync from a new clone doesn't go out with the wrong scope.
+            // Resolution order: existing config.toml → git remote →
+            // defer (do NOT default to the working-directory basename,
+            // that's the exact bug this task fixes).
+            let slug = resolve_project_slug_for_team_set(cas_root);
 
             if cli.json {
+                let (resolved, source) = match &slug {
+                    SlugResolution::FromConfig(s) => (Some(s.as_str()), "config_toml"),
+                    SlugResolution::FromGitRemote(s) => (Some(s.as_str()), "git_remote"),
+                    SlugResolution::NotResolved => (None, "deferred"),
+                };
                 let out = serde_json::json!({
                     "status": "ok",
                     "team_id": uuid,
                     "team_slug": serde_json::Value::Null,
+                    "canonical_id": resolved,
+                    "canonical_id_source": source,
                 });
                 println!("{}", out);
             } else {
@@ -298,8 +399,26 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
                 fmt.write_muted("  UUID: ")?;
                 fmt.write_raw(&uuid)?;
                 fmt.newline()?;
-                fmt.write_muted("  Slug resolution deferred — see `cas cloud team show`")?;
-                fmt.newline()?;
+                match &slug {
+                    SlugResolution::FromConfig(s) => {
+                        fmt.write_muted("  Project slug: ")?;
+                        fmt.write_raw(s)?;
+                        fmt.write_muted(" (from .cas/config.toml)")?;
+                        fmt.newline()?;
+                    }
+                    SlugResolution::FromGitRemote(s) => {
+                        fmt.write_muted("  Project slug: ")?;
+                        fmt.write_raw(s)?;
+                        fmt.write_muted(" (derived from git remote)")?;
+                        fmt.newline()?;
+                    }
+                    SlugResolution::NotResolved => {
+                        fmt.write_muted(
+                            "  Slug resolution deferred — run `cas cloud project set <canonical-id>`",
+                        )?;
+                        fmt.newline()?;
+                    }
+                }
             }
             Ok(())
         }
@@ -318,15 +437,78 @@ fn execute_team_set(args: &CloudTeamSetArgs, cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
-    let config = CloudConfig::load()?;
+/// Outcome of the eager slug-resolution flow run by `cas cloud team set`
+/// (cas-1ced).
+///
+/// Three states, in priority order:
+///  - `FromConfig` — `.cas/config.toml [project] canonical_id` already
+///    held a value. We leave it alone (source of truth).
+///  - `FromGitRemote` — derived from `git remote get-url origin`. The
+///    helper writes it to `.cas/config.toml` so subsequent resolves are
+///    `FromConfig`.
+///  - `NotResolved` — neither yielded a value. The handler keeps the
+///    "deferred" message and explicitly does NOT default to the
+///    working-directory basename (that's the bug this task fixes).
+#[doc(hidden)]
+pub enum SlugResolution {
+    FromConfig(String),
+    FromGitRemote(String),
+    NotResolved,
+}
+
+/// Run the slug-resolution flow against `cas_root`. Reads config.toml
+/// first; falls back to git-remote derivation; persists the derived value
+/// to config.toml on success. Best-effort write: a write failure
+/// downgrades the result to `NotResolved` rather than failing the team
+/// set as a whole (the team_id was already persisted by the caller).
+fn resolve_project_slug_for_team_set(cas_root: &Path) -> SlugResolution {
+    if let Some(slug) = crate::cloud::canonical_id_from_config_toml(cas_root) {
+        return SlugResolution::FromConfig(slug);
+    }
+    if let Some(slug) = crate::cloud::derive_canonical_id_from_git_remote(cas_root) {
+        if crate::cloud::set_canonical_id_in_config_toml(cas_root, &slug).is_ok() {
+            return SlugResolution::FromGitRemote(slug);
+        }
+    }
+    SlugResolution::NotResolved
+}
+
+/// Pure-data variant of `execute_team_show` — builds the JSON payload
+/// without doing IO. Used by `execute_team_show` and exposed (via the
+/// `_for_test` wrapper) so integration tests can assert on the shape
+/// without capturing stdout. cas-1ced.
+fn team_show_json(cas_root: &Path) -> anyhow::Result<serde_json::Value> {
+    let config = CloudConfig::load_from_cas_dir(cas_root)?;
+    let canonical_id = crate::cloud::canonical_id_from_config_toml(cas_root);
+    Ok(serde_json::json!({
+        "team_id": config.team_id,
+        "team_slug": config.team_slug,
+        "canonical_id": canonical_id,
+    }))
+}
+
+/// Test-only entrypoint that returns the rendered JSON string. `pub` so
+/// `cas-cli/tests/team_set_slug_resolution_test.rs` can assert on the
+/// composed output (team UUID + resolved project slug) without capturing
+/// stdout. `#[doc(hidden)]` so it doesn't pollute the public API surface.
+#[doc(hidden)]
+pub fn execute_team_show_for_test(_cli: &Cli, cas_root: &Path) -> anyhow::Result<String> {
+    let value = team_show_json(cas_root)?;
+    Ok(value.to_string())
+}
+
+fn execute_team_show(cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+    let config = CloudConfig::load_from_cas_dir(cas_root)?;
 
     match (&config.team_id, &config.team_slug) {
         (Some(id), slug) => {
+            // cas-1ced: also surface the resolved project slug.
+            let canonical_id = crate::cloud::canonical_id_from_config_toml(cas_root);
             if cli.json {
                 let out = serde_json::json!({
                     "team_id": id,
                     "team_slug": slug,
+                    "canonical_id": canonical_id,
                 });
                 println!("{}", out);
             } else {
@@ -334,11 +516,14 @@ fn execute_team_show(cli: &Cli) -> anyhow::Result<()> {
                 let mut out = io::stdout();
                 let mut fmt = Formatter::stdout(&mut out, theme);
                 fmt.newline()?;
-                fmt.write_muted("  Team ID:   ")?;
+                fmt.write_muted("  Team ID:      ")?;
                 fmt.write_raw(id)?;
                 fmt.newline()?;
-                fmt.write_muted("  Team slug: ")?;
+                fmt.write_muted("  Team slug:    ")?;
                 fmt.write_raw(slug.as_deref().unwrap_or("<not resolved>"))?;
+                fmt.newline()?;
+                fmt.write_muted("  Project slug: ")?;
+                fmt.write_raw(canonical_id.as_deref().unwrap_or("<not resolved>"))?;
                 fmt.newline()?;
             }
         }

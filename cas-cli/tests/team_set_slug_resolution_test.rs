@@ -35,10 +35,9 @@ mod common;
 use common::{TEST_TEAM, make_cli_json};
 
 use cas::cli::cloud::{
-    CloudProjectCommands, CloudProjectSetArgs, CloudTeamSetArgs, execute_project, execute_team,
-    execute_team_show_for_test,
+    CloudProjectCommands, CloudProjectSetArgs, CloudTeamCommands, CloudTeamSetArgs,
+    execute_project, execute_team, execute_team_show_for_test,
 };
-use cas::cli::cloud::CloudTeamCommands;
 use cas::cloud::CloudConfig;
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
