@@ -406,9 +406,20 @@ impl CasService {
             ));
 
             output.push_str("\nPulling team data...\n");
+            // cas-53d5: pull_team now takes project_id explicitly for
+            // per-(team, project) watermark scoping. Resolve at the
+            // caller; bail if we're not inside a CAS project (same
+            // contract as the syncer's prior internal resolve).
+            let project_id = crate::cloud::get_project_canonical_id().ok_or_else(|| {
+                Self::error(
+                    ErrorCode::INTERNAL_ERROR,
+                    "Team pull failed: not inside a CAS project directory".to_string(),
+                )
+            })?;
             let pull_result = syncer
                 .pull_team(
                     &team_id,
+                    &project_id,
                     store.as_ref(),
                     task_store.as_ref(),
                     rule_store.as_ref(),

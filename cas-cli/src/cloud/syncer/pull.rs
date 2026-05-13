@@ -684,10 +684,25 @@ impl CloudSyncer {
         })
     }
 
-    /// Pull team data from cloud and merge into local store
+    /// Pull team data from cloud and merge into local store.
+    ///
+    /// `project_id` is the canonical project ID for the current scope
+    /// (typically `cas::cloud::get_project_canonical_id()` at the caller
+    /// site). Taking it as a parameter (rather than resolving inside the
+    /// function) keeps the watermark scope explicit AND avoids the
+    /// process-wide cache in `get_project_canonical_id` which would make
+    /// it impossible to exercise the cross-project watermark behavior
+    /// in a single test process. The value is used for:
+    /// - The `last_team_pull_at_{team_id}_{project_id}` metadata key
+    ///   (cas-53d5 — per-(team, project) watermark scoping, fixes the
+    ///   "second project sees stale `since=` from the first" regression
+    ///   that surfaced as hypothesis #2 of the cas-ffc4 bug doc).
+    /// - The `project_id=` URL query param.
+    /// - The client-side `entity_matches_project` filter.
     pub fn pull_team(
         &self,
         team_id: &str,
+        project_id: &str,
         store: &dyn Store,
         task_store: &dyn TaskStore,
         rule_store: &dyn RuleStore,
@@ -706,8 +721,14 @@ impl CloudSyncer {
             .as_ref()
             .ok_or_else(|| CasError::Other("Not logged in".to_string()))?;
 
-        // Get last pull timestamp for this team
-        let since_key = format!("last_team_pull_at_{team_id}");
+        // Get last pull timestamp for this (team_id, project_id) scope.
+        // cas-53d5: re-keyed from the old `last_team_pull_at_{team_id}`.
+        // Absence of the new-format key is treated as "first sync into
+        // this scope" — we send no `since=`, triggering a full backfill.
+        // This is the bug fix: previously the global-per-team watermark
+        // leaked across projects, causing the second project to skip its
+        // historical backfill.
+        let since_key = format!("last_team_pull_at_{team_id}_{project_id}");
         let since = self.queue.get_metadata(&since_key)?;
 
         let mut pull_url = format!(
@@ -718,8 +739,6 @@ impl CloudSyncer {
         if let Some(since) = &since {
             params.push(format!("since={since}"));
         }
-        let project_id = get_project_canonical_id()
-            .ok_or_else(|| CasError::Other("Cannot pull: not inside a CAS project directory".to_string()))?;
         params.push(format!("project_id={}", project_id.replace('/', "%2F")));
         if !params.is_empty() {
             pull_url = format!("{pull_url}?{}", params.join("&"));
@@ -750,8 +769,12 @@ impl CloudSyncer {
         #[cfg(debug_assertions)]
         eprintln!("[CAS sync] Starting team pull: team={team_id} strategy={strategy:?}");
 
-        // Use the already-resolved project ID for client-side validation
-        let current_project_id = &project_id;
+        // Use the caller-supplied project ID for client-side validation.
+        // (cas-53d5: previously resolved internally via
+        // `get_project_canonical_id`; now passed in as a function
+        // parameter so the watermark key, URL param, and entity-filter
+        // all agree on a single explicit scope.)
+        let current_project_id = project_id;
 
         // Process entries
         for raw_entry in body.entries.unwrap_or_default() {
@@ -853,9 +876,17 @@ impl CloudSyncer {
             }
         }
 
-        // Update team pull timestamp
+        // Update team pull timestamp under the new per-(team, project)
+        // key. On successful write, best-effort retire the legacy
+        // `last_team_pull_at_{team_id}` global-per-team key — once the
+        // new-format key exists for any project under this team, the
+        // legacy key is dead metadata that would otherwise sit forever.
+        // Best-effort: a delete failure here cannot regress the pull
+        // result, so we swallow the error.
         if let Some(pulled_at) = body.pulled_at {
             let _ = self.queue.set_metadata(&since_key, &pulled_at);
+            let legacy_key = format!("last_team_pull_at_{team_id}");
+            let _ = self.queue.delete_metadata(&legacy_key);
         }
 
         result.duration_ms = start.elapsed().as_millis() as u64;
