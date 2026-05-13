@@ -1,6 +1,25 @@
 use cas_factory::AutoPromptConfig;
 use serde::{Deserialize, Serialize};
 
+/// Project-scoped configuration. Lives at `[project]` in `.cas/config.toml`.
+///
+/// `canonical_id` is the project's canonical slug used to scope cloud-sync
+/// pushes/pulls. When set, it takes precedence over the working-directory
+/// folder-name fallback baked into `resolve_canonical_id()`. Set eagerly
+/// by `cas cloud team set` (auto-derived from git remote when possible)
+/// or manually via `cas cloud project set <canonical-id>`. Closes the
+/// onboarding gap (cas-1ced / EPIC cas-ffc4 hypothesis #3) where a clone
+/// directory named differently from the canonical slug routed
+/// pushes/pulls to a phantom project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    /// Canonical project slug (e.g. `github.com/owner/repo`). When absent,
+    /// the resolver falls back to the parent-directory folder name, then
+    /// to a path-hash slug for the fs-root edge case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
+}
+
 /// Sync configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {

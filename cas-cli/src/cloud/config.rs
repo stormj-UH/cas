@@ -58,11 +58,160 @@ pub fn get_project_canonical_id() -> Option<String> {
     result
 }
 
-/// Pure composition of the folder-name derivation and the path-hash fallback.
-/// Extracted from `get_project_canonical_id` so the `.or_else` chain is testable
+/// Pure composition of the canonical-id resolution chain.
+/// Extracted from `get_project_canonical_id` so the chain is testable
 /// without the `OnceLock` static — callers should prefer the cached public API.
+///
+/// Resolution order (highest priority first):
+///  1. `.cas/config.toml [project] canonical_id` — explicit source of truth,
+///     set eagerly by `cas cloud team set` or manually via
+///     `cas cloud project set` (cas-1ced).
+///  2. Parent-directory folder name — legacy default that ships before
+///     team_set lands a config-toml entry.
+///  3. Path-hash fallback — for the `.cas/` at filesystem root edge case.
 pub fn resolve_canonical_id(cas_root: &Path) -> Option<String> {
-    canonical_id_from_cas_root(cas_root).or_else(|| fallback_project_id_from_path(cas_root))
+    canonical_id_from_config_toml(cas_root)
+        .or_else(|| canonical_id_from_cas_root(cas_root))
+        .or_else(|| fallback_project_id_from_path(cas_root))
+}
+
+/// Read `[project] canonical_id` from `<cas_root>/config.toml`. Returns
+/// `None` when the file is missing, parse fails, the `[project]` block is
+/// absent, or `canonical_id` is unset. This is a best-effort read — any
+/// failure falls through to the next resolution step.
+pub fn canonical_id_from_config_toml(cas_root: &Path) -> Option<String> {
+    let toml_path = cas_root.join("config.toml");
+    let content = std::fs::read_to_string(&toml_path).ok()?;
+    let parsed: toml::Value = toml::from_str(&content).ok()?;
+    parsed
+        .get("project")?
+        .get("canonical_id")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Write `[project] canonical_id = "<value>"` to `<cas_root>/config.toml`,
+/// preserving any other existing sections. Read-modify-write via the `toml`
+/// crate so prior `[memory]`, `[code_review]`, etc. blocks survive.
+///
+/// Returns `Err` only on IO or TOML serialization failure. Callers should
+/// surface the error — the value did NOT land if this fails.
+pub fn set_canonical_id_in_config_toml(
+    cas_root: &Path,
+    canonical_id: &str,
+) -> Result<(), CasError> {
+    let toml_path = cas_root.join("config.toml");
+
+    // Read-modify-write: parse existing content (or start with empty table
+    // if absent), update [project].canonical_id, serialize back.
+    let mut doc: toml::Value = match std::fs::read_to_string(&toml_path) {
+        Ok(content) => toml::from_str(&content)
+            .map_err(|e| CasError::Other(format!("Failed to parse config.toml: {e}")))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Value::Table(toml::value::Table::new()),
+        Err(e) => return Err(CasError::Other(format!("Failed to read config.toml: {e}"))),
+    };
+
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| CasError::Other("config.toml root is not a table".to_string()))?;
+
+    let project = table
+        .entry("project".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| CasError::Other("config.toml [project] is not a table".to_string()))?;
+    project.insert(
+        "canonical_id".to_string(),
+        toml::Value::String(canonical_id.to_string()),
+    );
+
+    let serialized = toml::to_string_pretty(&doc)
+        .map_err(|e| CasError::Other(format!("Failed to serialize config.toml: {e}")))?;
+
+    // Ensure cas_root exists before writing.
+    if let Some(parent) = toml_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CasError::Other(format!("Failed to create {parent:?}: {e}")))?;
+    }
+    std::fs::write(&toml_path, serialized)
+        .map_err(|e| CasError::Other(format!("Failed to write config.toml: {e}")))?;
+    Ok(())
+}
+
+/// Derive the canonical project ID from `git -C <cas_root> remote get-url origin`,
+/// normalized to `<host>/<owner>/<repo>` form (strips `https?://` / `git@HOST:`
+/// prefix and `.git` suffix). Returns `None` when:
+///  - git binary isn't available
+///  - cas_root isn't a git repo (or has no `origin` remote)
+///  - the URL doesn't match a recognizable form
+///
+/// Used by `cas cloud team set` (cas-1ced) as the second resolution step
+/// after `.cas/config.toml`. Never invoked by the cached production
+/// `get_project_canonical_id` chain — only by the eager `team set` flow.
+pub fn derive_canonical_id_from_git_remote(cas_root: &Path) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(cas_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    normalize_git_remote_url(raw.trim())
+}
+
+/// Normalize a git remote URL to `<host>/<owner>/<repo>` form.
+///
+/// Recognized inputs:
+///  - `https://host/owner/repo[.git]` → `host/owner/repo`
+///  - `http://host/owner/repo[.git]` → `host/owner/repo`
+///  - `ssh://git@host/owner/repo[.git]` → `host/owner/repo`
+///  - `git@host:owner/repo[.git]` → `host/owner/repo`
+///
+/// Returns `None` for anything else (e.g. local file paths, malformed
+/// URLs) so the caller can fall through to the next resolution step
+/// rather than persist a non-canonical value.
+pub fn normalize_git_remote_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // SSH form: `git@host:owner/repo[.git]`. Replace the `:` with `/` after
+    // stripping the user prefix so the parse falls through to the generic
+    // `host/owner/repo` extractor below.
+    let without_ssh_user = if let Some(rest) = trimmed.strip_prefix("git@") {
+        // Find the first `:` — that's the separator between host and path.
+        let (host, path) = rest.split_once(':')?;
+        format!("{host}/{path}")
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@") {
+        // ssh://git@host/path → strip prefix; rest already uses `/`.
+        rest.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest.to_string()
+    } else {
+        return None;
+    };
+
+    // Strip optional `.git` suffix.
+    let without_dot_git = without_ssh_user
+        .strip_suffix(".git")
+        .unwrap_or(&without_ssh_user);
+    // Strip optional trailing slash for paranoia.
+    let clean = without_dot_git.trim_end_matches('/');
+
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
+    }
 }
 
 /// Derive the canonical project ID from a `.cas` directory path.
@@ -757,5 +906,115 @@ mod tests {
         // Timestamps are stored with second precision in JSON
         let loaded_ts = loaded.get_team_sync_timestamp("team-123").unwrap();
         assert!((loaded_ts - ts).num_seconds().abs() < 1);
+    }
+
+    // cas-1ced: git-remote URL normalizer + config.toml round-trip helpers.
+
+    #[test]
+    fn normalize_https_strips_protocol_and_dot_git() {
+        assert_eq!(
+            normalize_git_remote_url("https://github.com/foo/bar.git").as_deref(),
+            Some("github.com/foo/bar"),
+        );
+    }
+
+    #[test]
+    fn normalize_https_handles_missing_dot_git() {
+        assert_eq!(
+            normalize_git_remote_url("https://github.com/foo/bar").as_deref(),
+            Some("github.com/foo/bar"),
+        );
+    }
+
+    #[test]
+    fn normalize_http_strips_protocol_and_dot_git() {
+        assert_eq!(
+            normalize_git_remote_url("http://gitlab.example.com/g/p.git").as_deref(),
+            Some("gitlab.example.com/g/p"),
+        );
+    }
+
+    #[test]
+    fn normalize_ssh_user_form() {
+        assert_eq!(
+            normalize_git_remote_url("git@github.com:foo/bar.git").as_deref(),
+            Some("github.com/foo/bar"),
+        );
+    }
+
+    #[test]
+    fn normalize_ssh_url_form() {
+        assert_eq!(
+            normalize_git_remote_url("ssh://git@github.com/foo/bar.git").as_deref(),
+            Some("github.com/foo/bar"),
+        );
+    }
+
+    #[test]
+    fn normalize_gitlab_subgroup() {
+        assert_eq!(
+            normalize_git_remote_url("https://gitlab.com/group/subgroup/project.git").as_deref(),
+            Some("gitlab.com/group/subgroup/project"),
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_local_path() {
+        // Local path is not a recognizable URL shape — falls through to None.
+        assert_eq!(normalize_git_remote_url("/home/user/repo"), None);
+    }
+
+    #[test]
+    fn normalize_rejects_empty() {
+        assert_eq!(normalize_git_remote_url(""), None);
+        assert_eq!(normalize_git_remote_url("   "), None);
+    }
+
+    #[test]
+    fn config_toml_roundtrip_writes_and_reads_canonical_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let cas_root = temp.path();
+        assert_eq!(canonical_id_from_config_toml(cas_root), None);
+        set_canonical_id_in_config_toml(cas_root, "github.com/foo/bar").unwrap();
+        assert_eq!(
+            canonical_id_from_config_toml(cas_root).as_deref(),
+            Some("github.com/foo/bar"),
+        );
+    }
+
+    #[test]
+    fn config_toml_preserves_other_sections() {
+        // Seed config.toml with a pre-existing block that has nothing to do
+        // with [project]. The write must NOT clobber it.
+        let temp = tempfile::tempdir().unwrap();
+        let cas_root = temp.path();
+        std::fs::write(
+            cas_root.join("config.toml"),
+            "[memory]\nsession_learn_auto = true\n",
+        )
+        .unwrap();
+
+        set_canonical_id_in_config_toml(cas_root, "github.com/foo/bar").unwrap();
+
+        let content = std::fs::read_to_string(cas_root.join("config.toml")).unwrap();
+        assert!(content.contains("session_learn_auto"), "pre-existing [memory] block must survive — got:\n{content}");
+        assert!(content.contains("github.com/foo/bar"), "new canonical_id must be written — got:\n{content}");
+    }
+
+    #[test]
+    fn resolve_canonical_id_prefers_config_toml_over_folder_name() {
+        // Lock in the resolution-order change: config.toml beats folder name.
+        let temp = tempfile::tempdir().unwrap();
+        // Create the `.cas/` subdir so cas_root looks like a real CAS root
+        // (parent dir name = `quiet-leopard-46` or whatever — irrelevant).
+        let cas_root = temp.path().join("project-dir");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        set_canonical_id_in_config_toml(&cas_root, "github.com/owner/explicit").unwrap();
+
+        assert_eq!(
+            resolve_canonical_id(&cas_root).as_deref(),
+            Some("github.com/owner/explicit"),
+            "config.toml [project] canonical_id must win over folder-name fallback",
+        );
     }
 }

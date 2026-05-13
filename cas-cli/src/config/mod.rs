@@ -112,6 +112,13 @@ pub struct Config {
     /// is unaffected by this flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
+
+    /// `[project]` — project-scoped configuration (cas-1ced). Holds the
+    /// canonical project slug for cloud-sync scoping. Set eagerly by
+    /// `cas cloud team set` (auto-derived from git remote) or manually
+    /// via `cas cloud project set <canonical-id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectConfig>,
 }
 
 impl Config {
@@ -146,6 +153,7 @@ impl Config {
         merge_option!(llm);
         merge_option!(integrations);
         merge_option!(code_review);
+        merge_option!(project);
         changed
     }
 }

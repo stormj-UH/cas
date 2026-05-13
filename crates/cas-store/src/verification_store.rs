@@ -21,7 +21,12 @@ fn lock_err<T>(_: std::sync::PoisonError<T>) -> StoreError {
     StoreError::Parse("Failed to acquire lock".to_string())
 }
 
-const VERIFICATION_SCHEMA: &str = r#"
+/// SQLite DDL for the `verifications` and `verification_issues` tables.
+///
+/// Re-exported via `cas_store::VERIFICATION_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const VERIFICATION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS verifications (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,

@@ -10,7 +10,14 @@ use std::str::FromStr;
 use crate::Result;
 use cas_types::{BeliefType, Entry, EntryType, MemoryTier, ObservationType, Rule, RuleStatus, Scope};
 
-const SCHEMA: &str = r#"
+/// SQLite DDL for the `entries`, `rules`, and `metadata` tables and their
+/// indexes — the core memory + rules schema.
+///
+/// Re-exported via `cas_store::ENTRIES_RULES_SCHEMA` so the migration runner
+/// in `cas-cli` can bootstrap the base tables before applying ALTER migrations
+/// against subsystems whose tables were historically created lazily by
+/// `SqliteStore::init` / `SqliteRuleStore::init`. See cas-bdb9 / EPIC cas-9fdb.
+pub const ENTRIES_RULES_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS entries (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL DEFAULT 'learning',
@@ -116,6 +123,42 @@ CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Sessions table for enterprise analytics. Inline-bootstrap so migrations
+-- such as m042_sessions_add_outcome / sessions_add_title can ALTER it on
+-- DBs that have never had `SqliteStore::store_init` run.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    cwd TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_secs INTEGER,
+    permission_mode TEXT,
+    entries_created INTEGER NOT NULL DEFAULT 0,
+    tasks_closed INTEGER NOT NULL DEFAULT 0,
+    tool_uses INTEGER NOT NULL DEFAULT 0,
+    team_id TEXT,
+    title TEXT,
+    branch TEXT,
+    worktree_id TEXT,
+    outcome TEXT,
+    friction_score REAL,
+    delight_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_team ON sessions(team_id);
+
+-- Expression index for helpful-score sort (requires SQLite 3.31+). Previously
+-- created via a best-effort inline `let _ = conn.execute(...)` in
+-- `store_init`; lifted here so the migration-runner bootstrap installs it
+-- alongside the rest of the entries schema. SQLite 3.31 has been minimum-
+-- supported across the supported platform matrix for years, so the
+-- silent-skip fallback is no longer required.
+CREATE INDEX IF NOT EXISTS idx_entries_helpful_score ON entries(
+    (helpful_count - harmful_count) DESC,
+    last_accessed DESC
+) WHERE archived = 0 AND (helpful_count - harmful_count) > 0;
 "#;
 
 /// SQLite-based entry store

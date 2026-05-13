@@ -1,5 +1,5 @@
 use crate::error::StoreError;
-use crate::sqlite::{SCHEMA, SqliteRuleStore};
+use crate::sqlite::{ENTRIES_RULES_SCHEMA, SqliteRuleStore};
 use crate::tracing::{DevTracer, TraceTimer};
 use crate::{Result, RuleStore};
 use cas_types::{Rule, RuleStatus};
@@ -9,7 +9,7 @@ use rusqlite::{OptionalExtension, params};
 impl RuleStore for SqliteRuleStore {
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(ENTRIES_RULES_SCHEMA)?;
         // NOTE: Column migrations are handled by `cas update --schema-only`
         // See cas-cli/src/migration/migrations.rs for migration definitions (IDs 51-56)
         Ok(())

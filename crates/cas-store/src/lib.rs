@@ -74,29 +74,29 @@ mod worktree_lease_test;
 pub use error::{Result, StoreError};
 
 // Agent store for multi-agent coordination
-pub use agent_store::{AgentStore, LeaseHistoryEntry, SqliteAgentStore};
+pub use agent_store::{AGENT_SCHEMA, AgentStore, LeaseHistoryEntry, SqliteAgentStore};
 
 // Event store for activity tracking (sidecar)
 pub use event_store::{EVENT_SCHEMA, EventStore, SqliteEventStore, record_event_with_conn};
 
 // Code store for indexed source code
 pub use code_store::CodeStore;
-pub use sqlite_code_store::SqliteCodeStore;
+pub use sqlite_code_store::{CODE_SCHEMA, SqliteCodeStore};
 
 // Entity store for knowledge graph feature
-pub use entity_store::SqliteEntityStore;
+pub use entity_store::{ENTITY_SCHEMA, SqliteEntityStore};
 
 // Loop store for iteration loops
-pub use loop_store::{LoopStore, SqliteLoopStore};
+pub use loop_store::{LOOP_SCHEMA, LoopStore, SqliteLoopStore};
 
 // Verification store for task quality gates
 pub use verification_store::{
-    SqliteVerificationStore, VerificationStore, add_verification_with_conn,
+    SqliteVerificationStore, VERIFICATION_SCHEMA, VerificationStore, add_verification_with_conn,
     save_verification_issues_with_conn,
 };
 
 // Worktree store for git worktree tracking
-pub use worktree_store::{SqliteWorktreeStore, WorktreeStore};
+pub use worktree_store::{SqliteWorktreeStore, WORKTREE_SCHEMA, WorktreeStore};
 
 mod known_repo_store;
 pub use known_repo_store::{KnownRepo, KnownRepoStore, SqliteKnownRepoStore};
@@ -153,10 +153,10 @@ pub use recording_text_store::{
 // Core stores
 pub use layered::{LayeredEntryStore, LayeredRuleStore, LayeredSkillStore};
 pub use markdown::{MarkdownRuleStore, MarkdownStore};
-pub use skill_store::SqliteSkillStore;
+pub use skill_store::{SKILL_SCHEMA, SqliteSkillStore};
 pub use spec_store::{SpecStore, SqliteSpecStore};
-pub use sqlite::{SqliteRuleStore, SqliteStore};
-pub use task_store::{SqliteTaskStore, clear_pending_verification_with_conn};
+pub use sqlite::{ENTRIES_RULES_SCHEMA, SqliteRuleStore, SqliteStore};
+pub use task_store::{SqliteTaskStore, TASK_SCHEMA, clear_pending_verification_with_conn};
 
 use cas_types::{
     Dependency, DependencyType, Entity, EntityMention, EntityType, Entry, RelationType,

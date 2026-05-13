@@ -2,7 +2,7 @@ use crate::Result;
 use crate::error::StoreError;
 use crate::event_store::record_event_with_conn;
 use crate::recording_store::capture_memory_event;
-use crate::sqlite::{SCHEMA, SqliteStore};
+use crate::sqlite::{ENTRIES_RULES_SCHEMA, SqliteStore};
 use crate::tracing::{DevTracer, TraceTimer};
 use cas_types::{Entry, Event, EventEntityType, EventType};
 use chrono::Utc;
@@ -11,47 +11,12 @@ use rusqlite::{OptionalExtension, params};
 impl SqliteStore {
     pub(crate) fn store_init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SCHEMA)?;
-
-        // Sessions table for enterprise analytics
+        // ENTRIES_RULES_SCHEMA covers entries, rules, metadata, sessions
+        // (+ all indexes including the helpful-score expression index).
+        // No additional inline DDL needed here — single source of truth.
         // NOTE: Column migrations are now handled by `cas update --schema-only`
-        // See cas-cli/src/migration/migrations.rs for the migration definitions
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                cwd TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_secs INTEGER,
-                permission_mode TEXT,
-                entries_created INTEGER NOT NULL DEFAULT 0,
-                tasks_closed INTEGER NOT NULL DEFAULT 0,
-                tool_uses INTEGER NOT NULL DEFAULT 0,
-                team_id TEXT,
-                title TEXT,
-                branch TEXT,
-                worktree_id TEXT,
-                outcome TEXT,
-                friction_score REAL,
-                delight_count INTEGER DEFAULT 0
-            )",
-            [],
-        )?;
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_team ON sessions(team_id)",
-            [],
-        );
-
-        // Expression index for helpful score sort (requires SQLite 3.31+)
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entries_helpful_score ON entries((helpful_count - harmful_count) DESC, last_accessed DESC) WHERE archived = 0 AND (helpful_count - harmful_count) > 0",
-            [],
-        );
-
+        // See cas-cli/src/migration/migrations.rs for the migration definitions.
+        conn.execute_batch(ENTRIES_RULES_SCHEMA)?;
         Ok(())
     }
     pub(crate) fn store_generate_id(&self) -> Result<String> {
