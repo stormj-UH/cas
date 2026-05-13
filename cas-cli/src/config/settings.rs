@@ -522,6 +522,28 @@ pub struct TelemetryConfig {
     pub consent_given: Option<bool>,
 }
 
+/// Stock worker model used as the final fallback for `[llm.worker.model]`.
+///
+/// Applied by `LlmConfig::model_for_role("worker")` when both the role-
+/// specific override (`[llm.worker.model]`) and the top-level fallback
+/// (`[llm.model]`) are unset. New installs and upgraders without an
+/// explicit `[llm.worker]` block pick up this model automatically; users
+/// who want a different worker model add an explicit `[llm.worker] model
+/// = "..."` to their `.cas/config.toml`.
+///
+/// Convention: no date suffix (mirrors `claude-opus-4-7` already used at
+/// `cas-cli/src/ui/factory/daemon/runtime/teams.rs:402,526` for the
+/// supervisor default).
+///
+/// See cas-05e3.
+pub const STOCK_WORKER_MODEL: &str = "claude-sonnet-4-6";
+
+/// Stock worker reasoning effort used as the final fallback for
+/// `[llm.worker.reasoning_effort]`. Same chain rules as
+/// [`STOCK_WORKER_MODEL`]: applied only when both the role override and
+/// the top-level `[llm] reasoning_effort` are unset. See cas-05e3.
+pub const STOCK_WORKER_REASONING_EFFORT: &str = "high";
+
 /// LLM configuration for harness and model selection
 ///
 /// Controls which CLI harness (Claude or Codex) is used and which model
@@ -594,17 +616,38 @@ impl LlmConfig {
         role_override.unwrap_or(&self.harness)
     }
 
-    /// Resolve the model for a given role, falling back to the top-level setting.
+    /// Resolve the model for a given role.
+    ///
+    /// Three-step fallback chain (cas-05e3):
+    /// 1. `[llm.<role>.model]` — role-specific override (highest priority).
+    /// 2. `[llm.model]` — top-level fallback (preserves the existing-user
+    ///    case where a single top-level model is meant to apply to all roles).
+    /// 3. **Worker-only stock floor:** if `role == "worker"` AND both above
+    ///    are unset, returns [`STOCK_WORKER_MODEL`]. Other roles still
+    ///    return `None` at step 3 — the stock is deliberately scoped to the
+    ///    worker lane.
     pub fn model_for_role(&self, role: &str) -> Option<&str> {
         let role_override = match role {
             "supervisor" => self.supervisor.as_ref().and_then(|r| r.model.as_deref()),
             "worker" => self.worker.as_ref().and_then(|r| r.model.as_deref()),
             _ => None,
         };
-        role_override.or(self.model.as_deref())
+        let resolved = role_override.or(self.model.as_deref());
+        match (resolved, role) {
+            (Some(_), _) => resolved,
+            (None, "worker") => Some(STOCK_WORKER_MODEL),
+            (None, _) => None,
+        }
     }
 
-    /// Resolve the reasoning effort for a given role, falling back to the top-level setting.
+    /// Resolve the reasoning effort for a given role.
+    ///
+    /// Three-step fallback chain (cas-05e3):
+    /// 1. `[llm.<role>.reasoning_effort]` — role-specific override.
+    /// 2. `[llm.reasoning_effort]` — top-level fallback.
+    /// 3. **Worker-only stock floor:** if `role == "worker"` AND both above
+    ///    are unset, returns [`STOCK_WORKER_REASONING_EFFORT`]. Other roles
+    ///    still return `None` at step 3.
     pub fn reasoning_effort_for_role(&self, role: &str) -> Option<&str> {
         let role_override = match role {
             "supervisor" => self
@@ -617,7 +660,12 @@ impl LlmConfig {
                 .and_then(|r| r.reasoning_effort.as_deref()),
             _ => None,
         };
-        role_override.or(self.reasoning_effort.as_deref())
+        let resolved = role_override.or(self.reasoning_effort.as_deref());
+        match (resolved, role) {
+            (Some(_), _) => resolved,
+            (None, "worker") => Some(STOCK_WORKER_REASONING_EFFORT),
+            (None, _) => None,
+        }
     }
 }
 
@@ -805,12 +853,19 @@ mod tests {
     // cas-9393: critical-path method feeds supervisor_effort and worker_effort
     // through the factory spawn pipeline — must have full coverage.
 
-    /// No config at all → None for every role.
+    /// No config at all → supervisor returns None, worker returns the stock
+    /// default. cas-05e3 split this from a single combined assertion: workers
+    /// now have a stock-fallback floor so new installs spawn with a sensible
+    /// model + effort without any `.cas/config.toml` editing.
     #[test]
-    fn reasoning_effort_for_role_no_config_returns_none() {
+    fn reasoning_effort_for_role_no_config_returns_none_for_supervisor() {
         let llm = LlmConfig::default();
-        assert_eq!(llm.reasoning_effort_for_role("supervisor"), None);
-        assert_eq!(llm.reasoning_effort_for_role("worker"), None);
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            None,
+            "supervisor must NOT receive the worker stock-default — \
+             regressions that bleed it across roles must fail this test"
+        );
     }
 
     /// Top-level `reasoning_effort` is the fallback when no per-role override
@@ -988,6 +1043,131 @@ reasoning_effort = "high"
             llm.reasoning_effort_for_role("orchestrator"),
             Some("medium"),
             "top-level reasoning_effort must survive TOML deserialization"
+        );
+    }
+
+    // ── cas-05e3: stock worker default ─────────────────────────────────────
+    // The worker role gets a model + reasoning_effort floor when nothing is
+    // configured. New installs and upgraders without an `[llm.worker]` block
+    // pick this up automatically; explicit config at either level still wins.
+    // Supervisor MUST stay on `None` so future regressions can't silently
+    // switch the supervisor lane onto the worker stock.
+
+    /// Empty config → worker resolves to the stock model + effort. The whole
+    /// point of cas-05e3 is that brand-new installs work without editing
+    /// `.cas/config.toml`.
+    #[test]
+    fn worker_stock_default_kicks_in_when_nothing_configured() {
+        let llm = LlmConfig::default();
+        assert_eq!(
+            llm.model_for_role("worker"),
+            Some(STOCK_WORKER_MODEL),
+            "empty config must resolve worker model to the stock default"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some(STOCK_WORKER_REASONING_EFFORT),
+            "empty config must resolve worker reasoning_effort to the stock default"
+        );
+        // Sanity-check the constant values match the spec.
+        assert_eq!(STOCK_WORKER_MODEL, "claude-sonnet-4-6");
+        assert_eq!(STOCK_WORKER_REASONING_EFFORT, "high");
+    }
+
+    /// Existing-user preservation: a top-level `[llm] model = "X"` (no
+    /// `[llm.worker]` block) still wins over the stock. This is the
+    /// non-negotiable back-compat hinge — users who set top-level model
+    /// expecting all roles to inherit must keep getting that behavior.
+    /// `reasoning_effort` is None at top level so it falls through to the
+    /// stock floor.
+    #[test]
+    fn worker_top_level_model_wins_over_stock_default() {
+        let llm = LlmConfig {
+            model: Some("claude-opus-4-7".to_string()),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.model_for_role("worker"),
+            Some("claude-opus-4-7"),
+            "top-level llm.model must still flow through to workers — \
+             stock fallback only fires when both role and top-level are None"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some(STOCK_WORKER_REASONING_EFFORT),
+            "top-level model set but top-level effort unset → worker effort \
+             still gets the stock floor"
+        );
+    }
+
+    /// Full top-level inherit: both model and effort set top-level, no role
+    /// block. Worker sees both, stock never fires.
+    #[test]
+    fn worker_full_top_level_inherit_suppresses_stock() {
+        let llm = LlmConfig {
+            model: Some("custom-model".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            ..LlmConfig::default()
+        };
+        assert_eq!(llm.model_for_role("worker"), Some("custom-model"));
+        assert_eq!(llm.reasoning_effort_for_role("worker"), Some("medium"));
+    }
+
+    /// Partial worker override (model only): stock still fires for the OTHER
+    /// field. Setting `[llm.worker] model = "Y"` does not opt out of the
+    /// stock effort floor.
+    #[test]
+    fn worker_partial_override_model_only_keeps_stock_effort() {
+        let llm = LlmConfig {
+            worker: Some(LlmRoleConfig {
+                model: Some("custom-y".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(llm.model_for_role("worker"), Some("custom-y"));
+        assert_eq!(
+            llm.reasoning_effort_for_role("worker"),
+            Some(STOCK_WORKER_REASONING_EFFORT),
+            "worker override on model must not suppress the stock effort floor"
+        );
+    }
+
+    /// Partial worker override (effort only): stock model floor still fires.
+    #[test]
+    fn worker_partial_override_effort_only_keeps_stock_model() {
+        let llm = LlmConfig {
+            worker: Some(LlmRoleConfig {
+                reasoning_effort: Some("low".to_string()),
+                ..LlmRoleConfig::default()
+            }),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            llm.model_for_role("worker"),
+            Some(STOCK_WORKER_MODEL),
+            "worker override on effort must not suppress the stock model floor"
+        );
+        assert_eq!(llm.reasoning_effort_for_role("worker"), Some("low"));
+    }
+
+    /// Supervisor stock-leak guard. `model_for_role("supervisor")` and
+    /// `reasoning_effort_for_role("supervisor")` MUST return None when
+    /// nothing is configured. The stock is a worker-only concept; a future
+    /// change that accidentally applies it to supervisor would break the
+    /// supervisor's default-Opus lane (`teams.rs:402,526`).
+    #[test]
+    fn supervisor_does_not_receive_worker_stock_default() {
+        let llm = LlmConfig::default();
+        assert_eq!(
+            llm.model_for_role("supervisor"),
+            None,
+            "supervisor model must stay None on empty config — stock is worker-only"
+        );
+        assert_eq!(
+            llm.reasoning_effort_for_role("supervisor"),
+            None,
+            "supervisor effort must stay None on empty config — stock is worker-only"
         );
     }
 }
