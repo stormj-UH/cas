@@ -5,6 +5,16 @@ All notable changes to CAS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.3] - 2026-05-13
+
+### Fixed
+
+- **`cas cloud team set <uuid>` now eagerly resolves the project canonical slug (cas-1ced, EPIC cas-ffc4 closes).** Final task in the EPIC opened against the original cloud-team bug doc — closes hypothesis #3, the last UX paper-cut from daniel.l's onboarding. Previously, `cas cloud team set` printed `Slug resolution deferred — see cas cloud team show` and didn't actually resolve the canonical project ID. When the working-directory name didn't match the canonical slug (daniel.l cloned the repo into `~/cas` while the canonical project ID was `cas-src`), his first `cas cloud sync` went out with `project_id=cas` and routed push/pull to a phantom project; the documented workaround was renaming the directory. Fix: after persisting the team_id, the handler now runs an eager resolution chain — `.cas/config.toml [project] canonical_id` → `git -C <root> remote get-url origin` (normalized via a new `normalize_git_remote_url` helper handling HTTPS, HTTP, `ssh://git@host/`, and the `git@host:owner/repo` shorthand, with `.git` suffix stripping) → defer. The deferred case explicitly does NOT fall back to the working-dir basename (that was the bug). When a slug is resolved, it's written to `.cas/config.toml [project]` and surfaces in subsequent `get_project_canonical_id()` calls. Output indicates the source (`from .cas/config.toml` / `derived from git remote` / deferred); JSON mode carries the same info as `canonical_id_source`. New `cas cloud project set <canonical-id>` subcommand for manual override (monorepo / non-git / custom layout). `cas cloud team show` now displays the resolved project slug alongside the team UUID. Config plumbing adds a `[project]` section to the `Config` struct (`ProjectConfig { canonical_id: Option<String> }`) wired through `merge_missing` + `init.rs`; `resolve_canonical_id` precedence becomes `config.toml → folder-name → path-hash`, backward-compatible. 17 new tests (6 integration in `team_set_slug_resolution_test.rs` covering config-preserve / HTTPS derive / SSH derive / no-basename-default negative / project set / team show; 11 unit in `cloud::config::tests` covering URL normalization shape table + config.toml round-trip + section-preserve + resolution precedence).
+
+### Cross-team coordination
+
+- **EPIC cas-ffc4 closes end-to-end.** Original bug doc moved to `docs/requests/completed/`. The three hypotheses surfaced in the cloud team's filing are all addressed: (#1) missing endpoint wire-up shipped in v2.15.1; (#2) cross-project watermark reuse shipped in v2.15.2; (#3) deferred slug resolution shipped here in v2.15.3. New team-member onboarding now lands the correct project slug at `cas cloud team set`, hits the team endpoint on `cas cloud sync`, and keeps `since=` watermarks scoped per-(team, project).
+
 ## [2.15.2] - 2026-05-13
 
 ### Fixed
