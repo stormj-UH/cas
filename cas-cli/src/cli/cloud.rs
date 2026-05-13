@@ -1163,16 +1163,24 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         // pull. This preserves the prior `--full` semantics under the new path.
         //
         // When a team is also configured, clear the team-pull watermark too
-        // (`last_team_pull_at_<team_id>`, written by `CloudSyncer::pull_team`
-        // — see cas-cli/src/cloud/syncer/pull.rs:710) so `--full` triggers a
-        // full team backfill in addition to a full personal backfill. Task
-        // cas-6ec7 added this — without it, `--full` was half-broken
-        // (personal cleared, team kept its old watermark and only fetched
-        // deltas).
+        // for the CURRENT (team_id, project_id) scope (key format
+        // `last_team_pull_at_{team_id}_{project_id}`, written by
+        // `CloudSyncer::pull_team` after cas-53d5). Scope-isolation is
+        // intentional: clearing only the active scope leaves watermarks for
+        // other projects the user has worked on with this team intact, so
+        // `cas cloud pull --full` in project P1 does NOT force a full
+        // backfill on the next pull from project P2. Without project scope,
+        // `--full` would either be half-broken (personal cleared, team
+        // kept its old watermark) or over-broad (nukes every project's
+        // team-pull watermark).
         if args.full {
             queue.delete_metadata("last_pull_at")?;
             if let Some(team_id) = config.active_team_id() {
-                queue.delete_metadata(&format!("last_team_pull_at_{team_id}"))?;
+                if let Some(project_id) = crate::cloud::get_project_canonical_id() {
+                    queue.delete_metadata(&format!(
+                        "last_team_pull_at_{team_id}_{project_id}"
+                    ))?;
+                }
             }
         }
 
@@ -1605,10 +1613,26 @@ pub fn execute_team_pull(
         crate::cloud::CloudSyncerConfig::default(),
     );
 
+    // cas-53d5: `pull_team` now takes the canonical project_id explicitly
+    // so its watermark is scoped per (team_id, project_id). Resolve here at
+    // the caller and bail with the same isolation contract if we can't —
+    // pull_team would otherwise have failed at its old internal resolve.
+    let project_id = match crate::cloud::get_project_canonical_id() {
+        Some(id) => id,
+        None => {
+            let _ = report_team_pull_error(
+                cli,
+                "Team pull skipped: not inside a CAS project directory",
+            );
+            return Ok(());
+        }
+    };
+
     // `let _ =` on reporter calls: a formatter/IO error from the display
     // path must not propagate out and block subsequent caller steps.
     match syncer.pull_team(
         &team_id,
+        &project_id,
         store.as_ref(),
         task_store.as_ref(),
         rule_store.as_ref(),

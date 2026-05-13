@@ -374,10 +374,14 @@ async fn fresh_teammate_pull_applies_team_memories_to_local_store() {
     let syncer = CloudSyncer::new(Arc::new(queue), cfg, syncer_config);
 
     // `pull_team` is sync + blocking ureq; run on the blocking pool
-    // so the wiremock tokio runtime can serve the GET.
+    // so the wiremock tokio runtime can serve the GET. cas-53d5 added
+    // the explicit `project_id` parameter — for this fresh-teammate
+    // wire-shape test, the value is arbitrary (no cross-scope assertion
+    // exists here; that lives in `team_pull_watermark_scope_test.rs`).
     let result = tokio::task::spawn_blocking(move || {
         syncer.pull_team(
             TEST_TEAM,
+            "fresh-teammate-test-project",
             &*entry_store,
             &*task_store,
             &*rule_store,
