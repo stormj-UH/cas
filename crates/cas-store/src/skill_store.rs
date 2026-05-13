@@ -9,7 +9,13 @@ use crate::error::StoreError;
 use crate::{Result, SkillStore};
 use cas_types::{Scope, Skill, SkillHooks, SkillStatus, SkillType};
 
-const SKILL_SCHEMA: &str = r#"
+/// SQLite DDL for the `skills` table and its indexes.
+///
+/// Re-exported via `cas_store::SKILL_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base table before applying ALTER migrations
+/// against subsystems whose tables were historically created lazily by
+/// `SqliteSkillStore::init`. See cas-bdb9 / EPIC cas-9fdb.
+pub const SKILL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS skills (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

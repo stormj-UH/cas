@@ -10,7 +10,13 @@ use crate::error::StoreError;
 use crate::{EntityStore, Result};
 use cas_types::{Entity, EntityMention, EntityType, RelationType, Relationship};
 
-const ENTITY_SCHEMA: &str = r#"
+/// SQLite DDL for the entity-graph tables (`entities`, `relationships`,
+/// `entity_mentions`) and their indexes.
+///
+/// Re-exported via `cas_store::ENTITY_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const ENTITY_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

@@ -16,7 +16,12 @@ fn lock_err<T>(_: std::sync::PoisonError<T>) -> StoreError {
     StoreError::Parse("Failed to acquire lock".to_string())
 }
 
-const LOOP_SCHEMA: &str = r#"
+/// SQLite DDL for the `loops` table and its indexes.
+///
+/// Re-exported via `cas_store::LOOP_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base table before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const LOOP_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS loops (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,

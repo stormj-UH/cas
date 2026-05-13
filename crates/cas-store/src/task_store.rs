@@ -14,7 +14,20 @@ use cas_types::{
     Scope, Task, TaskDeliverables, TaskStatus, TaskType,
 };
 
-const TASK_SCHEMA: &str = r#"
+/// SQLite DDL for the `tasks` and `dependencies` tables.
+///
+/// Re-exported via `cas_store::TASK_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+///
+/// NOTE: `task_leases` lives exclusively in `AGENT_SCHEMA` (the agent
+/// lifecycle owns lease semantics — FK to `agents(id)` with cascade delete,
+/// `renewed_at NOT NULL`). A redundant slim `task_leases` definition used
+/// to live here too; it was removed in cas-bdb9 fix-round-1 because the
+/// `IF NOT EXISTS` no-op silently dropped the NOT-NULL + FK on
+/// fresh-bootstrap DBs where `Subsystem::Tasks` ran before
+/// `Subsystem::Agents`.
+pub const TASK_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -64,20 +77,6 @@ CREATE TABLE IF NOT EXISTS dependencies (
 CREATE INDEX IF NOT EXISTS idx_deps_from ON dependencies(from_id);
 CREATE INDEX IF NOT EXISTS idx_deps_to ON dependencies(to_id);
 CREATE INDEX IF NOT EXISTS idx_deps_type ON dependencies(dep_type);
-
--- Task leases table: tracks exclusive task claims by agents
--- Note: Full schema with FK to agents is in agent_store; this is minimal for delete cleanup
-CREATE TABLE IF NOT EXISTS task_leases (
-    task_id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    acquired_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    renewed_at TEXT,
-    renewal_count INTEGER NOT NULL DEFAULT 0,
-    epoch INTEGER NOT NULL DEFAULT 1,
-    claim_reason TEXT
-);
 "#;
 
 /// SQLite-based task store
@@ -390,6 +389,15 @@ impl TaskStore for SqliteTaskStore {
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(TASK_SCHEMA)?;
+        // `task_leases` is owned by the agent lifecycle (`AGENT_SCHEMA`), but
+        // `SqliteTaskStore::delete` issues `DELETE FROM task_leases WHERE
+        // task_id = ?` for cleanup. To keep the task store usable without
+        // requiring callers to also have constructed `SqliteAgentStore`,
+        // we run the agent schema here too. The full AGENT_SCHEMA is the
+        // single source of truth — running it from both store inits is
+        // idempotent (`CREATE TABLE IF NOT EXISTS`). See cas-bdb9
+        // fix-round-1 P1 for why a duplicated slim definition is dangerous.
+        conn.execute_batch(crate::AGENT_SCHEMA)?;
         Ok(())
     }
 

@@ -82,6 +82,116 @@ impl Subsystem {
             Subsystem::Recordings => "recordings",
         }
     }
+
+    /// Every subsystem that exists today.
+    ///
+    /// Used by `ensure_base_schemas` to walk the full set during the
+    /// migration-runner bootstrap. Keep this in sync with the enum variants.
+    pub const ALL: &'static [Subsystem] = &[
+        Subsystem::Entries,
+        Subsystem::Tasks,
+        Subsystem::Rules,
+        Subsystem::Skills,
+        Subsystem::Agents,
+        Subsystem::Entities,
+        Subsystem::Verification,
+        Subsystem::Loops,
+        Subsystem::Worktrees,
+        Subsystem::Code,
+        Subsystem::Events,
+        Subsystem::Recording,
+        Subsystem::Recordings,
+    ];
+
+    /// Apply this subsystem's base-schema bootstrap DDL to `conn`.
+    ///
+    /// "Base schema" is the set of `CREATE TABLE IF NOT EXISTS` (+ indexes)
+    /// historically created lazily by `Sqlite*Store::init` / `::open`. ALTER
+    /// migrations that target a subsystem assume the table already exists, so
+    /// the migration runner invokes this before applying pending migrations
+    /// on databases that have never had the matching store constructed.
+    ///
+    /// Subsystems that are fully migration-driven (no inline lazy bootstrap,
+    /// e.g. `Recordings`, `Recording`) return `Ok(())` without executing any
+    /// statements — their tables are created by migrations themselves.
+    ///
+    /// All DDL is `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`,
+    /// so calling this on an already-populated database is a no-op.
+    pub fn ensure_base_schema(&self, conn: &Connection) -> Result<()> {
+        // Only subsystems whose canonical CREATE TABLE lives in a `Sqlite*Store`
+        // constructor / init function (and is therefore tied to "did anyone
+        // construct the store this process?") get pre-bootstrapped here.
+        //
+        // Subsystems that have an explicit `m###_*_create_table` migration in
+        // the ledger (Worktrees / Code / Events / Recordings / Recording)
+        // are DELIBERATELY excluded — their initial shape is owned by the
+        // migration chain itself, and pre-installing the modern post-ALTER
+        // shape would break subsequent ALTER migrations that target the
+        // historical column layout (e.g. m112 indexes `worktrees.task_id`
+        // which was renamed to `epic_id` by m120).
+        //
+        // The (sentinel_table, schema) pairs below mean: "if `sentinel_table`
+        // is missing, install this DDL". When the sentinel table already
+        // exists we skip the DDL entirely — the migration chain (ALTER
+        // migrations + m###_*_create_table for sibling tables) is the
+        // authoritative source from that point on. Re-running an
+        // `IF NOT EXISTS` table create is a no-op, but the index statements
+        // bundled in the same schema would fail with `no such column: …` on
+        // a legacy partial table, so the existence check is load-bearing.
+        let (sentinel_table, ddl): (Option<&'static str>, Option<&'static str>) = match self {
+            // `Entries` and `Rules` ship as a single SQL bundle in cas-store
+            // (entries + rules + metadata + sessions in one batch). We
+            // execute it once via Entries; Rules is a no-op.
+            Subsystem::Entries => (Some("entries"), Some(cas_store::ENTRIES_RULES_SCHEMA)),
+            Subsystem::Rules => (None, None), // covered by Entries
+            Subsystem::Tasks => (Some("tasks"), Some(cas_store::TASK_SCHEMA)),
+            Subsystem::Skills => (Some("skills"), Some(cas_store::SKILL_SCHEMA)),
+            Subsystem::Agents => (Some("agents"), Some(cas_store::AGENT_SCHEMA)),
+            Subsystem::Entities => (Some("entities"), Some(cas_store::ENTITY_SCHEMA)),
+            Subsystem::Verification => {
+                (Some("verifications"), Some(cas_store::VERIFICATION_SCHEMA))
+            }
+            Subsystem::Loops => (Some("loops"), Some(cas_store::LOOP_SCHEMA)),
+            // Migration-driven subsystems: their CREATE TABLE lives in a
+            // numbered migration. Skip pre-bootstrap.
+            Subsystem::Worktrees
+            | Subsystem::Code
+            | Subsystem::Events
+            | Subsystem::Recording
+            | Subsystem::Recordings => (None, None),
+        };
+
+        if let (Some(sentinel), Some(sql)) = (sentinel_table, ddl) {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [sentinel],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if exists == 0 {
+                conn.execute_batch(sql)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Ensure every subsystem's base schema exists on `conn`.
+///
+/// This is the fix for cas-bdb9: `apply_pending` / `run_migrations` used to
+/// assume that each ALTER migration's target table had already been created
+/// by some prior `Sqlite*Store::init`. On databases that have never had the
+/// matching store constructed (e.g. `cas doctor --fix` on a `.cas/cas.db`
+/// initialized by an older CAS version that didn't run every store init),
+/// the ALTER would fail with `no such table: …`. Calling this before the
+/// apply loop makes the bootstrap independent of which stores have been
+/// touched in the current process. Idempotent.
+pub fn ensure_base_schemas(conn: &Connection) -> Result<()> {
+    for subsystem in Subsystem::ALL {
+        subsystem.ensure_base_schema(conn)?;
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for Subsystem {
@@ -364,6 +474,12 @@ pub fn run_migrations(cas_dir: &Path, dry_run: bool) -> Result<MigrationResult> 
     // Ensure migrations table exists
     ensure_migrations_table(&conn)?;
 
+    // Ensure every subsystem's base schema exists before any ALTER migration
+    // runs. Fix for cas-bdb9: `cas doctor --fix` previously failed with
+    // `no such table: skills` on databases that had never had
+    // `SqliteSkillStore` / `SqliteAgentStore` constructed.
+    ensure_base_schemas(&conn)?;
+
     // Bootstrap if needed (detect already-applied migrations)
     bootstrap_migrations(cas_dir)?;
 
@@ -453,16 +569,23 @@ mod tests {
 
     #[test]
     fn test_migration_dry_run() {
-        let temp = TempDir::new().unwrap();
+        // `init_cas_dir` calls `known_repos::register_repo(host_cas_dir)` which
+        // writes to `$HOME/.cas/`. Without `with_temp_home`, concurrent sweep
+        // tests (`worktree::sweep::*`) see the registration and fail. Wrap so
+        // the host registry is isolated to this test's temp HOME.
+        crate::test_support::with_temp_home(|home| {
+            let temp = home.join("proj");
+            std::fs::create_dir_all(&temp).unwrap();
 
-        // Initialize CAS properly (creates base tables)
-        crate::store::init_cas_dir(temp.path()).unwrap();
+            // Initialize CAS properly (creates base tables)
+            crate::store::init_cas_dir(&temp).unwrap();
 
-        let result = run_migrations(temp.path().join(".cas").as_path(), true).unwrap();
+            let result = run_migrations(&temp.join(".cas"), true).unwrap();
 
-        // Should report pending but not apply
-        // (init_cas_dir already runs migrations, so pending may be 0)
-        assert!(result.errors.is_empty());
+            // Should report pending but not apply
+            // (init_cas_dir already runs migrations, so pending may be 0)
+            assert!(result.errors.is_empty());
+        });
     }
 
     #[test]
@@ -522,6 +645,288 @@ mod tests {
             matches!(result.unwrap_err(), CasError::NotInitialized),
             "Expected NotInitialized error"
         );
+    }
+
+    /// cas-bdb9: `ensure_base_schemas` on a fresh in-memory connection must
+    /// create the canonical tables for every lazy-bootstrap subsystem so that
+    /// subsequent ALTER migrations (e.g. m071_skills_add_summary,
+    /// m200_agents_add_pid_starttime) never hit "no such table: …".
+    #[test]
+    fn test_ensure_base_schemas_creates_lazy_subsystem_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Sanity: a fresh in-memory DB has no user tables.
+        let count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_before, 0, "fresh in-memory DB should be empty");
+
+        ensure_base_schemas(&conn).expect("ensure_base_schemas should succeed");
+
+        // Every lazy-bootstrap subsystem's primary table must now exist.
+        // Subsystems whose canonical CREATE TABLE lives in a numbered
+        // migration (Worktrees / Code / Events / Recording / Recordings)
+        // are intentionally NOT bootstrapped here — their tables only
+        // appear after the migration chain runs.
+        let expected = [
+            "entries",
+            "rules",
+            "metadata",
+            "sessions", // shipped as part of ENTRIES_RULES_SCHEMA — target of m028/m031/m032/m042/m043/m044
+            "tasks",
+            "skills",
+            "agents",
+            "task_leases", // lives in AGENT_SCHEMA (FK to agents + NOT-NULL renewed_at)
+            "entities",
+            "relationships",
+            "entity_mentions",
+            "verifications",
+            "verification_issues",
+            "loops",
+        ];
+
+        for table in expected {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "expected table `{table}` to exist after bootstrap");
+        }
+
+        // Negative invariant: migration-driven subsystems (Worktrees, Code,
+        // Events, Recording, Recordings) must NOT be pre-created by the
+        // bootstrap. Their CREATE TABLE shape is owned by the migration
+        // ledger and pre-installing the modern post-ALTER shape would break
+        // later ALTERs (e.g. m112 indexes `worktrees.task_id`).
+        let must_not_exist = [
+            "worktrees",
+            "code_files",
+            "code_symbols",
+            "code_relationships",
+            "code_memory_links",
+            "events",
+            "recordings",
+            "recording_text",
+        ];
+        for table in must_not_exist {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 0,
+                "table `{table}` must NOT be pre-created by ensure_base_schemas; \
+                 its CREATE TABLE lives in a numbered migration"
+            );
+        }
+    }
+
+    /// cas-bdb9: confirm `task_leases` lands via Agents (FK + NOT-NULL
+    /// constraints intact), not via Tasks. Regression guard for fix-round-1
+    /// P1 — the old `TASK_SCHEMA` duplicated `task_leases` with a slimmer
+    /// shape that silently shadowed `AGENT_SCHEMA`'s definition when
+    /// `Subsystem::ALL` iterated `Tasks` (index 1) before `Agents` (index 4),
+    /// losing the FK to `agents(id)` and the `renewed_at NOT NULL` constraint.
+    #[test]
+    fn test_task_leases_lands_with_fk_and_not_null_via_agents() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Foreign keys are OFF by default on a new connection; turn them on
+        // so the FK is actually recorded by sqlite_master inspection.
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        ensure_base_schemas(&conn).unwrap();
+
+        // FK presence: pragma_foreign_key_list returns one row per FK column.
+        let fk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('task_leases') \
+                 WHERE \"table\"='agents' AND \"from\"='agent_id' AND \"to\"='id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fk_count, 1,
+            "task_leases must keep its FK to agents(id) ON DELETE CASCADE — \
+             AGENT_SCHEMA is the single source of truth"
+        );
+
+        // renewed_at must be NOT NULL (AGENT_SCHEMA shape, not the legacy
+        // slim TASK_SCHEMA shape).
+        let renewed_at_notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('task_leases') WHERE name='renewed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            renewed_at_notnull, 1,
+            "task_leases.renewed_at must be NOT NULL — regression on the \
+             dual-definition / IF-NOT-EXISTS no-op bug"
+        );
+    }
+
+    /// cas-bdb9: `ensure_base_schemas` is idempotent — running it twice on
+    /// the same connection must not error or create duplicates.
+    #[test]
+    fn test_ensure_base_schemas_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_base_schemas(&conn).expect("first run should succeed");
+        ensure_base_schemas(&conn).expect("second run should be a no-op");
+
+        // Spot-check that exactly one `skills` table exists.
+        let skills_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='skills'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skills_count, 1);
+    }
+
+    /// cas-bdb9: `run_migrations` on a CAS dir whose `.cas/cas.db` has only the
+    /// minimal base tables (no skills/agents — simulating a DB initialized by
+    /// an older CAS version) must succeed end-to-end, with the skills and
+    /// agents tables bootstrapped and the ALTER migrations applied cleanly.
+    #[test]
+    fn test_run_migrations_bootstraps_missing_skills_and_agents_tables() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            // Seed entries/rules/tasks with their real lazy-bootstrap shape so
+            // `is_db_initialized` passes — mirroring the bug-doc scenario where
+            // an older CAS version initialized these stores but never touched
+            // skills/agents.
+            conn.execute_batch(cas_store::ENTRIES_RULES_SCHEMA).unwrap();
+            conn.execute_batch(cas_store::TASK_SCHEMA).unwrap();
+        }
+
+        // Confirm the precondition: skills and agents do NOT exist yet.
+        let conn = Connection::open(&db_path).unwrap();
+        let lazy_tables_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('skills', 'agents')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lazy_tables_before, 0,
+            "skills/agents should be absent before run_migrations"
+        );
+        drop(conn);
+
+        let result = run_migrations(temp.path(), false);
+        assert!(
+            result.is_ok(),
+            "run_migrations should succeed after base-schema bootstrap, got: {:?}",
+            result.err()
+        );
+
+        // After run_migrations the skills AND agents tables must exist.
+        let conn = Connection::open(&db_path).unwrap();
+        let lazy_tables_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('skills', 'agents')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lazy_tables_after, 2,
+            "skills and agents must both exist after run_migrations bootstrap"
+        );
+    }
+
+    /// cas-bdb9: running migrations a second time on the same already-
+    /// bootstrapped DB is a no-op (no errors, no duplicate apply).
+    #[test]
+    fn test_run_migrations_is_idempotent_after_bootstrap() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("cas.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn.execute_batch(cas_store::ENTRIES_RULES_SCHEMA).unwrap();
+            conn.execute_batch(cas_store::TASK_SCHEMA).unwrap();
+        }
+
+        let first = run_migrations(temp.path(), false).expect("first run should succeed");
+        let second = run_migrations(temp.path(), false).expect("second run should be a no-op");
+
+        assert!(first.errors.is_empty());
+        assert!(second.errors.is_empty());
+        // Without this assertion `bootstrap_migrations` auto-detecting every
+        // migration as already applied would let the test silently pass.
+        assert!(
+            first.applied_count > 0,
+            "first run should apply at least one migration after base-schema bootstrap; \
+             a 0-count would mean bootstrap_migrations falsely flagged every migration as applied"
+        );
+        assert_eq!(
+            second.applied_count, 0,
+            "second migration run should apply nothing"
+        );
+    }
+
+    /// cas-bdb9: pre-existing DB where stores HAVE been constructed continues
+    /// to migrate correctly — the additive bootstrap must not corrupt or
+    /// reset existing data.
+    #[test]
+    fn test_run_migrations_with_preexisting_stores_unchanged() {
+        // Use `with_temp_home` to isolate the host known_repos registry that
+        // `init_cas_dir` writes to — otherwise this test pollutes the shared
+        // process-level $HOME and races with other tests (e.g.
+        // `worktree::sweep::tests::sweep_all_known_iterates_registry_and_flags_unhealthy`).
+        crate::test_support::with_temp_home(|home| {
+            let temp = home.join("proj");
+            std::fs::create_dir_all(&temp).unwrap();
+            // Properly initialize CAS (runs every store init).
+            crate::store::init_cas_dir(&temp).unwrap();
+            let cas_dir = temp.join(".cas");
+
+            // Insert a sentinel row to confirm data is preserved.
+            {
+                let conn = Connection::open(cas_dir.join("cas.db")).unwrap();
+                // The skills table already exists thanks to SqliteSkillStore::init().
+                conn.execute(
+                    "INSERT OR IGNORE INTO skills (id, name, created_at, updated_at) VALUES ('sentinel', 'sentinel', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+            }
+
+            // Run migrations again — should not error, sentinel row must survive.
+            let result =
+                run_migrations(&cas_dir, false).expect("run_migrations should succeed");
+            assert!(result.errors.is_empty());
+
+            let conn = Connection::open(cas_dir.join("cas.db")).unwrap();
+            let sentinel_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM skills WHERE id='sentinel'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sentinel_count, 1, "pre-existing data must survive bootstrap");
+        });
     }
 
     #[test]

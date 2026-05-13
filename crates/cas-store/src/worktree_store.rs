@@ -13,6 +13,43 @@ use cas_types::{Worktree, WorktreeStatus};
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// SQLite DDL for the `worktrees` table (epic worktree tracking).
+///
+/// **IMPORTANT:** This constant is used ONLY by `SqliteWorktreeStore::init()` —
+/// it is DELIBERATELY EXCLUDED from the migration-runner bootstrap
+/// (`Subsystem::Worktrees::ensure_base_schema` returns `(None, None)`).
+///
+/// Rationale: the `worktrees` table has a multi-stage migration history —
+/// `m111_worktrees_create_table` creates it with `task_id`, and
+/// `m120_worktrees_add_epic_id` later renames `task_id` → `epic_id`. The
+/// constant below reflects the post-m120 modern shape (with `epic_id`, no
+/// `task_id`). Installing this DDL before the migration ledger runs would
+/// cause `m112_worktrees_idx_task` to fail with
+/// `no such column: task_id` while creating
+/// `idx_worktrees_task ON worktrees(task_id)`.
+///
+/// If you ever want to add `Worktrees` to the migration-runner bootstrap
+/// path, you must FIRST either: (a) shape this constant to match the m111
+/// baseline (re-introducing `task_id`), or (b) rewrite the migration chain
+/// so it no longer relies on the renamed column.
+///
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const WORKTREE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS worktrees (
+    id TEXT PRIMARY KEY,
+    epic_id TEXT,
+    branch TEXT NOT NULL,
+    parent_branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    merged_at TEXT,
+    removed_at TEXT,
+    created_by_agent TEXT,
+    merge_commit TEXT
+);
+"#;
+
 /// Worktree storage operations
 pub trait WorktreeStore: Send + Sync {
     /// Initialize schema
@@ -121,21 +158,7 @@ impl WorktreeStore for SqliteWorktreeStore {
     fn init(&self) -> Result<()> {
         // Ensure schema exists for tests/standalone usage (migrations in production).
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS worktrees (
-                id TEXT PRIMARY KEY,
-                epic_id TEXT,
-                branch TEXT NOT NULL,
-                parent_branch TEXT NOT NULL,
-                path TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                merged_at TEXT,
-                removed_at TEXT,
-                created_by_agent TEXT,
-                merge_commit TEXT
-            )",
-        )?;
+        conn.execute_batch(WORKTREE_SCHEMA)?;
         Ok(())
     }
 
