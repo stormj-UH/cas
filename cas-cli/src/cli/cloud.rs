@@ -1284,7 +1284,16 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 // SYNC
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+/// Orchestrates `cas cloud sync` — personal push, team push, then personal pull
+/// (which transitively does team pull when a team is configured).
+///
+/// `pub` so `cas-cli/tests/team_pull_wiring_test.rs` can exercise the
+/// end-to-end wire-up against a wiremock server. Production callers go
+/// through the CLI dispatcher; this is not intended for external public-API
+/// use. Mirrors the same `pub` + `#[doc(hidden)]` pattern as
+/// `execute_team_push` / `execute_team_pull`.
+#[doc(hidden)]
+pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
     execute_push(
         &CloudPushArgs {
             entries_only: false,
@@ -1304,6 +1313,16 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         let cloud_config = CloudConfig::load()?;
         execute_team_push(&cloud_config, cas_root, cli)?;
 
+        // Personal pull AND team pull happen transitively here:
+        // `execute_pull` invokes `execute_team_pull` at its tail when an
+        // active team is configured (cas-6ec7). `execute_sync` does NOT
+        // call `execute_team_pull` itself — duplicating the call would
+        // fire the team-pull HTTP request twice per sync (the second
+        // call returns 0 rows because the first advanced the `since=`
+        // watermark, but the wasted round-trip is still observable). The
+        // behavioral wiremock test in `team_pull_wiring_test.rs`
+        // (`execute_sync_hits_each_pull_endpoint_exactly_once_when_team_configured`)
+        // locks this invariant in with `.expect(1)` on both endpoints.
         execute_pull(
             &CloudPullArgs {
                 entries_only: false,
@@ -1313,16 +1332,6 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
             cli,
             cas_root,
         )?;
-
-        // cas-6ec7: team pull layers on top of the personal pull above.
-        // Without this call, a new team member running `cas cloud sync`
-        // sees zero team-scoped rows — only their personal data lands.
-        // `execute_pull` already invokes `execute_team_pull` internally,
-        // so calling it again here is a defense-in-depth guarantee: if a
-        // future refactor moves the wire-up out of `execute_pull`, the
-        // sync path still fires the team pull. The helper is idempotent
-        // when re-run (server-side `since=` watermark deduplicates).
-        execute_team_pull(&cloud_config, cas_root, cli)?;
     }
 
     Ok(())
@@ -1532,16 +1541,12 @@ pub fn execute_team_pull(
     cas_root: &Path,
     cli: &Cli,
 ) -> anyhow::Result<()> {
-    use std::sync::Arc;
-
-    use crate::cloud::{CloudSyncer, CloudSyncerConfig, SyncQueue};
-
     let Some(team_id) = cloud_config.active_team_id() else {
         return Ok(());
     };
     let team_id = team_id.to_string();
 
-    let queue = match SyncQueue::open(cas_root) {
+    let queue = match crate::cloud::SyncQueue::open(cas_root) {
         Ok(q) => {
             if let Err(e) = q.init() {
                 tracing::warn!(
@@ -1594,10 +1599,10 @@ pub fn execute_team_pull(
         }
     };
 
-    let syncer = CloudSyncer::new(
-        Arc::new(queue),
+    let syncer = crate::cloud::CloudSyncer::new(
+        std::sync::Arc::new(queue),
         cloud_config.clone(),
-        CloudSyncerConfig::default(),
+        crate::cloud::CloudSyncerConfig::default(),
     );
 
     // `let _ =` on reporter calls: a formatter/IO error from the display
