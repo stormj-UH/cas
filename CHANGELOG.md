@@ -5,6 +5,12 @@ All notable changes to CAS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.0] - 2026-05-13
+
+### Changed
+
+- **Stock worker LLM default flipped to Claude Sonnet 4.6 + `reasoning_effort=high` (cas-05e3).** Previously, workers spawned without an explicit `[llm.worker]` block in `.cas/config.toml` (the common case for new installs and most upgraders) fell through to the harness builtin — whatever Claude Code happened to pick by default. New behavior: `LlmConfig::model_for_role("worker")` and `reasoning_effort_for_role("worker")` apply a stock floor when both the role-specific override (`[llm.worker.X]`) and the top-level fallback (`[llm.X]`) are unset. Three-step chain becomes: role-override → top-level → stock-worker-default (`claude-sonnet-4-6` for model, `high` for reasoning effort). Supervisor role is deliberately untouched — `supervisor_does_not_receive_worker_stock_default` regression-locks that boundary. Existing users who explicitly set top-level `[llm] model = "X"` expecting all roles to inherit still see workers resolve to `X` (back-compat hinge). Runtime-only fallback: no changes to `cas init` or `cas update` config seeding, which means updating the stock constant in cas-src automatically propagates the new default to every install without requiring users to re-init or hand-edit. To pin a different worker model, add `[llm.worker] model = "..."` to `.cas/config.toml`. Constants `STOCK_WORKER_MODEL` and `STOCK_WORKER_REASONING_EFFORT` are now public from `cas-cli/src/config/settings.rs` for downstream consumers. 6 new tests + 1 split of the existing `reasoning_effort_for_role_no_config_returns_none` cover the full resolution matrix.
+
 ## [2.15.3] - 2026-05-13
 
 ### Fixed
