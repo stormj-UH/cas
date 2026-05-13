@@ -13,6 +13,27 @@ use cas_types::{Worktree, WorktreeStatus};
 
 type Result<T> = std::result::Result<T, StoreError>;
 
+/// SQLite DDL for the `worktrees` table (epic worktree tracking).
+///
+/// Re-exported via `cas_store::WORKTREE_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base table before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const WORKTREE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS worktrees (
+    id TEXT PRIMARY KEY,
+    epic_id TEXT,
+    branch TEXT NOT NULL,
+    parent_branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    merged_at TEXT,
+    removed_at TEXT,
+    created_by_agent TEXT,
+    merge_commit TEXT
+);
+"#;
+
 /// Worktree storage operations
 pub trait WorktreeStore: Send + Sync {
     /// Initialize schema
@@ -121,21 +142,7 @@ impl WorktreeStore for SqliteWorktreeStore {
     fn init(&self) -> Result<()> {
         // Ensure schema exists for tests/standalone usage (migrations in production).
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS worktrees (
-                id TEXT PRIMARY KEY,
-                epic_id TEXT,
-                branch TEXT NOT NULL,
-                parent_branch TEXT NOT NULL,
-                path TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                merged_at TEXT,
-                removed_at TEXT,
-                created_by_agent TEXT,
-                merge_commit TEXT
-            )",
-        )?;
+        conn.execute_batch(WORKTREE_SCHEMA)?;
         Ok(())
     }
 

@@ -14,7 +14,12 @@ use cas_types::{
     Scope, Task, TaskDeliverables, TaskStatus, TaskType,
 };
 
-const TASK_SCHEMA: &str = r#"
+/// SQLite DDL for the `tasks`, `dependencies`, and minimal `task_leases` tables.
+///
+/// Re-exported via `cas_store::TASK_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const TASK_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,

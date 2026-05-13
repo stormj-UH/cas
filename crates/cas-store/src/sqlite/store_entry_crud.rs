@@ -2,7 +2,7 @@ use crate::Result;
 use crate::error::StoreError;
 use crate::event_store::record_event_with_conn;
 use crate::recording_store::capture_memory_event;
-use crate::sqlite::{SCHEMA, SqliteStore};
+use crate::sqlite::{ENTRIES_RULES_SCHEMA, SqliteStore};
 use crate::tracing::{DevTracer, TraceTimer};
 use cas_types::{Entry, Event, EventEntityType, EventType};
 use chrono::Utc;
@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, params};
 impl SqliteStore {
     pub(crate) fn store_init(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(ENTRIES_RULES_SCHEMA)?;
 
         // Sessions table for enterprise analytics
         // NOTE: Column migrations are now handled by `cas update --schema-only`

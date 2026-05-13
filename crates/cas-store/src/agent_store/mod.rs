@@ -37,8 +37,13 @@ pub struct LeaseHistoryEntry {
     pub previous_agent_id: Option<String>,
 }
 
-/// Schema for agents and task leases tables
-const AGENT_SCHEMA: &str = r#"
+/// Schema for agents and task leases tables.
+///
+/// Re-exported via `cas_store::AGENT_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base table before applying ALTER migrations
+/// against subsystems whose tables were historically created lazily.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const AGENT_SCHEMA: &str = r#"
 -- Agents table: tracks registered Claude Code instances
 -- Agent ID is now PPID-based (cc-{ppid}-{machine_hash}) for stability
 CREATE TABLE IF NOT EXISTS agents (

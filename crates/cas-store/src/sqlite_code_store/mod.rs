@@ -14,6 +14,67 @@ use cas_code::{
     Language, SymbolKind,
 };
 
+/// SQLite DDL for the code-store tables (`code_files`, `code_symbols`,
+/// `code_relationships`, `code_memory_links`).
+///
+/// Re-exported via `cas_store::CODE_SCHEMA` so the migration runner in
+/// `cas-cli` can bootstrap the base tables before applying ALTER migrations.
+/// See cas-bdb9 / EPIC cas-9fdb.
+pub const CODE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS code_files (
+    id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    language TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    line_count INTEGER NOT NULL DEFAULT 0,
+    commit_hash TEXT,
+    content_hash TEXT NOT NULL,
+    created TEXT NOT NULL,
+    updated TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'project',
+    UNIQUE(repository, path)
+);
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id TEXT PRIMARY KEY,
+    qualified_name TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    language TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    documentation TEXT,
+    signature TEXT,
+    parent_id TEXT,
+    repository TEXT NOT NULL,
+    created TEXT NOT NULL,
+    updated TEXT NOT NULL,
+    commit_hash TEXT,
+    content_hash TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'project'
+);
+CREATE TABLE IF NOT EXISTS code_relationships (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    created TEXT NOT NULL,
+    UNIQUE(source_id, target_id, relation_type)
+);
+CREATE TABLE IF NOT EXISTS code_memory_links (
+    code_id TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    link_type TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    created TEXT NOT NULL,
+    PRIMARY KEY (code_id, entry_id, link_type)
+);
+"#;
+
 /// SQLite-based implementation of CodeStore.
 pub struct SqliteCodeStore {
     conn: Arc<Mutex<Connection>>,
@@ -28,60 +89,7 @@ impl SqliteCodeStore {
         // Ensure code tables exist
         {
             let c = conn.lock().unwrap();
-            c.execute_batch(
-                "CREATE TABLE IF NOT EXISTS code_files (
-                    id TEXT PRIMARY KEY,
-                    path TEXT NOT NULL,
-                    repository TEXT NOT NULL,
-                    language TEXT NOT NULL,
-                    size INTEGER NOT NULL DEFAULT 0,
-                    line_count INTEGER NOT NULL DEFAULT 0,
-                    commit_hash TEXT,
-                    content_hash TEXT NOT NULL,
-                    created TEXT NOT NULL,
-                    updated TEXT NOT NULL,
-                    scope TEXT NOT NULL DEFAULT 'project',
-                    UNIQUE(repository, path)
-                );
-                CREATE TABLE IF NOT EXISTS code_symbols (
-                    id TEXT PRIMARY KEY,
-                    qualified_name TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    language TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
-                    file_id TEXT NOT NULL,
-                    line_start INTEGER NOT NULL,
-                    line_end INTEGER NOT NULL,
-                    source TEXT NOT NULL,
-                    documentation TEXT,
-                    signature TEXT,
-                    parent_id TEXT,
-                    repository TEXT NOT NULL,
-                    created TEXT NOT NULL,
-                    updated TEXT NOT NULL,
-                    commit_hash TEXT,
-                    content_hash TEXT NOT NULL,
-                    scope TEXT NOT NULL DEFAULT 'project'
-                );
-                CREATE TABLE IF NOT EXISTS code_relationships (
-                    id TEXT PRIMARY KEY,
-                    source_id TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    relation_type TEXT NOT NULL,
-                    weight REAL NOT NULL DEFAULT 1.0,
-                    created TEXT NOT NULL,
-                    UNIQUE(source_id, target_id, relation_type)
-                );
-                CREATE TABLE IF NOT EXISTS code_memory_links (
-                    code_id TEXT NOT NULL,
-                    entry_id TEXT NOT NULL,
-                    link_type TEXT NOT NULL,
-                    confidence REAL NOT NULL DEFAULT 0.8,
-                    created TEXT NOT NULL,
-                    PRIMARY KEY (code_id, entry_id, link_type)
-                );",
-            )?;
+            c.execute_batch(CODE_SCHEMA)?;
         }
 
         Ok(Self { conn })
