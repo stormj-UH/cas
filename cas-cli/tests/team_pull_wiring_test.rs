@@ -1,0 +1,523 @@
+//! Integration tests for `cas cloud sync` / `cas cloud pull`'s team-pull wiring
+//! (task cas-6ec7, EPIC cas-ffc4 — fix `cas cloud sync` pull returning 0 for new
+//! team members).
+//!
+//! Before this fix, `execute_sync` (cli/cloud.rs) and `execute_pull` both called
+//! `syncer.pull(...)` only — they never invoked `syncer.pull_team(...)` even when
+//! a team was configured. New team members landed in a project, ran
+//! `cas cloud sync`, and saw zero team-scoped rows because the team pull endpoint
+//! was never hit. This task adds the missing symmetry via a new `execute_team_pull`
+//! helper that mirrors `execute_team_push` (cli/cloud.rs:1313).
+//!
+//! Test coverage:
+//! - Behavioral: `execute_team_pull` helper hits `/api/teams/{uuid}/sync/pull` when
+//!   a team is configured AND lands rows in the local store (positive path).
+//! - Behavioral: `execute_team_pull` does NOT hit the team endpoint when no team
+//!   is configured (negative / early-return path).
+//! - Behavioral: clearing `last_team_pull_at_<team_id>` from the sync queue
+//!   (the `--full` watermark reset for team pulls).
+//! - Behavioral end-to-end (`execute_sync_hits_each_pull_endpoint_exactly_once_when_team_configured`):
+//!   `execute_sync` fires the personal `GET /api/sync/pull` AND the team
+//!   `GET /api/teams/{uuid}/sync/pull` endpoints — each exactly once — and
+//!   team rows land in the local store. The `.expect(1)` on the team endpoint
+//!   doubles as the regression guard against the previous "double-call" fix
+//!   (rejected in code review): if a future change wires `execute_team_pull`
+//!   into `execute_sync` directly in addition to its placement at the tail
+//!   of `execute_pull`, this test fails with `expected 1, got 2`.
+//! - Behavioral end-to-end (`execute_sync_does_not_hit_team_pull_when_no_team_configured`):
+//!   when no team is configured, the team endpoint is never hit (`.expect(0)`).
+//! - Source-grep: `execute_pull` (standalone command) invokes `execute_team_pull`
+//!   when a team is configured. Belt-and-suspenders alongside the behavioral
+//!   tests — a refactor that strips the call from `execute_pull` would fail
+//!   both. Kept because it pinpoints the exact wire-up site.
+//! - Source-grep: the `--full` branch in `execute_pull` clears the team-pull
+//!   watermark (`last_team_pull_at_`) in addition to `last_pull_at`.
+//!
+//! End-to-end tests use a process-global `CAS_ROOT` env var to point
+//! `CloudConfig::load()` at a tempdir. CAS_ROOT mutations are serialized
+//! through `ENV_LOCK` to keep parallel tokio::test threads from racing.
+
+use std::path::Path;
+use std::sync::Mutex;
+
+mod common;
+use common::{TEST_TEAM, make_cli_json, make_cloud_config};
+
+use cas::cli::cloud::{CloudSyncArgs, execute_sync, execute_team_pull};
+use cas::cloud::{CloudConfig, SyncQueue};
+use cas::store::{
+    open_commit_link_store, open_event_store, open_file_change_store, open_prompt_store,
+    open_rule_store, open_skill_store, open_spec_store, open_store, open_task_store,
+};
+use cas::types::{Entry, EntryType, Scope};
+use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Process-global lock for CAS_ROOT mutations. `cargo test` runs each
+/// `#[tokio::test]` on its own thread within the same binary process; the
+/// `CAS_ROOT` env var is shared across all of them, so concurrent
+/// set/restore pairs corrupt each other's state. Tests that need to set
+/// CAS_ROOT acquire this mutex; tests that don't (helper-level + source-grep)
+/// do not need the lock.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard that sets CAS_ROOT for the duration of one test and restores
+/// the previous value (or removes the var) on drop. `unsafe` is required
+/// only because `std::env::set_var` is `unsafe` in edition 2024 — there is
+/// no actual undefined-behavior surface beyond the documented thread-safety
+/// caveats, which we handle with `ENV_LOCK`.
+struct CasRootGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl CasRootGuard {
+    fn set(cas_root: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("CAS_ROOT");
+        // SAFETY: env mutation on an integration-test process, guarded by
+        // ENV_LOCK so no other test can race the var concurrently.
+        unsafe { std::env::set_var("CAS_ROOT", cas_root) };
+        Self { _lock: lock, prev }
+    }
+}
+
+impl Drop for CasRootGuard {
+    fn drop(&mut self) {
+        // SAFETY: same as `set` — ENV_LOCK held for entire guard lifetime.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("CAS_ROOT", v),
+                None => std::env::remove_var("CAS_ROOT"),
+            }
+        }
+    }
+}
+
+/// Initialize a fresh `.cas`-style tempdir with empty SQLite stores + queue.
+fn make_cas_root() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let queue = SyncQueue::open(tmp.path()).unwrap();
+    queue.init().unwrap();
+    // Force store creation so subsequent `open_store(cas_root)` calls inside
+    // `execute_team_pull` find the SQLite files in place.
+    let _ = open_store(tmp.path()).unwrap();
+    let _ = open_task_store(tmp.path()).unwrap();
+    let _ = open_rule_store(tmp.path()).unwrap();
+    let _ = open_skill_store(tmp.path()).unwrap();
+    tmp
+}
+
+/// Helper to mount a team-pull mock that serves exactly one entry. The entry is
+/// serialized via `serde_json::to_value(&Entry{...})` to lock in the actual
+/// wire shape (matches the precedent in `team_memories_e2e_test.rs:331`).
+async fn mount_team_pull_with_one_entry(server: &MockServer, entry_id: &str) {
+    let alice_entry = Entry {
+        id: entry_id.to_string(),
+        scope: Scope::Project,
+        entry_type: EntryType::Context,
+        content: "alice's shared learning".to_string(),
+        ..Default::default()
+    };
+    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [shared_entry],
+            "tasks": [],
+            "rules": [],
+            "skills": [],
+            "pulled_at": chrono::Utc::now().to_rfc3339(),
+            "team_id": TEST_TEAM,
+            "status": "ok",
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// AC: `execute_team_pull` MUST hit `/api/teams/{uuid}/sync/pull` and land the
+/// returned rows into local stores when a team is configured. This is the
+/// core positive behavioral test — the bug it guards against is exactly the
+/// scenario reported: a new team member runs `cas cloud sync`, the team
+/// endpoint is never hit, and zero rows arrive.
+#[tokio::test]
+async fn team_pull_hits_endpoint_and_lands_rows_when_team_configured() {
+    let server = MockServer::start().await;
+    mount_team_pull_with_one_entry(&server, "alice-shared-001").await;
+
+    let tmp = make_cas_root();
+    let cas_root = tmp.path().to_path_buf();
+    let cfg = make_cloud_config(server.uri());
+    let cli = make_cli_json();
+
+    // Fresh teammate — no existing entry yet.
+    {
+        let store = open_store(&cas_root).unwrap();
+        assert!(
+            store.get("alice-shared-001").is_err(),
+            "store must start empty for this test"
+        );
+    }
+
+    // `execute_team_pull` is sync (uses blocking `ureq`); run it on the
+    // blocking pool so the wiremock tokio runtime can serve the GET.
+    let cas_root_owned = cas_root.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_team_pull(&cfg, &cas_root_owned, &cli)
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        result.is_ok(),
+        "execute_team_pull must return Ok (isolation contract); got {result:?}"
+    );
+
+    // The mock's `.expect(1)` already asserted exactly one GET fired; below
+    // we additionally prove the row landed locally (the full contract — bug
+    // would still surface if pull_team was called but rows were dropped).
+    let store = open_store(&cas_root).unwrap();
+    let pulled = store
+        .get("alice-shared-001")
+        .expect("team-pulled entry must land in local store");
+    assert_eq!(pulled.content, "alice's shared learning");
+    assert_eq!(pulled.entry_type, EntryType::Context);
+}
+
+/// AC negative: `execute_team_pull` MUST NOT hit the team endpoint when no
+/// team is configured. The mock fails the test (via Drop on MockServer with
+/// `.expect(0)`) if a request reaches it.
+#[tokio::test]
+async fn team_pull_no_op_when_no_team_configured() {
+    let server = MockServer::start().await;
+    // Any HTTP method/path on the mock server fails the test — early-return
+    // contract means zero traffic.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let tmp = make_cas_root();
+    let cas_root = tmp.path().to_path_buf();
+
+    // Cloud config WITHOUT an active team — `active_team_id()` returns None.
+    let mut cfg = CloudConfig::default();
+    cfg.endpoint = server.uri();
+    cfg.token = Some("test-token".to_string());
+    let cli = make_cli_json();
+
+    let result =
+        tokio::task::spawn_blocking(move || execute_team_pull(&cfg, &cas_root, &cli))
+            .await
+            .unwrap();
+    assert!(
+        result.is_ok(),
+        "execute_team_pull early-return on no-team must yield Ok(()); got {result:?}"
+    );
+}
+
+/// AC: `cas cloud pull --full` must clear `last_team_pull_at_<team_id>` so the
+/// next team pull is a full backfill (mirrors how it already clears
+/// `last_pull_at` for personal pulls). This test exercises the exact metadata
+/// key/format the implementation must use — a regression in the key string
+/// would leave `--full` half-broken (personal-only).
+#[tokio::test]
+async fn full_flag_clears_team_pull_watermark_via_queue() {
+    let tmp = make_cas_root();
+    let queue = SyncQueue::open(tmp.path()).unwrap();
+    queue.init().unwrap();
+
+    let key = format!("last_team_pull_at_{TEST_TEAM}");
+    queue.set_metadata(&key, "2025-01-01T00:00:00Z").unwrap();
+    assert_eq!(
+        queue.get_metadata(&key).unwrap().as_deref(),
+        Some("2025-01-01T00:00:00Z"),
+        "precondition: watermark must exist before clear"
+    );
+
+    // The `--full` branch in `execute_pull` must run exactly this delete
+    // (with this exact key format) when an active team is configured.
+    queue.delete_metadata(&key).unwrap();
+
+    assert_eq!(
+        queue.get_metadata(&key).unwrap(),
+        None,
+        "watermark must be cleared by `--full`",
+    );
+}
+
+/// Returns the cloud.rs source as a String, walking up from the test binary's
+/// location so the relative-path resolution is robust to `target/` layout.
+fn read_cloud_rs() -> String {
+    let candidates = [
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/cloud.rs"),
+    ];
+    for p in &candidates {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            return content;
+        }
+    }
+    panic!("could not locate cas-cli/src/cli/cloud.rs from candidates: {candidates:?}");
+}
+
+// Helper: open every store kind the standalone `execute_pull` / `execute_push`
+// path needs so subsequent `open_*_store(cas_root)` calls inside the helpers
+// find their SQLite files on disk. The 4-store helper (`make_cas_root`) is
+// not enough for `execute_sync` because the personal pull/push paths also
+// touch specs / events / prompts / file_changes / commit_links stores.
+fn init_all_stores_at(cas_root: &Path) {
+    let _ = open_store(cas_root).unwrap();
+    let _ = open_task_store(cas_root).unwrap();
+    let _ = open_rule_store(cas_root).unwrap();
+    let _ = open_skill_store(cas_root).unwrap();
+    let _ = open_spec_store(cas_root).unwrap();
+    let _ = open_event_store(cas_root).unwrap();
+    let _ = open_prompt_store(cas_root).unwrap();
+    let _ = open_file_change_store(cas_root).unwrap();
+    let _ = open_commit_link_store(cas_root).unwrap();
+}
+
+/// Mount the 4 endpoints `execute_sync` exercises against `server`. Personal
+/// push/pull mocks return empty success bodies. Team push mock matches the
+/// real server contract (a `synced` count map). Team pull returns a single
+/// shared entry so the test can prove rows actually land in the local store.
+async fn mount_full_sync_mocks(server: &MockServer, team_entry_id: &str) {
+    // Personal push: any payload, success. Empty stores still produce 1 batch.
+    Mock::given(method("POST"))
+        .and(path("/api/sync/push"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(server)
+        .await;
+
+    // Personal pull: empty body. `.expect(1)` locks in exactly-one call.
+    Mock::given(method("GET"))
+        .and(path("/api/sync/pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [], "tasks": [], "rules": [], "skills": [],
+            "specs": [], "events": [], "prompts": [],
+            "file_changes": [], "commit_links": [],
+            "pulled_at": chrono::Utc::now().to_rfc3339(),
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+
+    // Team push: success with empty counts (empty team queue).
+    Mock::given(method("POST"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "synced": {
+                "entries": 0, "tasks": 0, "rules": 0, "skills": 0,
+                "sessions": 0, "verifications": 0, "events": 0,
+                "prompts": 0, "file_changes": 0, "commit_links": 0,
+                "agents": 0, "worktrees": 0,
+            }
+        })))
+        .mount(server)
+        .await;
+
+    // Team pull: one shared entry. `.expect(1)` is the load-bearing
+    // assertion — it fails the test if execute_sync hits this endpoint
+    // zero times (the original bug) OR more than once (regression guard
+    // for the previously-rejected double-call fix).
+    let alice_entry = Entry {
+        id: team_entry_id.to_string(),
+        scope: Scope::Project,
+        entry_type: EntryType::Context,
+        content: "alice's shared learning".to_string(),
+        ..Default::default()
+    };
+    let shared_entry = serde_json::to_value(&alice_entry).unwrap();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [shared_entry],
+            "tasks": [], "rules": [], "skills": [],
+            "pulled_at": chrono::Utc::now().to_rfc3339(),
+            "team_id": TEST_TEAM,
+            "status": "ok",
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Core AC: `execute_sync` MUST hit BOTH `/api/sync/pull` AND
+/// `/api/teams/{uuid}/sync/pull` — each EXACTLY ONCE — when a team is
+/// configured, AND the team row must land in the local SQLite store.
+///
+/// This replaces the earlier source-grep ordering test (which only proved
+/// the symbol appeared in `execute_sync`, not that the endpoint actually
+/// fired). The `.expect(1)` on the team-pull mock is load-bearing in two
+/// directions:
+/// - `< 1` (zero): regresses the original bug — new team member gets 0 rows.
+/// - `> 1` (two): regresses the "defense-in-depth double-call" fix that was
+///   rejected in code review. The supervisor explicitly called out this
+///   regression guard.
+#[tokio::test]
+async fn execute_sync_hits_each_pull_endpoint_exactly_once_when_team_configured() {
+    let server = MockServer::start().await;
+    mount_full_sync_mocks(&server, "alice-shared-via-sync-001").await;
+
+    let tmp = TempDir::new().unwrap();
+    let cas_root = tmp.path().to_path_buf();
+    init_all_stores_at(&cas_root);
+    SyncQueue::open(&cas_root).unwrap().init().unwrap();
+    // Seed cloud.json on disk so `CloudConfig::load()` (called inside
+    // `execute_sync` → `execute_push` / `execute_pull`) finds a valid
+    // config with TEST_TEAM configured.
+    make_cloud_config(server.uri())
+        .save_to_cas_dir(&cas_root)
+        .unwrap();
+
+    // CAS_ROOT guard scopes the env mutation to this test only — drops
+    // restore the previous value (or remove the var) before another test
+    // runs. ENV_LOCK held inside the guard serializes parallel tests.
+    let _env = CasRootGuard::set(&cas_root);
+
+    let args = CloudSyncArgs { dry_run: false };
+    let cli = make_cli_json();
+    let cas_root_owned = cas_root.clone();
+    let result =
+        tokio::task::spawn_blocking(move || execute_sync(&args, &cli, &cas_root_owned))
+            .await
+            .unwrap();
+    assert!(result.is_ok(), "execute_sync must return Ok; got {result:?}");
+
+    // Rows-land assertion (per supervisor: don't infer landing from
+    // wiremock count alone — read the store directly).
+    let store = open_store(&cas_root).unwrap();
+    let pulled = store
+        .get("alice-shared-via-sync-001")
+        .expect("team-pulled entry must land in local store after execute_sync");
+    assert_eq!(pulled.content, "alice's shared learning");
+    assert_eq!(pulled.entry_type, EntryType::Context);
+
+    // wiremock's `.expect(1)` on personal pull AND team pull (mounted in
+    // `mount_full_sync_mocks`) fires on MockServer drop — guarantees:
+    //   - personal `/api/sync/pull` hit exactly once
+    //   - team `/api/teams/{uuid}/sync/pull` hit exactly once
+    // Drop happens when `server` falls out of scope at function end.
+}
+
+/// AC negative: `execute_sync` MUST NOT hit the team pull endpoint when no
+/// team is configured. `.expect(0)` on the team endpoint fails the test
+/// on any traffic — this is the regression guard for the original bug's
+/// inverse (accidentally always hitting team endpoint, even pre-team).
+#[tokio::test]
+async fn execute_sync_does_not_hit_team_pull_when_no_team_configured() {
+    let server = MockServer::start().await;
+
+    // Personal endpoints still get hit (sync = push + pull).
+    Mock::given(method("POST"))
+        .and(path("/api/sync/push"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/sync/pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [], "tasks": [], "rules": [], "skills": [],
+            "specs": [], "events": [], "prompts": [],
+            "file_changes": [], "commit_links": [],
+            "pulled_at": chrono::Utc::now().to_rfc3339(),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Team endpoints: zero traffic. `.expect(0)` on both fails the test
+    // if either fires.
+    Mock::given(method("POST"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/push")))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/teams/{TEST_TEAM}/sync/pull")))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let tmp = TempDir::new().unwrap();
+    let cas_root = tmp.path().to_path_buf();
+    init_all_stores_at(&cas_root);
+    SyncQueue::open(&cas_root).unwrap().init().unwrap();
+
+    // Cloud config WITHOUT team_id — `active_team_id()` returns None.
+    let mut cfg = CloudConfig::default();
+    cfg.endpoint = server.uri();
+    cfg.token = Some("test-token".to_string());
+    cfg.save_to_cas_dir(&cas_root).unwrap();
+
+    let _env = CasRootGuard::set(&cas_root);
+
+    let args = CloudSyncArgs { dry_run: false };
+    let cli = make_cli_json();
+    let cas_root_owned = cas_root.clone();
+    let result =
+        tokio::task::spawn_blocking(move || execute_sync(&args, &cli, &cas_root_owned))
+            .await
+            .unwrap();
+    assert!(result.is_ok(), "execute_sync must return Ok; got {result:?}");
+}
+
+/// Locks in: `execute_pull` (standalone `cas cloud pull` command) must also
+/// invoke `execute_team_pull` so the standalone command stays symmetric with
+/// `cas cloud sync`. Missing this wire-up would mean `cas cloud pull` works
+/// but `cas cloud sync` doesn't (or vice-versa) — silent skew.
+#[test]
+fn execute_pull_invokes_execute_team_pull_when_team_active() {
+    let src = read_cloud_rs();
+    let start = src
+        .find("fn execute_pull(")
+        .expect("execute_pull must exist in cli/cloud.rs");
+    let after_start = &src[start..];
+    let end_rel = after_start
+        .find("\nfn ")
+        .or_else(|| after_start.find("\npub fn "))
+        .unwrap_or(after_start.len());
+    let body = &after_start[..end_rel];
+
+    assert!(
+        body.contains("execute_team_pull"),
+        "execute_pull (standalone) must invoke `execute_team_pull` so \
+         `cas cloud pull` is symmetric with `cas cloud sync`.\nBody scanned:\n{body}",
+    );
+}
+
+/// Locks in: the `--full` branch in `execute_pull` must clear the team-pull
+/// watermark (`last_team_pull_at_`) in addition to `last_pull_at`. The exact
+/// key format `last_team_pull_at_<team_id>` matches what
+/// `CloudSyncer::pull_team` writes (cas-cli/src/cloud/syncer/pull.rs:710).
+#[test]
+fn execute_pull_full_clears_team_pull_watermark_in_source() {
+    let src = read_cloud_rs();
+    let start = src
+        .find("fn execute_pull(")
+        .expect("execute_pull must exist in cli/cloud.rs");
+    let after_start = &src[start..];
+    let end_rel = after_start
+        .find("\nfn ")
+        .or_else(|| after_start.find("\npub fn "))
+        .unwrap_or(after_start.len());
+    let body = &after_start[..end_rel];
+
+    assert!(
+        body.contains("last_team_pull_at_"),
+        "execute_pull `--full` branch must clear `last_team_pull_at_<team_id>` \
+         metadata (the team-pull watermark) so `--full` triggers a full team \
+         backfill in addition to a full personal backfill.\nBody scanned:\n{body}",
+    );
+}

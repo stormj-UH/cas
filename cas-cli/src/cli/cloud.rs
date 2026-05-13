@@ -1161,13 +1161,26 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 
         // --full: clear the watermark so the syncer issues a full (no `since=`)
         // pull. This preserves the prior `--full` semantics under the new path.
+        //
+        // When a team is also configured, clear the team-pull watermark too
+        // (`last_team_pull_at_<team_id>`, written by `CloudSyncer::pull_team`
+        // — see cas-cli/src/cloud/syncer/pull.rs:710) so `--full` triggers a
+        // full team backfill in addition to a full personal backfill. Task
+        // cas-6ec7 added this — without it, `--full` was half-broken
+        // (personal cleared, team kept its old watermark and only fetched
+        // deltas).
         if args.full {
             queue.delete_metadata("last_pull_at")?;
+            if let Some(team_id) = config.active_team_id() {
+                queue.delete_metadata(&format!("last_team_pull_at_{team_id}"))?;
+            }
         }
 
         let syncer = CloudSyncer::new(
             Arc::new(queue),
-            config,
+            // Clone: the outer `config` is reused after this scope to call
+            // `execute_team_pull` (cas-6ec7 wire-up).
+            config.clone(),
             CloudSyncerConfig::default(),
         );
 
@@ -1257,6 +1270,13 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         }
     }
 
+    // Team pull layers on top of personal pull when a team is configured.
+    // cas-6ec7: `cas cloud pull` was missing this call, leaving new team
+    // members with zero team-scoped rows on a fresh `cas cloud pull`. The
+    // helper is a no-op when `active_team_id()` is None and isolates its
+    // own errors so it cannot regress personal-pull results.
+    execute_team_pull(&config, cas_root, cli)?;
+
     Ok(())
 }
 
@@ -1264,7 +1284,16 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 // SYNC
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+/// Orchestrates `cas cloud sync` — personal push, team push, then personal pull
+/// (which transitively does team pull when a team is configured).
+///
+/// `pub` so `cas-cli/tests/team_pull_wiring_test.rs` can exercise the
+/// end-to-end wire-up against a wiremock server. Production callers go
+/// through the CLI dispatcher; this is not intended for external public-API
+/// use. Mirrors the same `pub` + `#[doc(hidden)]` pattern as
+/// `execute_team_push` / `execute_team_pull`.
+#[doc(hidden)]
+pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
     execute_push(
         &CloudPushArgs {
             entries_only: false,
@@ -1284,6 +1313,16 @@ fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
         let cloud_config = CloudConfig::load()?;
         execute_team_push(&cloud_config, cas_root, cli)?;
 
+        // Personal pull AND team pull happen transitively here:
+        // `execute_pull` invokes `execute_team_pull` at its tail when an
+        // active team is configured (cas-6ec7). `execute_sync` does NOT
+        // call `execute_team_pull` itself — duplicating the call would
+        // fire the team-pull HTTP request twice per sync (the second
+        // call returns 0 rows because the first advanced the `since=`
+        // watermark, but the wasted round-trip is still observable). The
+        // behavioral wiremock test in `team_pull_wiring_test.rs`
+        // (`execute_sync_hits_each_pull_endpoint_exactly_once_when_team_configured`)
+        // locks this invariant in with `.expect(1)` on both endpoints.
         execute_pull(
             &CloudPullArgs {
                 entries_only: false,
@@ -1464,6 +1503,228 @@ fn report_team_push_error(cli: &Cli, msg: &str) -> anyhow::Result<()> {
         println!(
             "{}",
             team_push_json("", &empty, std::slice::from_ref(&msg.to_string()))
+        );
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(msg)?;
+        fmt.newline()?;
+    }
+    Ok(())
+}
+
+/// Pull team data into the local stores from `GET /api/teams/{uuid}/sync/pull`
+/// when a team is configured. No-op when no active team.
+///
+/// Contract: always returns `Ok(())` — team-pull failures are reported via
+/// `report_team_pull_*` and isolated from the surrounding sync so the
+/// personal pull that ran just before stays, and any caller chained after
+/// (e.g. `execute_sync` exit) still completes cleanly. Mirrors the isolation
+/// contract of `execute_team_push` (cli/cloud.rs:1313).
+///
+/// Signature note: `pull_team` currently takes 4 stores (entries / tasks /
+/// rules / skills) — NOT the full 9-store set that personal `pull` takes.
+/// Per task cas-6ec7 spec, this helper preserves that parity. Extending
+/// `pull_team` to specs / events / prompts / file_changes / commit_links is
+/// a separate scope expansion.
+///
+/// `pub` so `cas-cli/tests/team_pull_wiring_test.rs` can exercise the helper
+/// directly with a wiremock server, matching the precedent set by
+/// `execute_team_push` for `team_sync_test.rs`. Not intended for external
+/// (public-API) use.
+#[doc(hidden)]
+pub fn execute_team_pull(
+    cloud_config: &CloudConfig,
+    cas_root: &Path,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    let Some(team_id) = cloud_config.active_team_id() else {
+        return Ok(());
+    };
+    let team_id = team_id.to_string();
+
+    let queue = match crate::cloud::SyncQueue::open(cas_root) {
+        Ok(q) => {
+            if let Err(e) = q.init() {
+                tracing::warn!(
+                    target: "cas::sync",
+                    error = %e,
+                    "team sync queue init failed; team pull aborted",
+                );
+                // Isolation contract: reporter errors must not escape.
+                let _ = report_team_pull_error(cli, &format!("Team sync queue init failed: {e}"));
+                return Ok(());
+            }
+            q
+        }
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Could not open sync queue: {e}"));
+            return Ok(());
+        }
+    };
+
+    // Stores synced by `pull_team`: entries / tasks / rules / skills (only).
+    // Per cas-6ec7 spec, this is intentional parity with the current
+    // `pull_team` signature — adding the remaining 5 entity kinds is a
+    // separate scope expansion.
+    let store = match open_store(cas_root) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Could not open entry store: {e}"));
+            return Ok(());
+        }
+    };
+    let task_store = match open_task_store(cas_root) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Could not open task store: {e}"));
+            return Ok(());
+        }
+    };
+    let rule_store = match open_rule_store(cas_root) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Could not open rule store: {e}"));
+            return Ok(());
+        }
+    };
+    let skill_store = match open_skill_store(cas_root) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Could not open skill store: {e}"));
+            return Ok(());
+        }
+    };
+
+    let syncer = crate::cloud::CloudSyncer::new(
+        std::sync::Arc::new(queue),
+        cloud_config.clone(),
+        crate::cloud::CloudSyncerConfig::default(),
+    );
+
+    // `let _ =` on reporter calls: a formatter/IO error from the display
+    // path must not propagate out and block subsequent caller steps.
+    match syncer.pull_team(
+        &team_id,
+        store.as_ref(),
+        task_store.as_ref(),
+        rule_store.as_ref(),
+        skill_store.as_ref(),
+    ) {
+        Ok(result) => {
+            if result.errors.is_empty() {
+                let _ = report_team_pull_result(cli, &team_id, &result);
+            } else {
+                let _ = report_team_pull_partial(cli, &team_id, &result);
+            }
+        }
+        Err(e) => {
+            let _ = report_team_pull_error(cli, &format!("Team pull failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Shared JSON shape for `report_team_pull_{result,partial,error}` —
+/// consumers see a consistent `{team_pull: {...}}` object regardless of
+/// outcome. Mirrors `team_push_json`'s shape so JSON consumers can branch
+/// on the wrapper key.
+fn team_pull_json(
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+    extra_errors: &[String],
+) -> serde_json::Value {
+    let mut errors = result.errors.clone();
+    errors.extend(extra_errors.iter().cloned());
+    serde_json::json!({
+        "team_pull": {
+            "team_id": team_id,
+            "pulled_entries": result.pulled_entries,
+            "pulled_tasks": result.pulled_tasks,
+            "pulled_rules": result.pulled_rules,
+            "pulled_skills": result.pulled_skills,
+            "conflicts_resolved": result.conflicts_resolved,
+            "duration_ms": result.duration_ms,
+            "errors": errors,
+        }
+    })
+}
+
+fn report_team_pull_result(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        println!("{}", team_pull_json(team_id, result, &[]));
+    } else {
+        // Suppress no-op output when nothing was pulled — keeps the human
+        // sync log uncluttered for the steady-state case (matches the
+        // `total_pushed() > 0` guard in `report_team_push_result`).
+        let total = result.pulled_entries
+            + result.pulled_tasks
+            + result.pulled_rules
+            + result.pulled_skills;
+        if total > 0 {
+            let theme = ActiveTheme::default();
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            let success_color = fmt.theme().palette.status_success;
+            fmt.write_colored("  \u{2713} ", success_color)?;
+            fmt.write_raw(&format!(
+                "Team pull: {} entries, {} tasks, {} rules, {} skills ({} total)",
+                result.pulled_entries,
+                result.pulled_tasks,
+                result.pulled_rules,
+                result.pulled_skills,
+                total,
+            ))?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_pull_partial(
+    cli: &Cli,
+    team_id: &str,
+    result: &crate::cloud::SyncResult,
+) -> anyhow::Result<()> {
+    if cli.json {
+        // Same shape as the full-success path so JSON consumers can always
+        // read pulled counts regardless of outcome.
+        println!("{}", team_pull_json(team_id, result, &[]));
+    } else {
+        let theme = ActiveTheme::default();
+        let mut out = io::stdout();
+        let mut fmt = Formatter::stdout(&mut out, theme);
+        let warning_color = fmt.theme().palette.status_warning;
+        fmt.write_colored("  \u{26A0} ", warning_color)?;
+        fmt.write_raw(&format!(
+            "Team pull encountered {} error(s); partial results applied",
+            result.errors.len()
+        ))?;
+        fmt.newline()?;
+        for err in &result.errors {
+            fmt.write_muted("    - ")?;
+            fmt.write_raw(err)?;
+            fmt.newline()?;
+        }
+    }
+    Ok(())
+}
+
+fn report_team_pull_error(cli: &Cli, msg: &str) -> anyhow::Result<()> {
+    if cli.json {
+        // Empty SyncResult + the single fatal error as a string — keeps
+        // shape consistent with success/partial paths.
+        let empty = crate::cloud::SyncResult::default();
+        println!(
+            "{}",
+            team_pull_json("", &empty, std::slice::from_ref(&msg.to_string()))
         );
     } else {
         let theme = ActiveTheme::default();
