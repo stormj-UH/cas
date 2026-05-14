@@ -353,7 +353,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "args": ["cas", "hook", "PreToolUse"],
+                            "command": "cas hook PreToolUse",
                             "timeout": 2000
                         }
                     ]
@@ -364,7 +364,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "args": ["cas", "hook", "PermissionRequest"],
+                            "command": "cas hook PermissionRequest",
                             "timeout": 2000
                         }
                     ]
@@ -880,18 +880,17 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PreToolUse entry: {hooks}"));
-            let pre_args: Vec<&str> = pre
+            let pre_cmd = pre
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("args"))
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_else(|| panic!("{role} PreToolUse missing args: {pre}"));
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{role} PreToolUse missing shell-form command: {pre}"));
             assert_eq!(
-                pre_args,
-                vec!["cas", "hook", "PreToolUse"],
-                "{role} PreToolUse must invoke `cas hook PreToolUse` via exec-form args"
+                pre_cmd,
+                "cas hook PreToolUse",
+                "{role} PreToolUse must invoke `cas hook PreToolUse` via shell-form command (cas-c17b)"
             );
             let matcher = pre
                 .get("matcher")
@@ -909,18 +908,17 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PermissionRequest entry: {hooks}"));
-            let perm_args: Vec<&str> = perm
+            let perm_cmd = perm
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("args"))
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_else(|| panic!("{role} PermissionRequest missing args: {perm}"));
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{role} PermissionRequest missing shell-form command: {perm}"));
             assert_eq!(
-                perm_args,
-                vec!["cas", "hook", "PermissionRequest"],
-                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via exec-form args"
+                perm_cmd,
+                "cas hook PermissionRequest",
+                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via shell-form command (cas-c17b)"
             );
         }
     }
