@@ -105,7 +105,7 @@ pub enum RelayEvent {
 /// Configuration for the cloud client
 #[derive(Debug, Clone)]
 pub struct CloudClientConfig {
-    /// Cloud API endpoint (e.g., "https://cas.dev")
+    /// Cloud API endpoint (e.g., "https://petra-stella-cloud.vercel.app")
     pub endpoint: String,
     /// API token for authentication
     pub token: String,

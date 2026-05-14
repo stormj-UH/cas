@@ -32,7 +32,7 @@ pub struct LoginArgs {
     pub token: Option<String>,
 
     /// Cloud API endpoint
-    #[arg(long, default_value = "https://cas.dev")]
+    #[arg(long, env = "CAS_CLOUD_ENDPOINT", default_value = "https://petra-stella-cloud.vercel.app")]
     pub endpoint: String,
 
     /// Don't open browser automatically
@@ -44,7 +44,7 @@ impl Default for LoginArgs {
     fn default() -> Self {
         Self {
             token: None,
-            endpoint: "https://cas.dev".to_string(),
+            endpoint: "https://petra-stella-cloud.vercel.app".to_string(),
             no_browser: false,
         }
     }

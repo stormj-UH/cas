@@ -341,7 +341,10 @@ pub struct CloudConfig {
 }
 
 fn default_endpoint() -> String {
-    "https://cas.dev".to_string()
+    std::env::var("CAS_CLOUD_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://petra-stella-cloud.vercel.app".to_string())
 }
 
 impl Default for CloudConfig {
@@ -508,7 +511,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = CloudConfig::default();
-        assert_eq!(config.endpoint, "https://cas.dev");
+        assert_eq!(config.endpoint, "https://petra-stella-cloud.vercel.app");
         assert!(config.token.is_none());
         assert!(!config.is_logged_in());
     }
@@ -999,6 +1002,70 @@ mod tests {
         let content = std::fs::read_to_string(cas_root.join("config.toml")).unwrap();
         assert!(content.contains("session_learn_auto"), "pre-existing [memory] block must survive — got:\n{content}");
         assert!(content.contains("github.com/foo/bar"), "new canonical_id must be written — got:\n{content}");
+    }
+
+    // ── default_endpoint env-var tests ──────────────────────────────────────
+    // Rust's std::env::set_var is not thread-safe; serialise all mutations
+    // through CLOUD_ENV_LOCK so parallel test threads can't race.
+    use std::sync::Mutex;
+    static CLOUD_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    impl EnvGuard {
+        fn new() -> Self {
+            let g = CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // SAFETY: serialized via CLOUD_ENV_LOCK — no other test mutates
+            // CAS_CLOUD_ENDPOINT while we hold the guard.
+            unsafe {
+                std::env::remove_var("CAS_CLOUD_ENDPOINT");
+            }
+            EnvGuard(g)
+        }
+        fn set(&self, k: &str, v: &str) {
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe { std::env::set_var(k, v); }
+        }
+        fn unset(&self, k: &str) {
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe { std::env::remove_var(k); }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe {
+                std::env::remove_var("CAS_CLOUD_ENDPOINT");
+            }
+        }
+    }
+
+    #[test]
+    fn default_endpoint_uses_env_var_when_set() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "https://env.example.com");
+        assert_eq!(default_endpoint(), "https://env.example.com");
+    }
+
+    #[test]
+    fn default_endpoint_falls_back_when_env_empty() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "");
+        assert_eq!(
+            default_endpoint(),
+            "https://petra-stella-cloud.vercel.app",
+            "empty CAS_CLOUD_ENDPOINT must not override the hardcoded fallback"
+        );
+    }
+
+    #[test]
+    fn default_endpoint_hardcoded_fallback() {
+        let g = EnvGuard::new();
+        g.unset("CAS_CLOUD_ENDPOINT");
+        assert_eq!(
+            default_endpoint(),
+            "https://petra-stella-cloud.vercel.app",
+            "unset CAS_CLOUD_ENDPOINT must yield the Petra Stella default"
+        );
     }
 
     #[test]
