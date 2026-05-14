@@ -340,12 +340,44 @@ pub struct CloudConfig {
     pub team_auto_promote: Option<bool>,
 }
 
-fn default_endpoint() -> String {
+/// Return true when `url` is a safe endpoint value.
+///
+/// Accepted: any `https://` URL, or `http://` only when the host is
+/// `localhost`, `127.0.0.1`, or `0.0.0.0` (e2e / dev servers).
+/// Everything else — `file://`, plain hostnames, arbitrary `http://` — is
+/// rejected to prevent an env-var misconfiguration from silently redirecting
+/// token exchange to an attacker-controlled server.
+pub(crate) fn is_acceptable_endpoint(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    url.starts_with("http://localhost")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://0.0.0.0")
+}
+
+pub(crate) fn default_endpoint() -> String {
     std::env::var("CAS_CLOUD_ENDPOINT")
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
+        .filter(|s| {
+            let ok = is_acceptable_endpoint(s);
+            if !ok {
+                tracing::warn!(
+                    endpoint = %s,
+                    "CAS_CLOUD_ENDPOINT does not match the allowed scheme; \
+                     falling back to default. Allowed: https://* or http://localhost."
+                );
+            }
+            ok
+        })
         .unwrap_or_else(|| "https://petra-stella-cloud.vercel.app".to_string())
 }
+
+/// Serialises all `CAS_CLOUD_ENDPOINT` mutations in tests.
+/// Defined outside `mod tests` so `auth.rs` tests can share the same mutex.
+#[cfg(test)]
+pub(crate) static CLOUD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Default for CloudConfig {
     fn default() -> Self {
@@ -510,6 +542,7 @@ mod tests {
 
     #[test]
     fn test_default_config() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let config = CloudConfig::default();
         assert_eq!(config.endpoint, "https://petra-stella-cloud.vercel.app");
         assert!(config.token.is_none());
@@ -518,6 +551,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -537,6 +571,7 @@ mod tests {
 
     #[test]
     fn test_logout() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig {
             token: Some("test_token".to_string()),
             email: Some("test@example.com".to_string()),
@@ -554,6 +589,7 @@ mod tests {
 
     #[test]
     fn test_set_and_clear_team() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig::default();
         assert!(!config.has_team());
         assert!(config.team_id.is_none());
@@ -572,12 +608,14 @@ mod tests {
 
     #[test]
     fn test_active_team_id_returns_none_when_no_team_set() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let config = CloudConfig::default();
         assert_eq!(config.active_team_id(), None);
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_default() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=None is the default — auto-promote enabled.
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
@@ -587,6 +625,7 @@ mod tests {
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_true() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(true);
@@ -595,6 +634,7 @@ mod tests {
 
     #[test]
     fn test_active_team_id_suppressed_by_auto_promote_false() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The coarse kill-switch from Decision 3 of filter-policy.md —
         // team_id still set, but dual-enqueue is disabled.
         let mut config = CloudConfig::default();
@@ -605,6 +645,7 @@ mod tests {
 
     #[test]
     fn test_team_sync_timestamps() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut config = CloudConfig::default();
 
         // Initially no timestamps
@@ -631,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_team_memory_sync_timestamps() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -890,6 +932,7 @@ mod tests {
 
     #[test]
     fn test_team_sync_timestamps_persist() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("cloud.json");
 
@@ -1005,15 +1048,17 @@ mod tests {
     }
 
     // ── default_endpoint env-var tests ──────────────────────────────────────
-    // Rust's std::env::set_var is not thread-safe; serialise all mutations
-    // through CLOUD_ENV_LOCK so parallel test threads can't race.
-    use std::sync::Mutex;
-    static CLOUD_ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Rust's std::env::set_var is not thread-safe; serialise ALL mutations of
+    // CAS_CLOUD_ENDPOINT through CLOUD_ENV_LOCK (defined at module level so
+    // auth.rs tests can share the same mutex).
+    //
+    // Tests that construct CloudConfig::default() (or ..Default::default())
+    // also acquire the lock because default_endpoint() now reads the env var.
 
     struct EnvGuard(std::sync::MutexGuard<'static, ()>);
     impl EnvGuard {
         fn new() -> Self {
-            let g = CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let g = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             // SAFETY: serialized via CLOUD_ENV_LOCK — no other test mutates
             // CAS_CLOUD_ENDPOINT while we hold the guard.
             unsafe {
@@ -1065,6 +1110,50 @@ mod tests {
             default_endpoint(),
             "https://petra-stella-cloud.vercel.app",
             "unset CAS_CLOUD_ENDPOINT must yield the Petra Stella default"
+        );
+    }
+
+    #[test]
+    fn default_endpoint_rejects_http_attacker() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "http://attacker.com");
+        assert_eq!(
+            default_endpoint(),
+            "https://petra-stella-cloud.vercel.app",
+            "http://attacker.com must be rejected and fall back to default"
+        );
+    }
+
+    #[test]
+    fn default_endpoint_accepts_http_localhost() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "http://127.0.0.1:3000");
+        assert_eq!(
+            default_endpoint(),
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1 is whitelisted for e2e / dev servers"
+        );
+    }
+
+    #[test]
+    fn default_endpoint_rejects_file_scheme() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "file:///etc/passwd");
+        assert_eq!(
+            default_endpoint(),
+            "https://petra-stella-cloud.vercel.app",
+            "file:// scheme must be rejected"
+        );
+    }
+
+    #[test]
+    fn default_endpoint_trims_whitespace_to_empty() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "   ");
+        assert_eq!(
+            default_endpoint(),
+            "https://petra-stella-cloud.vercel.app",
+            "whitespace-only CAS_CLOUD_ENDPOINT must be treated as empty"
         );
     }
 

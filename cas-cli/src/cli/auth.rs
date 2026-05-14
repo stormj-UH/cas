@@ -7,6 +7,7 @@ use std::io;
 use clap::{Parser, Subcommand};
 
 use crate::cli::Cli;
+use crate::cloud::{default_endpoint, is_acceptable_endpoint};
 use crate::ui::components::{
     Component, Formatter, Spinner, SpinnerMsg, clear_inline, render_inline_view, rerender_inline,
 };
@@ -32,7 +33,12 @@ pub struct LoginArgs {
     pub token: Option<String>,
 
     /// Cloud API endpoint
-    #[arg(long, env = "CAS_CLOUD_ENDPOINT", default_value = "https://petra-stella-cloud.vercel.app")]
+    #[arg(
+        long,
+        env = "CAS_CLOUD_ENDPOINT",
+        default_value = "https://petra-stella-cloud.vercel.app",
+        value_parser = parse_endpoint,
+    )]
     pub endpoint: String,
 
     /// Don't open browser automatically
@@ -44,9 +50,100 @@ impl Default for LoginArgs {
     fn default() -> Self {
         Self {
             token: None,
-            endpoint: "https://petra-stella-cloud.vercel.app".to_string(),
+            endpoint: default_endpoint(),
             no_browser: false,
         }
+    }
+}
+
+/// Validate an endpoint value: accept https://* or http://localhost variants only.
+/// Rejects empty strings, file:// URLs, and arbitrary http:// hosts.
+fn parse_endpoint(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("endpoint must not be empty".into());
+    }
+    if is_acceptable_endpoint(s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "endpoint must be https:// or http://localhost (got {s:?})"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloud::CLOUD_ENV_LOCK;
+
+    /// Serialises CAS_CLOUD_ENDPOINT mutations in auth.rs tests via the same
+    /// module-level mutex used by cloud::config tests — prevents cross-module races.
+    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    impl EnvGuard {
+        fn new() -> Self {
+            let g = CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe { std::env::remove_var("CAS_CLOUD_ENDPOINT"); }
+            EnvGuard(g)
+        }
+        fn set(&self, k: &str, v: &str) {
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe { std::env::set_var(k, v); }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via CLOUD_ENV_LOCK.
+            unsafe { std::env::remove_var("CAS_CLOUD_ENDPOINT"); }
+        }
+    }
+
+    #[test]
+    fn login_args_default_uses_default_endpoint() {
+        let g = EnvGuard::new();
+        g.set("CAS_CLOUD_ENDPOINT", "https://staging.example.com");
+        let args = LoginArgs::default();
+        assert_eq!(
+            args.endpoint,
+            "https://staging.example.com",
+            "LoginArgs::default() must delegate to default_endpoint() so env var is honoured"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_http_attacker() {
+        let result = parse_endpoint("http://attacker.com");
+        assert!(
+            result.is_err(),
+            "http://attacker.com must be rejected by parse_endpoint"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("https://") || msg.contains("http://localhost"),
+            "error message should describe allowed schemes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_accepts_https() {
+        assert_eq!(
+            parse_endpoint("https://petra-stella-cloud.vercel.app"),
+            Ok("https://petra-stella-cloud.vercel.app".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_accepts_http_localhost() {
+        assert_eq!(
+            parse_endpoint("http://localhost:8080"),
+            Ok("http://localhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_empty() {
+        assert!(parse_endpoint("").is_err());
+        assert!(parse_endpoint("   ").is_err());
     }
 }
 
