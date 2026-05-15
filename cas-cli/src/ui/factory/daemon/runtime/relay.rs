@@ -64,6 +64,7 @@ impl PaneBuffer {
     ///
     /// Handles CSI sequences (ESC[...X), OSC sequences (ESC]...ST/BEL),
     /// and two-byte ESC+char sequences.
+    #[allow(dead_code)]
     pub fn as_plain_text(&self) -> String {
         let bytes = self.as_bytes();
         strip_ansi(&bytes)
@@ -136,12 +137,14 @@ fn strip_ansi(bytes: &[u8]) -> String {
 }
 
 /// Interval between pane-tail snapshot writes.
+#[allow(dead_code)]
 const SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Write ANSI-stripped plain text snapshots to disk for each pane.
 ///
 /// Files are written atomically (write to .tmp, then rename) to
 /// `~/.cas/sessions/{session_name}/pane-tail/{pane_id}.txt`.
+#[allow(dead_code)]
 pub(in crate::ui::factory::daemon) fn write_pane_snapshots(
     session_name: &str,
     pane_buffers: &HashMap<String, PaneBuffer>,

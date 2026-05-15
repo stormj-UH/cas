@@ -1330,7 +1330,9 @@ mod tests {
     // Tests that construct CloudConfig::default() (or ..Default::default())
     // also acquire the lock because default_endpoint() now reads the env var.
 
-    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
     impl EnvGuard {
         fn new() -> Self {
             let g = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1339,7 +1341,7 @@ mod tests {
             unsafe {
                 std::env::remove_var("CAS_CLOUD_ENDPOINT");
             }
-            EnvGuard(g)
+            EnvGuard { _guard: g }
         }
         fn set(&self, k: &str, v: &str) {
             // SAFETY: serialized via CLOUD_ENV_LOCK.

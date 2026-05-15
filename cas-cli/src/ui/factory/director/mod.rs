@@ -148,6 +148,7 @@ pub struct SidecarState<'a> {
 
 /// Panel areas for click detection
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub struct PanelAreas {
     pub factory: Rect,
     pub tasks: Rect,

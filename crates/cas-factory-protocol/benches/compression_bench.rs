@@ -217,7 +217,8 @@ fn bench_roundtrip(c: &mut Criterion) {
             |b, data| {
                 b.iter(|| {
                     let compressed = compress(black_box(data));
-                    decompress(black_box(&compressed)).unwrap()
+                    let decompressed = decompress(black_box(&compressed)).unwrap();
+                    black_box(decompressed.as_ref().len());
                 })
             },
         );

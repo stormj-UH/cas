@@ -403,6 +403,7 @@ pub enum ProjectOverviewStaleness {
 impl ProjectOverviewStaleness {
     /// `true` when this level warrants `severity="high"` in the SessionStart
     /// injection (drives "prepend vs append" in the hook).
+    #[cfg(test)]
     pub fn is_high_severity(&self, is_supervisor: bool) -> bool {
         match self {
             ProjectOverviewStaleness::Missing => true,
@@ -504,9 +505,8 @@ fn change_prefix(c: &ProjectOverviewChange) -> &'static str {
 /// Check if PRODUCT_OVERVIEW.md is missing or stale.
 ///
 /// `agent_role` is accepted for API symmetry with downstream hook wiring; the
-/// returned staleness is role-agnostic. Callers drive role-based severity by
-/// passing `is_supervisor` to `ProjectOverviewStaleness::is_high_severity` and
-/// `format_injection` at render time.
+/// returned staleness is role-agnostic. Callers can tailor rendering through
+/// `format_injection`.
 pub fn check_freshness(
     repo_root: &Path,
     agent_role: Option<&str>,

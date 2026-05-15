@@ -262,6 +262,7 @@ impl FactoryDaemon {
     pub(super) fn gui_notify_pane_exited(&mut self, pane_id: &str, exit_code: Option<i32>) {
         self.notify_pane_exited(pane_id, exit_code);
     }
+    #[allow(dead_code)]
     pub(super) fn gui_send_state_update(&mut self) {
         self.send_state_update();
     }
@@ -483,6 +484,7 @@ impl FactoryDaemon {
     }
 
     /// Broadcast a DaemonMessage to all connected GUI clients only.
+    #[allow(dead_code)]
     fn gui_broadcast(&mut self, msg: &DaemonMessage) {
         if let Some(frame) = encode_frame(msg) {
             for client in self.gui_clients.values_mut() {

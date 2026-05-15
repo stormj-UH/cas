@@ -1,6 +1,6 @@
 use crate::ui::factory::daemon::imports::*;
 use crate::ui::factory::protocol::{ClientMessage, DaemonMessage};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Encode a DaemonMessage as a WebSocket Binary frame (raw JSON, no length prefix).

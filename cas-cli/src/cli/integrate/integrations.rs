@@ -14,9 +14,9 @@ use anyhow::Context;
 
 use super::github::{self, GithubAction};
 use super::lock::IntegrateLock;
-use super::neon::{self, LiveNeonClient, NeonDetection};
+use super::neon::{self, LiveNeonClient};
 use super::types::{IntegrationOutcome, IntegrationStatus};
-use super::vercel::{self, VercelDetection};
+use super::vercel;
 
 /// Caller-supplied flags that gate the run. Mirrors the `cas init` CLI
 /// surface.

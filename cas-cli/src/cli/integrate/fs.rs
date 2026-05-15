@@ -59,7 +59,7 @@ pub fn read_capped(path: &Path) -> anyhow::Result<String> {
             MAX_FILE_BYTES
         );
     }
-    let mut f = fs::File::open(path)
+    let f = fs::File::open(path)
         .with_context(|| format!("opening {}", path.display()))?;
     let mut s = String::new();
     f.take(MAX_FILE_BYTES + 1)

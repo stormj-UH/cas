@@ -80,13 +80,15 @@ mod tests {
 
     /// Serialises CAS_CLOUD_ENDPOINT mutations in auth.rs tests via the same
     /// module-level mutex used by cloud::config tests — prevents cross-module races.
-    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
     impl EnvGuard {
         fn new() -> Self {
             let g = CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             // SAFETY: serialized via CLOUD_ENV_LOCK.
             unsafe { std::env::remove_var("CAS_CLOUD_ENDPOINT"); }
-            EnvGuard(g)
+            EnvGuard { _guard: g }
         }
         fn set(&self, k: &str, v: &str) {
             // SAFETY: serialized via CLOUD_ENV_LOCK.

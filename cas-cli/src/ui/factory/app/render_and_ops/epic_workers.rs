@@ -197,17 +197,22 @@ impl FactoryApp {
         // Harness — the field that was previously cached and never refreshed.
         let live_cli = cas_mux::SupervisorCli::from_str(llm.harness_for_role("worker"))
             .unwrap_or(cas_mux::SupervisorCli::Claude);
-        self.mux.set_worker_cli(live_cli);
         // Keep FactoryApp's own field in sync so queue_codex_worker_intro_prompt
         // and generate_prompt pick up the updated harness as well.
         self.worker_cli = live_cli;
 
         // Re-read model and effort for consistency; these were already correct
         // at startup but can drift if config changes mid-session.
-        self.mux
-            .set_worker_model(llm.model_for_role("worker").map(ToOwned::to_owned));
-        self.mux
-            .set_worker_effort(llm.reasoning_effort_for_role("worker").map(ToOwned::to_owned));
+        let worker_model = llm.model_for_role("worker").map(ToOwned::to_owned);
+        let worker_effort = llm
+            .reasoning_effort_for_role("worker")
+            .and_then(|effort| effort.parse::<cas_mux::Effort>().ok());
+        self.mux.set_default_worker_spec(cas_mux::WorkerSpec {
+            name: None,
+            cli: live_cli,
+            model: worker_model,
+            effort: worker_effort,
+        });
     }
 
     /// Add a new worker at runtime (synchronous - blocks during worktree creation).
@@ -759,7 +764,6 @@ impl FactoryApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cas_store::TaskStore;
     use cas_types::{Task, TaskStatus};
     use tempfile::TempDir;
 

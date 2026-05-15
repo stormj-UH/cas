@@ -281,7 +281,9 @@ mod tests {
 
     /// Guard that clears the two gate env vars on drop so a test failure can't
     /// leave residue for the next test in the same process.
-    struct EnvGuard(std::sync::MutexGuard<'static, ()>);
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
     impl EnvGuard {
         fn new() -> Self {
             let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -291,7 +293,7 @@ mod tests {
                 std::env::remove_var("CAS_WARN_DUPLICATES");
                 std::env::remove_var("CAS_SUPPRESS_DUPLICATE_WARNING");
             }
-            EnvGuard(g)
+            EnvGuard { _guard: g }
         }
         fn set(&self, k: &str, v: &str) {
             unsafe {

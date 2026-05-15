@@ -203,6 +203,7 @@ impl HeadfulConfig {
         self.fifo_dir().join(format!("cas-tui-headful-{name}.fifo"))
     }
 
+    #[cfg(target_os = "macos")]
     fn window_id_path(&self) -> PathBuf {
         let name = self
             .name
@@ -731,11 +732,6 @@ static SHARED_HEADFUL: OnceLock<SharedHeadful> = OnceLock::new();
 #[cfg(target_os = "macos")]
 fn escape_applescript_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\"', "\\\"")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn escape_applescript_string(value: &str) -> String {
-    value.to_string()
 }
 
 fn set_nonblocking(file: &std::fs::File) {
