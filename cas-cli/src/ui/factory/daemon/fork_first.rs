@@ -380,18 +380,6 @@ impl DaemonInitPhase {
             self.factory_config.cwd.clone(),
         )?;
 
-        // Send InitComplete to boot screen
-        self.send_init_complete()?;
-        tracing::info!("Initialization complete, transitioning to daemon mode");
-
-        // Give boot screen client time to receive InitComplete before we close the socket
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Close the init client (boot screen connection)
-        if let Some(stream) = self.init_client.take() {
-            drop(stream);
-        }
-
         // Defer cloud phone-home client start to daemon.run() where a Tokio
         // runtime is available.  In the fork-first path, run_with_progress()
         // executes *before* the Tokio runtime is created, so calling
@@ -454,6 +442,20 @@ impl DaemonInitPhase {
         );
         metadata.team_name = teams.as_ref().map(|t| t.team_name().to_string());
         session_manager.save_metadata(&metadata)?;
+
+        // The boot client switches to attach as soon as it receives InitComplete.
+        // Publish metadata first so the parent cannot race into `attach` and
+        // report the generated session as missing.
+        self.send_init_complete()?;
+        tracing::info!("Initialization complete, transitioning to daemon mode");
+
+        // Give boot screen client time to receive InitComplete before we close the socket.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Close the init client (boot screen connection).
+        if let Some(stream) = self.init_client.take() {
+            drop(stream);
+        }
 
         // Bind notification socket for instant prompt queue wakeup
         let notify_rx = match cas_factory::DaemonNotifier::bind(app.cas_dir()) {
