@@ -16,6 +16,7 @@
 //! 2. Processing the queue during idle periods (daemon)
 //! 3. Pulling latest changes on MCP server startup
 
+mod backfill;
 mod config;
 mod coordinator;
 pub mod device;
@@ -23,6 +24,8 @@ pub(crate) mod me;
 mod sync_queue;
 mod syncer;
 
+// T6: first-run backfill — `pub` so integration tests can call the inner seam.
+pub use backfill::{BackfillOutcome, maybe_apply_team_backfill, maybe_apply_team_backfill_inner};
 pub use config::{
     CloudConfig, TeamInfo, canonical_id_from_config_toml, derive_canonical_id_from_git_remote,
     get_project_canonical_id, set_canonical_id_in_config_toml,
