@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::{CloudConfig, FetchTeamsOutcome, fetch_and_cache_teams, get_project_canonical_id,
-    teams_cache_stale, user_level_cloud_json_path};
+use crate::cloud::{BackfillOutcome, CloudConfig, FetchTeamsOutcome, fetch_and_cache_teams,
+    get_project_canonical_id, maybe_apply_team_backfill, teams_cache_stale,
+    user_level_cloud_json_path};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -398,6 +399,9 @@ fn execute_team_default_inner(
     if args.personal {
         let was_set = config.default_team_id.is_some();
         config.default_team_id = None;
+        // Mark the one-time backfill gate so future syncs do not re-promote
+        // the user to team scope against their explicit personal-scope choice.
+        config.team_backfill_notified = true;
         config.save_to_cas_dir(user_cas_dir)?;
 
         if cli.json {
@@ -1686,6 +1690,48 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // T6: first-run backfill notice — runs even when the teams cache is
+    // already fresh (cheap JSON read; gated by team_backfill_notified so it
+    // is a no-op after the first time). Must run before execute_push so the
+    // updated default_team_id is visible to the syncing stores opened inside
+    // execute_push via open_store → active_team_id().
+    if !args.dry_run {
+        match maybe_apply_team_backfill() {
+            BackfillOutcome::Applied { ref team_id, ref team_slug, ref team_name } => {
+                if !cli.json {
+                    eprintln!();
+                    eprintln!("  ✓ Team membership detected — syncing to team scope");
+                    eprintln!("    Team: {} ({})", team_name, team_slug);
+                    eprintln!("    UUID: {}", team_id);
+                    eprintln!();
+                    eprintln!("  Existing personal entries are NOT automatically promoted.");
+                    eprintln!("  To promote them retroactively, run:");
+                    eprintln!("    cas memory share --all");
+                    eprintln!();
+                    eprintln!("  To revert to personal scope:");
+                    eprintln!("    cas cloud team default --personal");
+                    eprintln!();
+                } else {
+                    // JSON callers get a structured event they can grep for.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "team_backfill_applied",
+                            "team_id": team_id,
+                            "team_slug": team_slug,
+                            "team_name": team_name,
+                        })
+                    );
+                }
+            }
+            BackfillOutcome::AlreadyNotified
+            | BackfillOutcome::NoMembership
+            | BackfillOutcome::MultiTeamAmbiguous => {
+                // No-op — these are expected quiet paths.
             }
         }
     }
