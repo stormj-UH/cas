@@ -20,17 +20,21 @@ use crate::cloud::CloudConfig;
 /// Outcome of [`maybe_apply_team_backfill_inner`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackfillOutcome {
-    /// Backfill ran: `default_team_id` was auto-set (or was already set by
-    /// the server) and the one-time notice has been armed.  The caller is
-    /// responsible for printing the user-facing notice.
-    Applied {
-        /// The team UUID that is now the default.
+    /// Backfill auto-picked the default team (single-team user whose
+    /// `default_team_id` was `None`).  The caller should print the
+    /// first-run notice — this is the "we just changed something" path.
+    AppliedSetDefault {
+        /// The team UUID that was just set as the default.
         team_id: String,
         /// URL-safe slug (for display in the notice).
         team_slug: String,
         /// Display name (for display in the notice).
         team_name: String,
     },
+    /// `default_team_id` was already set by the server (via T2 `/api/me`).
+    /// We just marked `team_backfill_notified = true`; nothing changed for
+    /// the user — no notice needed.
+    AppliedAlreadyDefault,
     /// `team_backfill_notified` was already `true` — no-op.
     AlreadyNotified,
     /// `teams[]` is empty — user has no team membership; no notice.
@@ -62,38 +66,36 @@ pub fn maybe_apply_team_backfill_inner(user_cas_dir: &Path) -> BackfillOutcome {
         return BackfillOutcome::NoMembership;
     }
 
-    // Determine the team to promote to.
-    let promoted_team = if let Some(ref dtid) = cfg.default_team_id.clone() {
-        // Server already set a default (via T2 me.rs). Find the team record
-        // for the notice display text, falling back to the UUID if not found
-        // in the cached list.
-        let info = cfg.teams.iter().find(|t| &t.id == dtid).cloned();
-        let (slug, name) = info
-            .as_ref()
-            .map(|t| (t.slug.clone(), t.name.clone()))
-            .unwrap_or_else(|| (dtid.clone(), dtid.clone()));
-        Some((dtid.clone(), slug, name))
+    // Determine the outcome variant and whether we need to mutate anything.
+    if let Some(ref dtid) = cfg.default_team_id.clone() {
+        // Server already set a default (via T2 me.rs) — just mark notified
+        // and return the silent variant.  Nothing changed from the user's
+        // perspective; no first-run notice needed.
+        cfg.team_backfill_notified = true;
+        if let Err(e) = std::fs::create_dir_all(user_cas_dir) {
+            tracing::warn!(error = %e, "backfill: could not create user_cas_dir");
+        }
+        let _ = cfg.save_to_cas_dir(user_cas_dir);
+        let _ = dtid; // explicit: we read it above only to detect presence
+        BackfillOutcome::AppliedAlreadyDefault
     } else if cfg.teams.len() == 1 {
-        // Implicit single-team auto-pick.
-        let t = &cfg.teams[0];
+        // Implicit single-team auto-pick — we are setting the default for the
+        // first time.  Print the first-run notice.
+        let t = cfg.teams[0].clone();
         cfg.default_team_id = Some(t.id.clone());
-        Some((t.id.clone(), t.slug.clone(), t.name.clone()))
+        cfg.team_backfill_notified = true;
+        if let Err(e) = std::fs::create_dir_all(user_cas_dir) {
+            tracing::warn!(error = %e, "backfill: could not create user_cas_dir");
+        }
+        let _ = cfg.save_to_cas_dir(user_cas_dir);
+        BackfillOutcome::AppliedSetDefault {
+            team_id: t.id,
+            team_slug: t.slug,
+            team_name: t.name,
+        }
     } else {
         // Multiple teams, no server default → ambiguous; no auto-set.
-        None
-    };
-
-    match promoted_team {
-        Some((team_id, team_slug, team_name)) => {
-            cfg.team_backfill_notified = true;
-            // Persist; ignore write errors (best-effort — the notice still fires).
-            if let Err(e) = std::fs::create_dir_all(user_cas_dir) {
-                tracing::warn!(error = %e, "backfill: could not create user_cas_dir");
-            }
-            let _ = cfg.save_to_cas_dir(user_cas_dir);
-            BackfillOutcome::Applied { team_id, team_slug, team_name }
-        }
-        None => BackfillOutcome::MultiTeamAmbiguous,
+        BackfillOutcome::MultiTeamAmbiguous
     }
 }
 

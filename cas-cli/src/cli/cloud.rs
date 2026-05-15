@@ -1646,7 +1646,7 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 /// `pub(crate)` so `cli/auth.rs` can call it without going through the public
 /// API surface.
 pub(crate) fn print_backfill_notice(cli: &Cli, outcome: &BackfillOutcome) {
-    if let BackfillOutcome::Applied { team_id, team_slug, team_name } = outcome {
+    if let BackfillOutcome::AppliedSetDefault { team_id, team_slug, team_name } = outcome {
         if !cli.json {
             eprintln!();
             eprintln!("  ✓ Team membership detected — syncing to team scope");

@@ -57,11 +57,11 @@ fn backfill_auto_sets_sole_team_and_marks_notified() {
     let outcome = maybe_apply_team_backfill_inner(temp.path());
 
     match outcome {
-        BackfillOutcome::Applied { ref team_id, ref team_slug, .. } => {
+        BackfillOutcome::AppliedSetDefault { ref team_id, ref team_slug, .. } => {
             assert_eq!(team_id, "tid-solo");
             assert_eq!(team_slug, "solo-team");
         }
-        other => panic!("expected Applied, got {other:?}"),
+        other => panic!("expected AppliedSetDefault, got {other:?}"),
     }
 
     let saved = read_user_config(temp.path());
@@ -122,10 +122,11 @@ fn backfill_no_auto_set_on_multi_team_no_default() {
     assert!(!saved.team_backfill_notified);
 }
 
-/// Server already populated default_team_id (via T2 me.rs) — T6 shows the
-/// notice and marks notified, without overwriting the already-correct value.
+/// Server already populated `default_team_id` (via T2 me.rs) — T6 returns
+/// `AppliedAlreadyDefault` (silent, no notice) and marks notified, without
+/// overwriting the already-correct value.
 #[test]
-fn backfill_notifies_when_default_already_set_by_server() {
+fn backfill_silent_when_default_already_set_by_server() {
     let temp = TempDir::new().unwrap();
     let mut cfg = CloudConfig::default();
     cfg.teams = vec![
@@ -136,17 +137,14 @@ fn backfill_notifies_when_default_already_set_by_server() {
     write_user_config(temp.path(), &cfg);
 
     let outcome = maybe_apply_team_backfill_inner(temp.path());
-    match outcome {
-        BackfillOutcome::Applied { ref team_id, .. } => {
-            assert_eq!(team_id, "tid-a");
-        }
-        other => panic!("expected Applied, got {other:?}"),
-    }
+    assert_eq!(outcome, BackfillOutcome::AppliedAlreadyDefault,
+        "server-set default must return AppliedAlreadyDefault, not the noisy AppliedSetDefault");
 
     let saved = read_user_config(temp.path());
     assert_eq!(saved.default_team_id.as_deref(), Some("tid-a"),
         "existing default_team_id must be preserved");
-    assert!(saved.team_backfill_notified);
+    assert!(saved.team_backfill_notified,
+        "team_backfill_notified must be set even on the silent path");
 }
 
 /// After login, `fetch_and_cache_teams` writes `teams[]` into user config.
@@ -171,12 +169,12 @@ fn backfill_fires_after_login_team_fetch() {
     let outcome = maybe_apply_team_backfill_inner(temp.path());
 
     match outcome {
-        BackfillOutcome::Applied { ref team_id, ref team_slug, ref team_name } => {
+        BackfillOutcome::AppliedSetDefault { ref team_id, ref team_slug, ref team_name } => {
             assert_eq!(team_id, "tid-login");
             assert_eq!(team_slug, "login-team");
             assert_eq!(team_name, "Login Team");
         }
-        other => panic!("expected Applied after login-path backfill, got {other:?}"),
+        other => panic!("expected AppliedSetDefault after login-path backfill, got {other:?}"),
     }
 
     let saved = read_user_config(temp.path());
@@ -189,6 +187,35 @@ fn backfill_fires_after_login_team_fetch() {
     let outcome2 = maybe_apply_team_backfill_inner(temp.path());
     assert_eq!(outcome2, BackfillOutcome::AlreadyNotified,
         "second backfill call must be AlreadyNotified — must not re-fire on re-login");
+}
+
+/// Login path: when the server already set `default_team_id` (multi-team user
+/// whose org has a server-side default), the login-path backfill must return
+/// `AppliedAlreadyDefault` — silent, no first-run notice — so users who were
+/// already in team scope don't see a misleading "just enrolled" message.
+#[test]
+fn login_path_silent_when_default_already_server_set() {
+    let temp = TempDir::new().unwrap();
+
+    // Simulate state after fetch_and_cache_teams for a multi-team user whose
+    // server returned a default_team_id.
+    let mut cfg = CloudConfig::default();
+    cfg.teams = vec![
+        make_team("tid-x", "team-x", "Team X"),
+        make_team("tid-y", "team-y", "Team Y"),
+    ];
+    cfg.default_team_id = Some("tid-x".to_string()); // server-supplied default
+    write_user_config(temp.path(), &cfg);
+
+    let outcome = maybe_apply_team_backfill_inner(temp.path());
+    assert_eq!(outcome, BackfillOutcome::AppliedAlreadyDefault,
+        "login path must be silent when server already supplied default_team_id");
+
+    let saved = read_user_config(temp.path());
+    assert_eq!(saved.default_team_id.as_deref(), Some("tid-x"),
+        "server-set default_team_id must be preserved");
+    assert!(saved.team_backfill_notified,
+        "team_backfill_notified must be set to block future re-fires");
 }
 
 /// `cas cloud team default --personal` must set `team_backfill_notified=true`
