@@ -302,25 +302,39 @@ Share learnings across a team without manual flags. After an admin has
 created a team in the CAS Cloud dashboard:
 
 ```bash
-# One-time setup per machine — UUID from your team dashboard
+# Standard setup — log in. CAS fetches your team membership automatically.
 cas login
-cas cloud team set 550e8400-e29b-41d4-a716-446655440000
+
+# If you belong to exactly one team, auto-scope kicks in immediately.
+# If you belong to multiple teams, pick a user-wide default:
+cas cloud team default petra-stella   # slug from your team dashboard
 
 # From now on, every memory captured via mcp__cas__memory
 # action=remember (Claude Code) in a Project-scoped, non-Preference
-# context automatically dual-enqueues into the team push queue.
+# context automatically dual-enqueues into the team push queue
+# across all your CAS-initialized projects.
 
 # Next sync drains both personal and team queues
 cas cloud sync
 ```
 
-Teammates on a fresh machine see what you've shared with the same
-zero-flag setup:
+Teammates on a fresh machine get the same setup:
 
 ```bash
 cas login
-cas cloud team set 550e8400-e29b-41d4-a716-446655440000
+# single-team users: done — sync will auto-scope to your team
+# multi-team users: pick a default:
+cas cloud team default petra-stella
 cas cloud team-memories
+```
+
+**Multiple teams.** If you belong to more than one team, set the
+user-wide default once, then override per-project as needed:
+
+```bash
+cas cloud team default petra-stella          # user-wide default (all projects)
+cas cloud team set <uuid>                    # per-project override (this dir only)
+cas cloud team default --personal            # revert to personal scope (no team)
 ```
 
 **Backfilling pre-existing memories.** If you had personal entries

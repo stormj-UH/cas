@@ -4,11 +4,13 @@
 
 use clap::{Parser, Subcommand};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::{CloudConfig, get_project_canonical_id};
+use crate::cloud::{BackfillOutcome, CloudConfig, FetchTeamsOutcome, fetch_and_cache_teams,
+    get_project_canonical_id, maybe_apply_team_backfill, teams_cache_stale,
+    user_level_cloud_json_path};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -47,20 +49,41 @@ pub enum CloudCommands {
 /// Subcommands for `cas cloud team`
 #[derive(Subcommand)]
 pub enum CloudTeamCommands {
-    /// Set the active team by UUID
+    /// Set the user-level default team (resolves slug or UUID against cached memberships)
     ///
-    /// The team is persisted in `~/.cas/cloud.json` and used by team-scoped
-    /// sync operations (push to `/api/teams/{uuid}/sync/push`, pull via
-    /// `cas cloud team-memories`).
+    /// Writes `default_team_id` to `~/.cas/cloud.json`. All projects without an
+    /// explicit per-project team override (`cas cloud team set`) will use this
+    /// default for team-scoped sync.
     ///
-    /// Only UUID input is supported today — slug resolution requires a
-    /// cloud-side endpoint that is not yet available. Find your team UUID
-    /// in the CAS Cloud dashboard under team settings.
+    /// Use `--personal` to revert to personal scope (clears the default).
+    ///
+    /// Requires cached team memberships — run `cas cloud login` first if you see
+    /// "team not found" errors.
+    Default(CloudTeamDefaultArgs),
+    /// Set the per-project team override by UUID (advanced / escape hatch)
+    ///
+    /// Writes `team_id` to `<project>/.cas/cloud.json`. Prefer
+    /// `cas cloud team default <slug>` for the normal first-time setup path.
     Set(CloudTeamSetArgs),
     /// Show the currently configured team
     Show,
     /// Clear the configured team (no more team-scoped sync)
     Clear,
+}
+
+/// Arguments for `cas cloud team default`.
+#[derive(Parser)]
+pub struct CloudTeamDefaultArgs {
+    /// Team slug or UUID to set as the user-level default.
+    ///
+    /// Resolved against the cached team memberships in `~/.cas/cloud.json`.
+    /// Omit when using `--personal`.
+    #[arg(required_unless_present = "personal")]
+    pub slug_or_uuid: Option<String>,
+
+    /// Clear the default team and revert to personal scope.
+    #[arg(long, conflicts_with = "slug_or_uuid")]
+    pub personal: bool,
 }
 
 #[derive(Parser)]
@@ -278,6 +301,15 @@ pub fn execute_team(
     cas_root: &Path,
 ) -> anyhow::Result<()> {
     match cmd {
+        CloudTeamCommands::Default(args) => {
+            // `default` writes to the user-level ~/.cas/cloud.json, not the
+            // project's .cas/. Resolve the user cas dir here so the inner
+            // function stays injected (and testable).
+            let user_cas_dir = dirs::home_dir()
+                .map(|h| h.join(".cas"))
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+            execute_team_default_inner(args, cli, &user_cas_dir)
+        }
         CloudTeamCommands::Set(args) => execute_team_set(args, cli, cas_root),
         CloudTeamCommands::Show => execute_team_show(cli, cas_root).map(|_| ()),
         CloudTeamCommands::Clear => execute_team_clear(cli),
@@ -330,6 +362,135 @@ fn execute_project_set(
         fmt.newline()?;
     }
     Ok(())
+}
+
+// ─── TEAM DEFAULT ────────────────────────────────────────────────────────────
+
+/// Testable entrypoint for `cas cloud team default` — call this directly from
+/// integration tests to avoid touching the real `~/.cas/cloud.json`.
+///
+/// `user_cas_dir` is normally `~/.cas/` (resolved by the dispatcher) but can
+/// be any tempdir in tests — same injected-path pattern as `execute_team_set`.
+#[doc(hidden)]
+pub fn execute_team_default_for_test(
+    args: &CloudTeamDefaultArgs,
+    cli: &Cli,
+    user_cas_dir: &PathBuf,
+) -> anyhow::Result<serde_json::Value> {
+    execute_team_default_inner(args, cli, user_cas_dir)?;
+    // Return the updated config as JSON for assertion convenience.
+    let cfg = CloudConfig::load_from_cas_dir(user_cas_dir)?;
+    Ok(serde_json::json!({
+        "default_team_id": cfg.default_team_id,
+    }))
+}
+
+/// Inner implementation for `cas cloud team default`.
+///
+/// Accepts an injected `user_cas_dir` so integration tests can point it at a
+/// tempdir.  The dispatcher resolves `~/.cas/` before calling this.
+fn execute_team_default_inner(
+    args: &CloudTeamDefaultArgs,
+    cli: &Cli,
+    user_cas_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut config = CloudConfig::load_from_cas_dir(user_cas_dir)?;
+
+    if args.personal {
+        let was_set = config.default_team_id.is_some();
+        config.default_team_id = None;
+        // Mark the one-time backfill gate so future syncs do not re-promote
+        // the user to team scope against their explicit personal-scope choice.
+        config.team_backfill_notified = true;
+        config.save_to_cas_dir(user_cas_dir)?;
+
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::json!({ "status": "ok", "default_team_id": serde_json::Value::Null, "was_set": was_set })
+            );
+        } else {
+            let theme = ActiveTheme::default();
+            let mut out = io::stdout();
+            let mut fmt = Formatter::stdout(&mut out, theme);
+            let success_color = fmt.theme().palette.status_success;
+            fmt.newline()?;
+            fmt.write_colored("  \u{2713} ", success_color)?;
+            fmt.write_raw(if was_set {
+                "Default team cleared — syncing to personal scope"
+            } else {
+                "No default team was configured"
+            })?;
+            fmt.newline()?;
+        }
+        return Ok(());
+    }
+
+    // Slug-or-UUID lookup against cached teams[].
+    let query = args
+        .slug_or_uuid
+        .as_deref()
+        .expect("slug_or_uuid is required unless --personal is set");
+
+    let matched = config
+        .teams
+        .iter()
+        .find(|t| t.slug == query || t.id == query)
+        .cloned();
+
+    match matched {
+        Some(team) => {
+            config.default_team_id = Some(team.id.clone());
+            config.save_to_cas_dir(user_cas_dir)?;
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "ok",
+                        "default_team_id": team.id,
+                        "team_slug": team.slug,
+                        "team_name": team.name,
+                    })
+                );
+            } else {
+                let theme = ActiveTheme::default();
+                let mut out = io::stdout();
+                let mut fmt = Formatter::stdout(&mut out, theme);
+                let success_color = fmt.theme().palette.status_success;
+                fmt.newline()?;
+                fmt.write_colored("  \u{2713} ", success_color)?;
+                fmt.write_raw("Default team set")?;
+                fmt.newline()?;
+                fmt.write_muted("  Team:  ")?;
+                fmt.write_raw(&team.name)?;
+                fmt.newline()?;
+                fmt.write_muted("  Slug:  ")?;
+                fmt.write_raw(&team.slug)?;
+                fmt.newline()?;
+                fmt.write_muted("  UUID:  ")?;
+                fmt.write_raw(&team.id)?;
+                fmt.newline()?;
+            }
+            Ok(())
+        }
+        None => {
+            let hint = if config.teams.is_empty() {
+                "Run `cas cloud login` to refresh team membership.".to_string()
+            } else {
+                let available: Vec<&str> = config.teams.iter().map(|t| t.slug.as_str()).collect();
+                format!(
+                    "Available teams: {}.\nRun `cas cloud login` to refresh team membership.",
+                    available.join(", ")
+                )
+            };
+            anyhow::bail!(
+                "Team {:?} not found in cached memberships.\n{}",
+                query,
+                hint
+            )
+        }
+    }
 }
 
 fn execute_team_set(
@@ -1477,6 +1638,43 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 // SYNC
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Print the T6 first-run backfill notice to stderr.
+///
+/// Extracted as a shared helper so both `execute_sync` and the auth login paths
+/// can emit the same notice without forking the display logic.
+///
+/// `pub(crate)` so `cli/auth.rs` can call it without going through the public
+/// API surface.
+pub(crate) fn print_backfill_notice(cli: &Cli, outcome: &BackfillOutcome) {
+    if let BackfillOutcome::AppliedSetDefault { team_id, team_slug, team_name } = outcome {
+        if !cli.json {
+            eprintln!();
+            eprintln!("  ✓ Team membership detected — syncing to team scope");
+            eprintln!("    Team: {} ({})", team_name, team_slug);
+            eprintln!("    UUID: {}", team_id);
+            eprintln!();
+            eprintln!("  Existing personal entries are NOT automatically promoted.");
+            eprintln!("  To promote them retroactively, run:");
+            eprintln!("    cas memory share --all");
+            eprintln!();
+            eprintln!("  To revert to personal scope:");
+            eprintln!("    cas cloud team default --personal");
+            eprintln!();
+        } else {
+            // JSON callers get a structured event they can grep for.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "team_backfill_applied",
+                    "team_id": team_id,
+                    "team_slug": team_slug,
+                    "team_name": team_name,
+                })
+            );
+        }
+    }
+}
+
 /// Orchestrates `cas cloud sync` — personal push, team push, then personal pull
 /// (which transitively does team pull when a team is configured).
 ///
@@ -1487,6 +1685,62 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 /// `execute_team_push` / `execute_team_pull`.
 #[doc(hidden)]
 pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+    // T2 lazy refresh: re-fetch /api/me when teams[] is empty or the last
+    // fetch is more than 24 h old.  Best-effort — failure is logged but does
+    // not abort sync.
+    if !args.dry_run {
+        let user_cfg = user_level_cloud_json_path()
+            .and_then(|p| {
+                p.parent().map(|d| CloudConfig::load_from_cas_dir(d).ok()).flatten()
+            });
+        let stale = user_cfg
+            .as_ref()
+            .map(|cfg| teams_cache_stale(cfg, 86_400))
+            .unwrap_or(true);
+
+        if stale {
+            // Only refresh when we have a token; load from project config
+            // (that's where the token lives after login).
+            if let Ok(proj_cfg) = CloudConfig::load() {
+                if let Some(token) = proj_cfg.token.as_deref() {
+                    match fetch_and_cache_teams(&proj_cfg.endpoint, token) {
+                        FetchTeamsOutcome::Updated { team_count } => {
+                            tracing::debug!(
+                                team_count,
+                                "lazy-refreshed team membership from /api/me during sync"
+                            );
+                        }
+                        FetchTeamsOutcome::Empty => {
+                            tracing::debug!("lazy /api/me refresh: zero team memberships");
+                        }
+                        FetchTeamsOutcome::AuthFailed => {
+                            eprintln!(
+                                "warning: could not refresh team membership (/api/me 401). \
+                                 Token may be expired — run `cas cloud login` to re-authenticate."
+                            );
+                        }
+                        FetchTeamsOutcome::NetworkError(msg) => {
+                            tracing::warn!(
+                                error = %msg,
+                                "lazy /api/me refresh failed (non-fatal, continuing sync)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // T6: first-run backfill notice — runs even when the teams cache is
+    // already fresh (cheap JSON read; gated by team_backfill_notified so it
+    // is a no-op after the first time). Must run before execute_push so the
+    // updated default_team_id is visible to the syncing stores opened inside
+    // execute_push via open_store → active_team_id().
+    if !args.dry_run {
+        let outcome = maybe_apply_team_backfill();
+        print_backfill_notice(cli, &outcome);
+    }
+
     execute_push(
         &CloudPushArgs {
             entries_only: false,

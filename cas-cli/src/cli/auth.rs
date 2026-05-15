@@ -7,7 +7,9 @@ use std::io;
 use clap::{Parser, Subcommand};
 
 use crate::cli::Cli;
-use crate::cloud::{default_endpoint, is_acceptable_endpoint};
+use crate::cli::cloud::print_backfill_notice;
+use crate::cloud::{FetchTeamsOutcome, default_endpoint, fetch_and_cache_teams,
+    is_acceptable_endpoint, maybe_apply_team_backfill};
 use crate::ui::components::{
     Component, Formatter, Spinner, SpinnerMsg, clear_inline, render_inline_view, rerender_inline,
 };
@@ -345,6 +347,39 @@ fn execute_device_flow_login(args: &LoginArgs, cli: &Cli) -> anyhow::Result<()> 
                             config.save()?;
                         }
 
+                        // Best-effort: fetch team membership from /api/me and
+                        // cache into ~/.cas/cloud.json so T3's resolution chain
+                        // works offline immediately after login.
+                        match fetch_and_cache_teams(&args.endpoint, access_token) {
+                            FetchTeamsOutcome::Updated { team_count } => {
+                                tracing::debug!(
+                                    team_count,
+                                    "fetched and cached team membership from /api/me"
+                                );
+                            }
+                            FetchTeamsOutcome::Empty => {
+                                tracing::debug!("logged in but /api/me returned zero team memberships");
+                            }
+                            FetchTeamsOutcome::AuthFailed => {
+                                eprintln!(
+                                    "warning: could not fetch team membership (/api/me returned 401). \
+                                     Run `cas cloud login` again to refresh."
+                                );
+                            }
+                            FetchTeamsOutcome::NetworkError(msg) => {
+                                eprintln!(
+                                    "warning: could not fetch team membership: {msg}. \
+                                     Team auto-scope will work after the next `cas cloud sync`."
+                                );
+                            }
+                        }
+
+                        // T6: first-run backfill — auto-promote to team scope on first
+                        // login when the user has exactly one team (or the server already
+                        // set a default).  Best-effort; errors in the write are ignored.
+                        let backfill_outcome = maybe_apply_team_backfill();
+                        print_backfill_notice(cli, &backfill_outcome);
+
                         if cli.json {
                             println!(r#"{{"status":"ok","email":"{}"}}"#, email.unwrap_or(""));
                         } else {
@@ -515,6 +550,31 @@ fn execute_login_with_token(token: &str, endpoint: &str, cli: &Cli) -> anyhow::R
         config.token = Some(token.to_string());
         config.save()?;
     }
+
+    // Best-effort: fetch team membership from /api/me and cache into
+    // ~/.cas/cloud.json so T3's resolution chain works immediately.
+    match fetch_and_cache_teams(endpoint, token) {
+        FetchTeamsOutcome::Updated { team_count } => {
+            tracing::debug!(
+                team_count,
+                "fetched and cached team membership from /api/me"
+            );
+        }
+        FetchTeamsOutcome::Empty => {
+            tracing::debug!("logged in but /api/me returned zero team memberships");
+        }
+        FetchTeamsOutcome::AuthFailed | FetchTeamsOutcome::NetworkError(_) => {
+            // Token was just verified, so a 401 or network error here is
+            // a transient anomaly.  Swallow it silently; the next sync
+            // will retry via the lazy-refresh path.
+            tracing::warn!("could not fetch team membership from /api/me during token login (non-fatal)");
+        }
+    }
+
+    // T6: first-run backfill — auto-promote to team scope on first login when
+    // the user has exactly one team (or the server already set a default).
+    let backfill_outcome = maybe_apply_team_backfill();
+    print_backfill_notice(cli, &backfill_outcome);
 
     if cli.json {
         println!(r#"{{"status":"ok","message":"Logged in successfully"}}"#);

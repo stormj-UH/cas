@@ -17,6 +17,8 @@ use std::sync::Mutex;
 use crate::error::CasError;
 use crate::store::find_cas_root;
 
+// `dirs` used by `user_config_path()` / `load_user()` / `save_user()`
+
 /// Cached project canonical ID. Only `Some` results are cached; if resolution
 /// returns `None` (e.g. `find_cas_root()` fails because the process started
 /// outside a CAS project), the next call retries instead of locking in `None`
@@ -258,6 +260,27 @@ pub fn fallback_project_id_from_path(cas_root: &Path) -> Option<String> {
     Some(format!("local:{hex}"))
 }
 
+/// A team membership entry returned by `/api/me` and cached in `cloud.json`.
+///
+/// Mirrors the `TeamInfo` shape promised by petra-stella-cloud's `/api/me`
+/// response (RESPONSE-user-team-membership-endpoint.md, 2026-05-15).  Fields
+/// are stored as `String` rather than typed UUIDs so the struct survives any
+/// future backend representation changes without a migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamInfo {
+    /// Opaque team UUID (stable primary key used for API calls)
+    pub id: String,
+
+    /// URL-safe slug (human-readable, may change on rename)
+    pub slug: String,
+
+    /// Display name shown in the CLI
+    pub name: String,
+
+    /// Caller's role in this team: `"owner"`, `"admin"`, `"member"`, or `"viewer"`
+    pub role: String,
+}
+
 /// Cloud configuration stored in .cas/cloud.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
@@ -338,6 +361,63 @@ pub struct CloudConfig {
     /// See `docs/requests/team-memories-filter-policy.md` Decision 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_auto_promote: Option<bool>,
+
+    /// Team memberships for the authenticated user, fetched from `/api/me`
+    /// and cached here so the resolution chain (T3) can work offline.
+    ///
+    /// Empty by default; populated by T2 (`cas cloud login` + lazy refresh).
+    /// Absent in existing `cloud.json` files → deserialises to empty `Vec`
+    /// via `#[serde(default)]`.  Not written to disk when empty via
+    /// `skip_serializing_if` so pre-T2 files stay clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<TeamInfo>,
+
+    /// The team UUID the user has selected as their default scope.
+    ///
+    /// Populated either from the `default_team_id` field returned by
+    /// `/api/me` (if the server already knows a ranking) or by the user
+    /// running `cas cloud team default <slug>` (T4).  `None` means no
+    /// default has been set; T3's resolution chain falls back to implicit
+    /// single-team detection or personal scope.
+    ///
+    /// Absent in existing `cloud.json` files → deserialises to `None` via
+    /// `#[serde(default)]`.  Not written to disk when `None` via
+    /// `skip_serializing_if` so pre-T4 files stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_team_id: Option<String>,
+
+    /// UTC timestamp of the last successful `/api/me` fetch that populated
+    /// `teams[]`.  Used by T2's staleness check: when `teams` is non-empty
+    /// and this timestamp is within 24 h, the lazy refresh in
+    /// `execute_sync` is skipped to avoid an extra HTTP round-trip per
+    /// sync cycle.
+    ///
+    /// `None` means teams have never been fetched (triggers refresh on next
+    /// sync).  Absent in existing `cloud.json` → `None` via
+    /// `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teams_fetched_at: Option<DateTime<Utc>>,
+
+    /// Set to `true` after the first-run backfill notice has been shown
+    /// (T6), OR when the user explicitly runs `cas cloud team default
+    /// --personal`.
+    ///
+    /// Guards two things at once:
+    /// 1. Prevents the one-time notice from firing more than once.
+    /// 2. Prevents `maybe_apply_team_backfill` from overriding an explicit
+    ///    `--personal` choice (the `--personal` handler sets this flag before
+    ///    saving so a later sync never re-promotes the user to team scope).
+    ///
+    /// Absent in existing `cloud.json` files → `false` via `#[serde(default)]`.
+    /// Not written to disk when `false` so pre-T6 files stay clean.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_backfill_notified: bool,
+}
+
+/// `skip_serializing_if` predicate for bool fields that default to `false`.
+/// Keeps `cloud.json` clean: the field is omitted when it has its zero value.
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Return true when `url` is a safe endpoint value.
@@ -374,6 +454,23 @@ pub(crate) fn default_endpoint() -> String {
         .unwrap_or_else(|| "https://petra-stella-cloud.vercel.app".to_string())
 }
 
+/// Resolve the path to the user-level `~/.cas/cloud.json`.
+///
+/// In normal operation returns `~/.cas/cloud.json`.
+///
+/// Test seam: when the `CAS_USER_CLOUD_JSON` environment variable is set to
+/// a non-empty value, that path is used instead. This mirrors the
+/// `CAS_CLOUD_ENDPOINT` pattern and lets integration tests inject a
+/// controlled user-level config without touching the real `~/.cas/`.
+pub(crate) fn user_level_cloud_json_path() -> Option<std::path::PathBuf> {
+    if let Ok(override_path) = std::env::var("CAS_USER_CLOUD_JSON") {
+        if !override_path.trim().is_empty() {
+            return Some(std::path::PathBuf::from(override_path));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".cas").join("cloud.json"))
+}
+
 /// Serialises all `CAS_CLOUD_ENDPOINT` mutations in tests.
 /// Defined outside `mod tests` so `auth.rs` tests can share the same mutex.
 #[cfg(test)]
@@ -398,11 +495,48 @@ impl Default for CloudConfig {
             last_skill_sync: None,
             factory_cloud_client_enabled: false,
             team_auto_promote: None,
+            teams: Vec::new(),
+            default_team_id: None,
+            teams_fetched_at: None,
+            team_backfill_notified: false,
         }
     }
 }
 
 impl CloudConfig {
+    /// Return the path to the user-level `~/.cas/cloud.json`.
+    ///
+    /// Returns `None` only when `dirs::home_dir()` fails — practically
+    /// unreachable on any supported platform (Linux/macOS).
+    pub fn user_config_path() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".cas").join("cloud.json"))
+    }
+
+    /// Load the user-level cloud config from `~/.cas/cloud.json`.
+    ///
+    /// Falls back to `Default::default()` when the file is absent — identical
+    /// semantics to `load_from` for a missing file.  This is the user-scope
+    /// counterpart to `load()` (project scope).
+    pub fn load_user() -> Result<Self, CasError> {
+        match Self::user_config_path() {
+            Some(path) => Self::load_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Save the user-level cloud config to `~/.cas/cloud.json`.
+    ///
+    /// Creates `~/.cas/` if it does not already exist.  This is the
+    /// user-scope counterpart to `save()` (project scope).
+    pub fn save_user(&self) -> Result<(), CasError> {
+        let path = Self::user_config_path()
+            .ok_or_else(|| CasError::Other("Cannot determine home directory".to_string()))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.save_to(&path)
+    }
+
     /// Load cloud config from .cas/cloud.json
     pub fn load() -> Result<Self, CasError> {
         let path = Self::config_path()?;
@@ -479,19 +613,58 @@ impl CloudConfig {
         self.team_id.is_some()
     }
 
-    /// Return the team UUID to auto-promote writes to, or `None` if team
-    /// auto-promotion is disabled for this folder.
+    /// Core resolution logic for `active_team_id`, split out so unit tests
+    /// can inject a controlled user-level config without touching disk.
     ///
-    /// Distinct from `team_id` directly: this accessor honours the
-    /// `team_auto_promote` coarse kill-switch. `Some(false)` on
-    /// `team_auto_promote` returns `None` here even if `team_id` is set —
-    /// the user has opted out of automatic dual-enqueue. Callers building
-    /// the T1 filter predicate should use this accessor, not `team_id`.
-    pub fn active_team_id(&self) -> Option<&str> {
+    /// Resolution chain (highest priority first):
+    /// 0. Kill-switch: `team_auto_promote = Some(false)` → always `None`.
+    /// 1. `self.team_id` if `Some` → project-level explicit override.
+    /// 2. `user_cfg.default_team_id` if `Some` → user's preferred team.
+    /// 3. `user_cfg.teams.len() == 1` → implicit single-team auto-pick.
+    /// 4. `None` — ambiguous (0 or 2+ teams) or no user config at all.
+    pub fn active_team_id_with_user_config(&self, user_cfg: Option<&CloudConfig>) -> Option<String> {
+        // Step 0 — coarse kill-switch.
         if matches!(self.team_auto_promote, Some(false)) {
             return None;
         }
-        self.team_id.as_deref()
+        // Step 1 — project-level explicit override wins.
+        if let Some(ref tid) = self.team_id {
+            return Some(tid.clone());
+        }
+        // Steps 2–4 — fall through to user-level config.
+        if let Some(user) = user_cfg {
+            // Step 2 — user has a default team preference.
+            if let Some(ref dtid) = user.default_team_id {
+                return Some(dtid.clone());
+            }
+            // Step 3 — implicit single-team auto-pick.
+            if user.teams.len() == 1 {
+                return Some(user.teams[0].id.clone());
+            }
+        }
+        // Step 4 — ambiguous or no membership.
+        None
+    }
+
+    /// Return the team UUID to auto-promote writes to, or `None` if team
+    /// auto-promotion is disabled for this folder.
+    ///
+    /// Walks the full resolution chain — project-level `team_id` first, then
+    /// user-level `~/.cas/cloud.json` (`default_team_id` → single-team
+    /// auto-pick → `None`). Distinct from reading `team_id` directly: this
+    /// accessor honours the `team_auto_promote` coarse kill-switch.
+    /// `Some(false)` on `team_auto_promote` returns `None` here even if
+    /// `team_id` is set — the user has opted out of automatic dual-enqueue.
+    /// Callers building the T1 filter predicate should use this accessor,
+    /// not `team_id`.
+    ///
+    /// For unit-testable access without disk I/O, use
+    /// [`active_team_id_with_user_config`][Self::active_team_id_with_user_config]
+    /// directly.
+    pub fn active_team_id(&self) -> Option<String> {
+        let user_cfg = user_level_cloud_json_path()
+            .and_then(|p| CloudConfig::load_from(&p).ok());
+        self.active_team_id_with_user_config(user_cfg.as_ref())
     }
 
     /// Set the current team context
@@ -609,27 +782,34 @@ mod tests {
     #[test]
     fn test_active_team_id_returns_none_when_no_team_set() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Ensure no user-level config leaks in from ~/.cas/cloud.json.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let config = CloudConfig::default();
         assert_eq!(config.active_team_id(), None);
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_default() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=None is the default — auto-promote enabled.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
-        assert_eq!(config.active_team_id(), Some("team-abc"));
+        assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
         assert!(config.team_auto_promote.is_none());
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_true() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(true);
-        assert_eq!(config.active_team_id(), Some("team-abc"));
+        assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
@@ -637,10 +817,105 @@ mod tests {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The coarse kill-switch from Decision 3 of filter-policy.md —
         // team_id still set, but dual-enqueue is disabled.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(false);
         assert_eq!(config.active_team_id(), None);
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
+    }
+
+    // ── cas-ea2f5: resolution-chain unit tests (test-first, added before impl) ──
+
+    #[test]
+    fn test_active_team_id_user_default_team_fallback() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has default_team_id set → return it.
+        let project_cfg = CloudConfig::default(); // no team_id
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("user-default-team"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_single_team_auto_pick() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has exactly 1 team, no default_team_id
+        // → return the sole team's id.
+        let project_cfg = CloudConfig::default();
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![TeamInfo {
+            id: "solo-team-id".to_string(),
+            slug: "solo".to_string(),
+            name: "Solo".to_string(),
+            role: "member".to_string(),
+        }];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("solo-team-id"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_multi_team_ambiguous_returns_none() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No project-level team_id, user config has 2 teams but no default_team_id
+        // → None (ambiguous).
+        let project_cfg = CloudConfig::default();
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.teams = vec![
+            TeamInfo { id: "t1".to_string(), slug: "a".to_string(), name: "A".to_string(), role: "member".to_string() },
+            TeamInfo { id: "t2".to_string(), slug: "b".to_string(), name: "B".to_string(), role: "member".to_string() },
+        ];
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_project_override_beats_user_default() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Project-level team_id wins over user-level default_team_id.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.set_team("project-team", "proj");
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)).as_deref(),
+            Some("project-team"),
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_kill_switch_beats_user_config() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // team_auto_promote=Some(false) short-circuits to None even when user
+        // config would otherwise supply a team.
+        let mut project_cfg = CloudConfig::default();
+        project_cfg.team_auto_promote = Some(false);
+        let mut user_cfg = CloudConfig::default();
+        user_cfg.default_team_id = Some("user-default-team".to_string());
+
+        assert_eq!(
+            project_cfg.active_team_id_with_user_config(Some(&user_cfg)),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_active_team_id_no_user_config_no_project_team() {
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Neither project nor user config has team info → None.
+        let project_cfg = CloudConfig::default();
+        assert_eq!(project_cfg.active_team_id_with_user_config(None), None);
     }
 
     #[test]
@@ -1154,6 +1429,109 @@ mod tests {
             default_endpoint(),
             "https://petra-stella-cloud.vercel.app",
             "whitespace-only CAS_CLOUD_ENDPOINT must be treated as empty"
+        );
+    }
+
+    // ── cas-6462: TeamInfo + CloudConfig.teams / default_team_id ───────────
+
+    #[test]
+    fn test_team_info_roundtrip() {
+        // TeamInfo serialises and deserialises cleanly.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let team = TeamInfo {
+            id: "tid-abc".to_string(),
+            slug: "petra-stella".to_string(),
+            name: "Petra Stella".to_string(),
+            role: "admin".to_string(),
+        };
+        let json = serde_json::to_string(&team).unwrap();
+        let back: TeamInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, team);
+    }
+
+    #[test]
+    fn test_teams_and_default_team_id_roundtrip() {
+        // CloudConfig with populated teams[] and default_team_id survives
+        // save/load without data loss.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cloud.json");
+
+        let mut config = CloudConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        config.teams = vec![
+            TeamInfo {
+                id: "tid-1".to_string(),
+                slug: "team-one".to_string(),
+                name: "Team One".to_string(),
+                role: "member".to_string(),
+            },
+            TeamInfo {
+                id: "tid-2".to_string(),
+                slug: "team-two".to_string(),
+                name: "Team Two".to_string(),
+                role: "owner".to_string(),
+            },
+        ];
+        config.default_team_id = Some("tid-1".to_string());
+
+        config.save_to(&path).unwrap();
+        let loaded = CloudConfig::load_from(&path).unwrap();
+
+        assert_eq!(loaded.teams.len(), 2);
+        assert_eq!(loaded.teams[0].id, "tid-1");
+        assert_eq!(loaded.teams[0].slug, "team-one");
+        assert_eq!(loaded.teams[0].name, "Team One");
+        assert_eq!(loaded.teams[0].role, "member");
+        assert_eq!(loaded.teams[1].id, "tid-2");
+        assert_eq!(loaded.teams[1].role, "owner");
+        assert_eq!(loaded.default_team_id, Some("tid-1".to_string()));
+    }
+
+    #[test]
+    fn test_existing_cloud_json_without_teams_deserialises_to_defaults() {
+        // Backwards compat: a cloud.json written before cas-6462 (no `teams`
+        // or `default_team_id` keys) must deserialise without error, yielding
+        // an empty Vec and None respectively.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cloud.json");
+
+        // Simulate a legacy cloud.json with only the fields that existed before T1.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"https://petra-stella-cloud.vercel.app","token":"old-tok"}"#,
+        )
+        .unwrap();
+
+        let loaded = CloudConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.token, Some("old-tok".to_string()));
+        assert!(loaded.teams.is_empty(), "teams must default to empty Vec");
+        assert!(
+            loaded.default_team_id.is_none(),
+            "default_team_id must default to None"
+        );
+    }
+
+    #[test]
+    fn test_empty_teams_not_written_to_disk() {
+        // When teams is empty and default_team_id is None, neither key should
+        // appear in the serialised JSON — keeping legacy cloud.json files clean.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let config = CloudConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("\"teams\""),
+            "empty teams must not appear in JSON, got: {json}"
+        );
+        assert!(
+            !json.contains("\"default_team_id\""),
+            "None default_team_id must not appear in JSON, got: {json}"
         );
     }
 
