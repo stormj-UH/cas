@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::cli::Cli;
-use crate::cloud::{CloudConfig, get_project_canonical_id};
+use crate::cloud::{CloudConfig, FetchTeamsOutcome, fetch_and_cache_teams, get_project_canonical_id,
+    teams_cache_stale, user_level_cloud_json_path};
 use crate::ui::components::Formatter;
 use crate::ui::theme::ActiveTheme;
 
@@ -1643,6 +1644,52 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 /// `execute_team_push` / `execute_team_pull`.
 #[doc(hidden)]
 pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow::Result<()> {
+    // T2 lazy refresh: re-fetch /api/me when teams[] is empty or the last
+    // fetch is more than 24 h old.  Best-effort — failure is logged but does
+    // not abort sync.
+    if !args.dry_run {
+        let user_cfg = user_level_cloud_json_path()
+            .and_then(|p| {
+                p.parent().map(|d| CloudConfig::load_from_cas_dir(d).ok()).flatten()
+            });
+        let stale = user_cfg
+            .as_ref()
+            .map(|cfg| teams_cache_stale(cfg, 86_400))
+            .unwrap_or(true);
+
+        if stale {
+            // Only refresh when we have a token; load from project config
+            // (that's where the token lives after login).
+            if let Ok(proj_cfg) = CloudConfig::load() {
+                if let Some(token) = proj_cfg.token.as_deref() {
+                    match fetch_and_cache_teams(&proj_cfg.endpoint, token) {
+                        FetchTeamsOutcome::Updated { team_count } => {
+                            tracing::debug!(
+                                team_count,
+                                "lazy-refreshed team membership from /api/me during sync"
+                            );
+                        }
+                        FetchTeamsOutcome::Empty => {
+                            tracing::debug!("lazy /api/me refresh: zero team memberships");
+                        }
+                        FetchTeamsOutcome::AuthFailed => {
+                            eprintln!(
+                                "warning: could not refresh team membership (/api/me 401). \
+                                 Token may be expired — run `cas cloud login` to re-authenticate."
+                            );
+                        }
+                        FetchTeamsOutcome::NetworkError(msg) => {
+                            tracing::warn!(
+                                error = %msg,
+                                "lazy /api/me refresh failed (non-fatal, continuing sync)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     execute_push(
         &CloudPushArgs {
             entries_only: false,
