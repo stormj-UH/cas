@@ -421,6 +421,23 @@ pub(crate) fn default_endpoint() -> String {
         .unwrap_or_else(|| "https://petra-stella-cloud.vercel.app".to_string())
 }
 
+/// Resolve the path to the user-level `~/.cas/cloud.json`.
+///
+/// In normal operation returns `~/.cas/cloud.json`.
+///
+/// Test seam: when the `CAS_USER_CLOUD_JSON` environment variable is set to
+/// a non-empty value, that path is used instead. This mirrors the
+/// `CAS_CLOUD_ENDPOINT` pattern and lets integration tests inject a
+/// controlled user-level config without touching the real `~/.cas/`.
+pub(crate) fn user_level_cloud_json_path() -> Option<std::path::PathBuf> {
+    if let Ok(override_path) = std::env::var("CAS_USER_CLOUD_JSON") {
+        if !override_path.trim().is_empty() {
+            return Some(std::path::PathBuf::from(override_path));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".cas").join("cloud.json"))
+}
+
 /// Serialises all `CAS_CLOUD_ENDPOINT` mutations in tests.
 /// Defined outside `mod tests` so `auth.rs` tests can share the same mutex.
 #[cfg(test)]
@@ -561,19 +578,58 @@ impl CloudConfig {
         self.team_id.is_some()
     }
 
-    /// Return the team UUID to auto-promote writes to, or `None` if team
-    /// auto-promotion is disabled for this folder.
+    /// Core resolution logic for `active_team_id`, split out so unit tests
+    /// can inject a controlled user-level config without touching disk.
     ///
-    /// Distinct from `team_id` directly: this accessor honours the
-    /// `team_auto_promote` coarse kill-switch. `Some(false)` on
-    /// `team_auto_promote` returns `None` here even if `team_id` is set —
-    /// the user has opted out of automatic dual-enqueue. Callers building
-    /// the T1 filter predicate should use this accessor, not `team_id`.
-    pub fn active_team_id(&self) -> Option<&str> {
+    /// Resolution chain (highest priority first):
+    /// 0. Kill-switch: `team_auto_promote = Some(false)` → always `None`.
+    /// 1. `self.team_id` if `Some` → project-level explicit override.
+    /// 2. `user_cfg.default_team_id` if `Some` → user's preferred team.
+    /// 3. `user_cfg.teams.len() == 1` → implicit single-team auto-pick.
+    /// 4. `None` — ambiguous (0 or 2+ teams) or no user config at all.
+    pub fn active_team_id_with_user_config(&self, user_cfg: Option<&CloudConfig>) -> Option<String> {
+        // Step 0 — coarse kill-switch.
         if matches!(self.team_auto_promote, Some(false)) {
             return None;
         }
-        self.team_id.as_deref()
+        // Step 1 — project-level explicit override wins.
+        if let Some(ref tid) = self.team_id {
+            return Some(tid.clone());
+        }
+        // Steps 2–4 — fall through to user-level config.
+        if let Some(user) = user_cfg {
+            // Step 2 — user has a default team preference.
+            if let Some(ref dtid) = user.default_team_id {
+                return Some(dtid.clone());
+            }
+            // Step 3 — implicit single-team auto-pick.
+            if user.teams.len() == 1 {
+                return Some(user.teams[0].id.clone());
+            }
+        }
+        // Step 4 — ambiguous or no membership.
+        None
+    }
+
+    /// Return the team UUID to auto-promote writes to, or `None` if team
+    /// auto-promotion is disabled for this folder.
+    ///
+    /// Walks the full resolution chain — project-level `team_id` first, then
+    /// user-level `~/.cas/cloud.json` (`default_team_id` → single-team
+    /// auto-pick → `None`). Distinct from reading `team_id` directly: this
+    /// accessor honours the `team_auto_promote` coarse kill-switch.
+    /// `Some(false)` on `team_auto_promote` returns `None` here even if
+    /// `team_id` is set — the user has opted out of automatic dual-enqueue.
+    /// Callers building the T1 filter predicate should use this accessor,
+    /// not `team_id`.
+    ///
+    /// For unit-testable access without disk I/O, use
+    /// [`active_team_id_with_user_config`][Self::active_team_id_with_user_config]
+    /// directly.
+    pub fn active_team_id(&self) -> Option<String> {
+        let user_cfg = user_level_cloud_json_path()
+            .and_then(|p| CloudConfig::load_from(&p).ok());
+        self.active_team_id_with_user_config(user_cfg.as_ref())
     }
 
     /// Set the current team context
@@ -691,27 +747,34 @@ mod tests {
     #[test]
     fn test_active_team_id_returns_none_when_no_team_set() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Ensure no user-level config leaks in from ~/.cas/cloud.json.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let config = CloudConfig::default();
         assert_eq!(config.active_team_id(), None);
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_default() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // team_auto_promote=None is the default — auto-promote enabled.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
-        assert_eq!(config.active_team_id(), Some("team-abc"));
+        assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
         assert!(config.team_auto_promote.is_none());
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
     fn test_active_team_id_returns_team_when_auto_promote_is_true() {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(true);
-        assert_eq!(config.active_team_id(), Some("team-abc"));
+        assert_eq!(config.active_team_id().as_deref(), Some("team-abc"));
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     #[test]
@@ -719,10 +782,12 @@ mod tests {
         let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // The coarse kill-switch from Decision 3 of filter-policy.md —
         // team_id still set, but dual-enqueue is disabled.
+        unsafe { std::env::set_var("CAS_USER_CLOUD_JSON", "/nonexistent/path/cloud.json"); }
         let mut config = CloudConfig::default();
         config.set_team("team-abc", "my-team");
         config.team_auto_promote = Some(false);
         assert_eq!(config.active_team_id(), None);
+        unsafe { std::env::remove_var("CAS_USER_CLOUD_JSON"); }
     }
 
     // ── cas-ea2f5: resolution-chain unit tests (test-first, added before impl) ──
