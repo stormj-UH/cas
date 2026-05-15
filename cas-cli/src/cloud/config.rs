@@ -258,6 +258,27 @@ pub fn fallback_project_id_from_path(cas_root: &Path) -> Option<String> {
     Some(format!("local:{hex}"))
 }
 
+/// A team membership entry returned by `/api/me` and cached in `cloud.json`.
+///
+/// Mirrors the `TeamInfo` shape promised by petra-stella-cloud's `/api/me`
+/// response (RESPONSE-user-team-membership-endpoint.md, 2026-05-15).  Fields
+/// are stored as `String` rather than typed UUIDs so the struct survives any
+/// future backend representation changes without a migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamInfo {
+    /// Opaque team UUID (stable primary key used for API calls)
+    pub id: String,
+
+    /// URL-safe slug (human-readable, may change on rename)
+    pub slug: String,
+
+    /// Display name shown in the CLI
+    pub name: String,
+
+    /// Caller's role in this team: `"owner"`, `"admin"`, `"member"`, or `"viewer"`
+    pub role: String,
+}
+
 /// Cloud configuration stored in .cas/cloud.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
@@ -338,6 +359,30 @@ pub struct CloudConfig {
     /// See `docs/requests/team-memories-filter-policy.md` Decision 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_auto_promote: Option<bool>,
+
+    /// Team memberships for the authenticated user, fetched from `/api/me`
+    /// and cached here so the resolution chain (T3) can work offline.
+    ///
+    /// Empty by default; populated by T2 (`cas cloud login` + lazy refresh).
+    /// Absent in existing `cloud.json` files → deserialises to empty `Vec`
+    /// via `#[serde(default)]`.  Not written to disk when empty via
+    /// `skip_serializing_if` so pre-T2 files stay clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<TeamInfo>,
+
+    /// The team UUID the user has selected as their default scope.
+    ///
+    /// Populated either from the `default_team_id` field returned by
+    /// `/api/me` (if the server already knows a ranking) or by the user
+    /// running `cas cloud team default <slug>` (T4).  `None` means no
+    /// default has been set; T3's resolution chain falls back to implicit
+    /// single-team detection or personal scope.
+    ///
+    /// Absent in existing `cloud.json` files → deserialises to `None` via
+    /// `#[serde(default)]`.  Not written to disk when `None` via
+    /// `skip_serializing_if` so pre-T4 files stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_team_id: Option<String>,
 }
 
 /// Return true when `url` is a safe endpoint value.
@@ -398,6 +443,8 @@ impl Default for CloudConfig {
             last_skill_sync: None,
             factory_cloud_client_enabled: false,
             team_auto_promote: None,
+            teams: Vec::new(),
+            default_team_id: None,
         }
     }
 }
@@ -1154,6 +1201,109 @@ mod tests {
             default_endpoint(),
             "https://petra-stella-cloud.vercel.app",
             "whitespace-only CAS_CLOUD_ENDPOINT must be treated as empty"
+        );
+    }
+
+    // ── cas-6462: TeamInfo + CloudConfig.teams / default_team_id ───────────
+
+    #[test]
+    fn test_team_info_roundtrip() {
+        // TeamInfo serialises and deserialises cleanly.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let team = TeamInfo {
+            id: "tid-abc".to_string(),
+            slug: "petra-stella".to_string(),
+            name: "Petra Stella".to_string(),
+            role: "admin".to_string(),
+        };
+        let json = serde_json::to_string(&team).unwrap();
+        let back: TeamInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, team);
+    }
+
+    #[test]
+    fn test_teams_and_default_team_id_roundtrip() {
+        // CloudConfig with populated teams[] and default_team_id survives
+        // save/load without data loss.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cloud.json");
+
+        let mut config = CloudConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        config.teams = vec![
+            TeamInfo {
+                id: "tid-1".to_string(),
+                slug: "team-one".to_string(),
+                name: "Team One".to_string(),
+                role: "member".to_string(),
+            },
+            TeamInfo {
+                id: "tid-2".to_string(),
+                slug: "team-two".to_string(),
+                name: "Team Two".to_string(),
+                role: "owner".to_string(),
+            },
+        ];
+        config.default_team_id = Some("tid-1".to_string());
+
+        config.save_to(&path).unwrap();
+        let loaded = CloudConfig::load_from(&path).unwrap();
+
+        assert_eq!(loaded.teams.len(), 2);
+        assert_eq!(loaded.teams[0].id, "tid-1");
+        assert_eq!(loaded.teams[0].slug, "team-one");
+        assert_eq!(loaded.teams[0].name, "Team One");
+        assert_eq!(loaded.teams[0].role, "member");
+        assert_eq!(loaded.teams[1].id, "tid-2");
+        assert_eq!(loaded.teams[1].role, "owner");
+        assert_eq!(loaded.default_team_id, Some("tid-1".to_string()));
+    }
+
+    #[test]
+    fn test_existing_cloud_json_without_teams_deserialises_to_defaults() {
+        // Backwards compat: a cloud.json written before cas-6462 (no `teams`
+        // or `default_team_id` keys) must deserialise without error, yielding
+        // an empty Vec and None respectively.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cloud.json");
+
+        // Simulate a legacy cloud.json with only the fields that existed before T1.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"https://petra-stella-cloud.vercel.app","token":"old-tok"}"#,
+        )
+        .unwrap();
+
+        let loaded = CloudConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.token, Some("old-tok".to_string()));
+        assert!(loaded.teams.is_empty(), "teams must default to empty Vec");
+        assert!(
+            loaded.default_team_id.is_none(),
+            "default_team_id must default to None"
+        );
+    }
+
+    #[test]
+    fn test_empty_teams_not_written_to_disk() {
+        // When teams is empty and default_team_id is None, neither key should
+        // appear in the serialised JSON — keeping legacy cloud.json files clean.
+        let _guard = super::CLOUD_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let config = CloudConfig {
+            token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("\"teams\""),
+            "empty teams must not appear in JSON, got: {json}"
+        );
+        assert!(
+            !json.contains("\"default_team_id\""),
+            "None default_team_id must not appear in JSON, got: {json}"
         );
     }
 
