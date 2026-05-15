@@ -5,6 +5,24 @@ All notable changes to CAS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Auto-detection of team scope on login — `cas cloud team set` no longer required for most users (EPIC cas-ab88).** CAS now fetches your team membership from `/api/me` (petra-stella-cloud) immediately after `cas login` and caches `teams[]` + `default_team_id` into `~/.cas/cloud.json`. The resolution chain in `active_team_id()` then picks the right team automatically: project-level explicit override → user `default_team_id` → implicit single-team auto-pick → personal scope. Single-team users need only `cas login` + `cas cloud sync`; no manual UUID or slug lookup required.
+
+- **`cas cloud team default <slug-or-uuid>` subcommand (cas-6804).** Sets a user-wide team default in `~/.cas/cloud.json`. Takes a team slug (e.g. `petra-stella`) or UUID; resolves against the cached `teams[]` populated at login. Use `--personal` to revert to personal scope (clears the default). This is the recommended first-time setup step for multi-team users; single-team users typically don't need it.
+
+- **`cas cloud team set` repositioned as advanced / per-project override (cas-6b8b).** The subcommand still works and is the right tool for per-project overrides that should differ from the user-wide default (e.g. a contractor working across multiple teams). It is no longer the primary onboarding path; `cas login` + `cas cloud team default` is.
+
+- **First-run backfill notice on upgrade (cas-8f23).** When a user upgrades into the new auto-scope world and logs in for the first time with `teams[]` populated, CAS prints a one-time notice describing the auto-detected team and inviting them to run `cas cloud team default --personal` to opt out. The gate is `team_backfill_notified: bool` in `~/.cas/cloud.json`; it is set once and never re-fires.
+
+### Changed
+
+- **`teams[]` and `default_team_id` added to user-level `~/.cas/cloud.json` (cas-6462).** New `TeamInfo { id, slug, name, role }` struct. Fields use `#[serde(default)]` + `skip_serializing_if` so existing `cloud.json` files deserialise cleanly without migration.
+
+- **`active_team_id()` resolution chain extended to read user-level config (cas-ea2f5).** Priority order: (0) kill-switch `team_auto_promote = false` → always `None`; (1) project-level `team_id` if set; (2) user `default_team_id`; (3) sole team auto-pick when `teams.len() == 1`; (4) `None` (ambiguous or no membership). The `active_team_id_with_user_config(user_cfg)` testable inner keeps the chain exercisable without disk I/O.
+
 ## [2.16.1] - 2026-05-14
 
 ### Fixed

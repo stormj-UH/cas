@@ -293,7 +293,7 @@ Then retry. Alternatively, control-click the binary in Finder → Open → confi
 
 ## What this guide does NOT cover
 
-- CAS Cloud sync (`cas-login`, `cas cloud sync`) — needs an API token from your team. See `~/.local/bin/cas-login` source on the maintainer's machine; this isn't a packaged feature yet.
+- CAS Cloud sync setup beyond the basics — `cas login` + `cas cloud sync` are packaged commands; see the [README Team Memories section](../../README.md#team-memories-optional) for the full team-scope flow (`cas cloud team default <slug>`).
 - The `cas-update` / `cas-refresh` orchestrator scripts — those live in `~/.local/bin/` and are author-specific. See `docs/ideation/2026-04-30-cas-shell-helpers-distribution-ideation.md`.
 - Multi-user setups, shared cas.db, team collaboration patterns.
 - Custom skill / agent authoring.
