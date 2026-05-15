@@ -170,7 +170,8 @@ impl CasService {
                 output.push_str("\nUse `team show` for detailed team statistics.");
             } else {
                 output.push_str("No team configured.\n\n");
-                output.push_str("To join a team, use `cas cloud team set <team-id>`.\n");
+                output.push_str("To set a user-wide team default, run `cas cloud team default <slug>`.\n");
+                output.push_str("For a per-project override, use `cas cloud team set <uuid>`.\n");
                 output.push_str("To view all your teams, visit the CAS Cloud web dashboard.");
             }
 
@@ -199,7 +200,7 @@ impl CasService {
                 .ok_or_else(|| {
                     Self::error(
                         ErrorCode::INVALID_PARAMS,
-                        "team_id required (or set default with cas cloud team set)",
+                        "team_id required (or set user-wide default with `cas cloud team default <slug>`)",
                     )
                 })?;
 

@@ -95,7 +95,8 @@ pub fn execute_share(args: &ShareArgs, cas_root: &Path) -> anyhow::Result<()> {
         eprintln!(
             "warning: no active team configured (or team_auto_promote disabled). \
              Entries will be marked share=Team on disk but no team-queue rows will \
-             be enqueued until you run `cas cloud team set <uuid>` and write again."
+             be enqueued until you run `cas cloud team default <slug>` (user-wide) \
+             or `cas cloud team set <uuid>` (per-project) and write again."
         );
     }
 
