@@ -149,6 +149,48 @@ fn backfill_notifies_when_default_already_set_by_server() {
     assert!(saved.team_backfill_notified);
 }
 
+/// After login, `fetch_and_cache_teams` writes `teams[]` into user config.
+/// A subsequent `maybe_apply_team_backfill_inner` call (the same code path
+/// that auth.rs calls via the production wrapper) must auto-promote the sole
+/// team and mark the user as notified — matching what the wired login path does.
+#[test]
+fn backfill_fires_after_login_team_fetch() {
+    let temp = TempDir::new().unwrap();
+
+    // Simulate what fetch_and_cache_teams writes after a successful device-flow
+    // login: teams[] populated, default_team_id still None (T2 fills teams but
+    // leaves default_team_id for T6 to set).
+    let mut cfg = CloudConfig::default();
+    cfg.teams = vec![make_team("tid-login", "login-team", "Login Team")];
+    // default_team_id and team_backfill_notified both at default (None / false).
+    write_user_config(temp.path(), &cfg);
+
+    // This is what the login path calls (via the production wrapper which
+    // resolves user_cas_dir from CAS_USER_CLOUD_JSON; here we test the inner
+    // seam directly to stay hermetic).
+    let outcome = maybe_apply_team_backfill_inner(temp.path());
+
+    match outcome {
+        BackfillOutcome::Applied { ref team_id, ref team_slug, ref team_name } => {
+            assert_eq!(team_id, "tid-login");
+            assert_eq!(team_slug, "login-team");
+            assert_eq!(team_name, "Login Team");
+        }
+        other => panic!("expected Applied after login-path backfill, got {other:?}"),
+    }
+
+    let saved = read_user_config(temp.path());
+    assert_eq!(saved.default_team_id.as_deref(), Some("tid-login"),
+        "login backfill must persist default_team_id");
+    assert!(saved.team_backfill_notified,
+        "login backfill must set team_backfill_notified=true");
+
+    // Idempotency: a second call (e.g., re-login) must be a no-op.
+    let outcome2 = maybe_apply_team_backfill_inner(temp.path());
+    assert_eq!(outcome2, BackfillOutcome::AlreadyNotified,
+        "second backfill call must be AlreadyNotified — must not re-fire on re-login");
+}
+
 /// `cas cloud team default --personal` must set `team_backfill_notified=true`
 /// so the backfill never fires and overrides the explicit personal-scope choice.
 #[test]

@@ -1638,6 +1638,43 @@ fn execute_pull(args: &CloudPullArgs, cli: &Cli, cas_root: &Path) -> anyhow::Res
 // SYNC
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Print the T6 first-run backfill notice to stderr.
+///
+/// Extracted as a shared helper so both `execute_sync` and the auth login paths
+/// can emit the same notice without forking the display logic.
+///
+/// `pub(crate)` so `cli/auth.rs` can call it without going through the public
+/// API surface.
+pub(crate) fn print_backfill_notice(cli: &Cli, outcome: &BackfillOutcome) {
+    if let BackfillOutcome::Applied { team_id, team_slug, team_name } = outcome {
+        if !cli.json {
+            eprintln!();
+            eprintln!("  ✓ Team membership detected — syncing to team scope");
+            eprintln!("    Team: {} ({})", team_name, team_slug);
+            eprintln!("    UUID: {}", team_id);
+            eprintln!();
+            eprintln!("  Existing personal entries are NOT automatically promoted.");
+            eprintln!("  To promote them retroactively, run:");
+            eprintln!("    cas memory share --all");
+            eprintln!();
+            eprintln!("  To revert to personal scope:");
+            eprintln!("    cas cloud team default --personal");
+            eprintln!();
+        } else {
+            // JSON callers get a structured event they can grep for.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "team_backfill_applied",
+                    "team_id": team_id,
+                    "team_slug": team_slug,
+                    "team_name": team_name,
+                })
+            );
+        }
+    }
+}
+
 /// Orchestrates `cas cloud sync` — personal push, team push, then personal pull
 /// (which transitively does team pull when a team is configured).
 ///
@@ -1700,40 +1737,8 @@ pub fn execute_sync(args: &CloudSyncArgs, cli: &Cli, cas_root: &Path) -> anyhow:
     // updated default_team_id is visible to the syncing stores opened inside
     // execute_push via open_store → active_team_id().
     if !args.dry_run {
-        match maybe_apply_team_backfill() {
-            BackfillOutcome::Applied { ref team_id, ref team_slug, ref team_name } => {
-                if !cli.json {
-                    eprintln!();
-                    eprintln!("  ✓ Team membership detected — syncing to team scope");
-                    eprintln!("    Team: {} ({})", team_name, team_slug);
-                    eprintln!("    UUID: {}", team_id);
-                    eprintln!();
-                    eprintln!("  Existing personal entries are NOT automatically promoted.");
-                    eprintln!("  To promote them retroactively, run:");
-                    eprintln!("    cas memory share --all");
-                    eprintln!();
-                    eprintln!("  To revert to personal scope:");
-                    eprintln!("    cas cloud team default --personal");
-                    eprintln!();
-                } else {
-                    // JSON callers get a structured event they can grep for.
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "team_backfill_applied",
-                            "team_id": team_id,
-                            "team_slug": team_slug,
-                            "team_name": team_name,
-                        })
-                    );
-                }
-            }
-            BackfillOutcome::AlreadyNotified
-            | BackfillOutcome::NoMembership
-            | BackfillOutcome::MultiTeamAmbiguous => {
-                // No-op — these are expected quiet paths.
-            }
-        }
+        let outcome = maybe_apply_team_backfill();
+        print_backfill_notice(cli, &outcome);
     }
 
     execute_push(
