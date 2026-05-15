@@ -397,6 +397,27 @@ pub struct CloudConfig {
     /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teams_fetched_at: Option<DateTime<Utc>>,
+
+    /// Set to `true` after the first-run backfill notice has been shown
+    /// (T6), OR when the user explicitly runs `cas cloud team default
+    /// --personal`.
+    ///
+    /// Guards two things at once:
+    /// 1. Prevents the one-time notice from firing more than once.
+    /// 2. Prevents `maybe_apply_team_backfill` from overriding an explicit
+    ///    `--personal` choice (the `--personal` handler sets this flag before
+    ///    saving so a later sync never re-promotes the user to team scope).
+    ///
+    /// Absent in existing `cloud.json` files → `false` via `#[serde(default)]`.
+    /// Not written to disk when `false` so pre-T6 files stay clean.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_backfill_notified: bool,
+}
+
+/// `skip_serializing_if` predicate for bool fields that default to `false`.
+/// Keeps `cloud.json` clean: the field is omitted when it has its zero value.
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Return true when `url` is a safe endpoint value.
@@ -477,6 +498,7 @@ impl Default for CloudConfig {
             teams: Vec::new(),
             default_team_id: None,
             teams_fetched_at: None,
+            team_backfill_notified: false,
         }
     }
 }
