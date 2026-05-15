@@ -302,8 +302,11 @@ Share learnings across a team without manual flags. After an admin has
 created a team in the CAS Cloud dashboard:
 
 ```bash
-# Standard setup — log in, then set your user-wide team default by slug
+# Standard setup — log in. CAS fetches your team membership automatically.
 cas login
+
+# If you belong to exactly one team, auto-scope kicks in immediately.
+# If you belong to multiple teams, pick a user-wide default:
 cas cloud team default petra-stella   # slug from your team dashboard
 
 # From now on, every memory captured via mcp__cas__memory
@@ -319,6 +322,8 @@ Teammates on a fresh machine get the same setup:
 
 ```bash
 cas login
+# single-team users: done — sync will auto-scope to your team
+# multi-team users: pick a default:
 cas cloud team default petra-stella
 cas cloud team-memories
 ```
