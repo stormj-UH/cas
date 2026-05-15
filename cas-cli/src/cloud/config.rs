@@ -17,6 +17,8 @@ use std::sync::Mutex;
 use crate::error::CasError;
 use crate::store::find_cas_root;
 
+// `dirs` used by `user_config_path()` / `load_user()` / `save_user()`
+
 /// Cached project canonical ID. Only `Some` results are cached; if resolution
 /// returns `None` (e.g. `find_cas_root()` fails because the process started
 /// outside a CAS project), the next call retries instead of locking in `None`
@@ -450,6 +452,39 @@ impl Default for CloudConfig {
 }
 
 impl CloudConfig {
+    /// Return the path to the user-level `~/.cas/cloud.json`.
+    ///
+    /// Returns `None` only when `dirs::home_dir()` fails — practically
+    /// unreachable on any supported platform (Linux/macOS).
+    pub fn user_config_path() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".cas").join("cloud.json"))
+    }
+
+    /// Load the user-level cloud config from `~/.cas/cloud.json`.
+    ///
+    /// Falls back to `Default::default()` when the file is absent — identical
+    /// semantics to `load_from` for a missing file.  This is the user-scope
+    /// counterpart to `load()` (project scope).
+    pub fn load_user() -> Result<Self, CasError> {
+        match Self::user_config_path() {
+            Some(path) => Self::load_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Save the user-level cloud config to `~/.cas/cloud.json`.
+    ///
+    /// Creates `~/.cas/` if it does not already exist.  This is the
+    /// user-scope counterpart to `save()` (project scope).
+    pub fn save_user(&self) -> Result<(), CasError> {
+        let path = Self::user_config_path()
+            .ok_or_else(|| CasError::Other("Cannot determine home directory".to_string()))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.save_to(&path)
+    }
+
     /// Load cloud config from .cas/cloud.json
     pub fn load() -> Result<Self, CasError> {
         let path = Self::config_path()?;
