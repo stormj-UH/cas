@@ -385,6 +385,18 @@ pub struct CloudConfig {
     /// `skip_serializing_if` so pre-T4 files stay clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_team_id: Option<String>,
+
+    /// UTC timestamp of the last successful `/api/me` fetch that populated
+    /// `teams[]`.  Used by T2's staleness check: when `teams` is non-empty
+    /// and this timestamp is within 24 h, the lazy refresh in
+    /// `execute_sync` is skipped to avoid an extra HTTP round-trip per
+    /// sync cycle.
+    ///
+    /// `None` means teams have never been fetched (triggers refresh on next
+    /// sync).  Absent in existing `cloud.json` → `None` via
+    /// `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teams_fetched_at: Option<DateTime<Utc>>,
 }
 
 /// Return true when `url` is a safe endpoint value.
@@ -464,6 +476,7 @@ impl Default for CloudConfig {
             team_auto_promote: None,
             teams: Vec::new(),
             default_team_id: None,
+            teams_fetched_at: None,
         }
     }
 }
