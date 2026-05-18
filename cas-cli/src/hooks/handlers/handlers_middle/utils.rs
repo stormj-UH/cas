@@ -50,6 +50,33 @@ pub fn find_similar_rule(cas_root: &std::path::Path, content: &str) -> bool {
     }
 }
 
+/// Check if a similar memory entry already exists using BM25 search.
+///
+/// Returns `true` if an entry with a high similarity score is found, meaning
+/// the caller should skip writing a new near-duplicate entry.  Mirrors the
+/// `find_similar_rule` guard used by the `extract_learnings_sync` path.
+pub fn find_similar_entry(cas_root: &std::path::Path, content: &str) -> bool {
+    use cas_core::{DocType, SearchIndex, SearchOptions};
+
+    let index_dir = cas_root.join("index/tantivy");
+    let search = match SearchIndex::open(&index_dir) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let opts = SearchOptions {
+        query: content.chars().take(200).collect(),
+        limit: 3,
+        doc_types: vec![DocType::Entry],
+        ..Default::default()
+    };
+
+    match search.search_unified(&opts) {
+        Ok(results) => results.iter().any(|r| r.bm25_score > 5.0),
+        Err(_) => false,
+    }
+}
+
 /// Check if a file path represents an architectural/important file
 pub fn is_architectural_file(path: &str) -> bool {
     // Configuration files

@@ -847,3 +847,230 @@ If no clear learnings found, respond with: []"#
         .filter(|l| l.confidence >= 0.7)
         .collect())
 }
+
+// ─── session-learn: 7-signal memory classifier (cas-6156 / EPIC cas-ebea) ─────
+
+/// Run the session-learn 7-signal classifier against the transcript.
+///
+/// Synchronous wrapper — creates a `tokio::Runtime`, calls `session_learn_async`
+/// with a 30-second timeout (longer than `extract_learnings_sync` because the
+/// 7-signal prompt is richer), and returns the draft list.
+///
+/// Callers in `stop_flow.rs` apply the confidence gate and overlap-detection
+/// (`find_similar_entry`) before writing survivors to the store.
+pub(crate) fn session_learn_sync(
+    transcript_path: &str,
+    file_paths: &[String],
+) -> Result<Vec<SessionLearnDraft>, MemError> {
+    use std::time::Duration;
+    use tokio::runtime::Runtime;
+
+    let rt =
+        Runtime::new().map_err(|e| MemError::Other(format!("Failed to create runtime: {e}")))?;
+
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            session_learn_async(transcript_path, file_paths),
+        )
+        .await
+        .map_err(|_| MemError::Other("session-learn timed out after 30s".to_string()))?
+    })
+}
+
+/// Async implementation — reads transcript, builds the 7-signal prompt, calls
+/// Haiku, and parses the returned JSON array into `Vec<SessionLearnDraft>`.
+async fn session_learn_async(
+    transcript_path: &str,
+    file_paths: &[String],
+) -> Result<Vec<SessionLearnDraft>, MemError> {
+    use crate::tracing::claude_wrapper::traced_prompt;
+    use claude_rs::QueryOptions;
+
+    let transcript = std::fs::read_to_string(transcript_path)
+        .map_err(|e| MemError::Other(format!("session-learn: cannot read transcript: {e}")))?;
+
+    // Skip trivial transcripts — same guard the SKILL.md documents
+    if transcript.len() < 500 {
+        return Ok(vec![]);
+    }
+
+    // Keep the most-recent 50 k chars (valid UTF-8 boundary)
+    let transcript_excerpt = if transcript.len() > 50_000 {
+        let mut start = transcript.len() - 50_000;
+        while start < transcript.len() && !transcript.is_char_boundary(start) {
+            start += 1;
+        }
+        &transcript[start..]
+    } else {
+        &transcript
+    };
+
+    let file_context = if file_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Files Modified This Session\n{}",
+            file_paths
+                .iter()
+                .take(20)
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
+    let prompt_text = format!(
+        r#"You are analyzing a Claude Code session transcript to extract structured memory entries using a 7-signal taxonomy.
+
+## 7-Signal Classification
+
+For each finding, assign exactly one signal:
+1. concept  — a new domain term or abstraction the agent learned
+2. entity   — a person, project, tool, repo, or library worth remembering for future recall
+3. correction — the user pushed back on the agent; this should bind future behavior
+4. pattern  — a recurring pitfall, gotcha, or "I always forget X" moment
+5. idea     — a proposal that was floated but not acted on (worth saving)
+6. decision — an architectural/process/scope decision with a rationale that should outlive the session
+7. gap      — something the agent didn't know but should have
+
+## Output Schema
+
+Return a JSON array of draft objects (possibly empty):
+[{{
+  "signal": "correction",
+  "entry_type": "preference",
+  "scope": "global",
+  "tags": ["correction", "topic"],
+  "content": "<imperative-form memory, e.g. 'Always X' or 'Never Y'>",
+  "confidence": 0.85,
+  "dedup_hits": [],
+  "notes": "<optional rationale for non-obvious choices>"
+}}]
+
+Default signal → entry_type mapping (override when a better fit is clear):
+- concept   → learning    (scope: project if term is codebase-specific, global if cross-project)
+- entity    → context     (scope: project)
+- correction → preference (scope: global — corrections outlive projects; project only if codebase-specific)
+- pattern   → learning    (scope: project if codebase-specific, global if tool-general)
+- idea      → context     (scope: project)
+- decision  → context     (scope: project)
+- gap       → observation (scope: project)
+
+## Quality Rules
+
+- Only emit project-, user-, or session-specific findings — no general programming knowledge
+- Emit corrections at confidence >= 0.5; all other signals at confidence >= 0.6
+- One signal per draft (a finding that fits two signals = two drafts)
+- dedup_hits: list IDs of near-duplicate existing memories if you know them; otherwise []
+- Return [] if the session contains no clear signal-worthy findings
+
+## Transcript
+{transcript_excerpt}
+{file_context}
+
+Return only the JSON array, no prose, no markdown wrapper."#
+    );
+
+    let result = traced_prompt(
+        &prompt_text,
+        QueryOptions::new().model("claude-haiku-4-5").max_turns(1),
+        "session_learn",
+    )
+    .await
+    .map_err(|e| MemError::Other(format!("session-learn LLM call failed: {e}")))?;
+
+    let response_text = result.text();
+
+    // Extract JSON array from the response
+    let json_str = response_text
+        .find('[')
+        .and_then(|start| {
+            response_text
+                .rfind(']')
+                .map(|end| &response_text[start..=end])
+        })
+        .unwrap_or("[]");
+
+    let drafts: Vec<SessionLearnDraft> = serde_json::from_str(json_str)
+        .map_err(|e| MemError::Parse(format!("session-learn: failed to parse drafts: {e}")))?;
+
+    Ok(drafts)
+}
+
+#[cfg(test)]
+mod session_learn_tests {
+    use super::*;
+
+    /// Confirm `SessionLearnDraft` round-trips through JSON correctly.
+    /// This exercises the serde mapping without a live LLM.
+    #[test]
+    fn session_learn_draft_deserializes_from_json() {
+        let json = r#"[
+          {
+            "signal": "correction",
+            "entry_type": "preference",
+            "scope": "global",
+            "tags": ["correction", "scope-discipline"],
+            "content": "When a worker flags a real gap, amend the AC rather than working around it.",
+            "confidence": 0.9,
+            "dedup_hits": []
+          },
+          {
+            "signal": "pattern",
+            "entry_type": "learning",
+            "scope": "project",
+            "tags": ["pattern", "git"],
+            "content": "Single-commit branches self-cert through the verification gate; multi-commit stacks hit jail.",
+            "confidence": 0.85,
+            "dedup_hits": [],
+            "notes": "Confirmed by cas-8edb"
+          }
+        ]"#;
+
+        let drafts: Vec<SessionLearnDraft> =
+            serde_json::from_str(json).expect("draft JSON must parse");
+        assert_eq!(drafts.len(), 2);
+
+        let correction = &drafts[0];
+        assert_eq!(correction.signal, "correction");
+        assert_eq!(correction.entry_type, "preference");
+        assert_eq!(correction.scope, "global");
+        assert!((correction.confidence - 0.9).abs() < f32::EPSILON);
+        assert!(correction.dedup_hits.is_empty());
+        assert!(correction.notes.is_none());
+
+        let pattern = &drafts[1];
+        assert_eq!(pattern.signal, "pattern");
+        assert_eq!(pattern.notes.as_deref(), Some("Confirmed by cas-8edb"));
+    }
+
+    /// Empty-array response is valid and must not error.
+    #[test]
+    fn session_learn_draft_accepts_empty_array() {
+        let drafts: Vec<SessionLearnDraft> =
+            serde_json::from_str("[]").expect("empty array must parse");
+        assert!(drafts.is_empty());
+    }
+
+    /// `session_learn_sync` on a too-short transcript must return Ok([]) without
+    /// attempting an LLM call (the < 500 byte guard in session_learn_async).
+    /// We verify this by pointing at a real temp file with tiny content.
+    #[test]
+    fn session_learn_sync_skips_trivial_transcript() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(tmp, "short").expect("write");
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let result = session_learn_sync(&path, &[]);
+        assert!(
+            result.is_ok(),
+            "trivial transcript must return Ok, not Err: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "trivial transcript must return empty draft list"
+        );
+    }
+}
