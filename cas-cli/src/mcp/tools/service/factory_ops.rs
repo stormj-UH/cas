@@ -423,9 +423,30 @@ impl CasService {
                 // ("owned by worker-backfill (0a7f2802-...)") without manual
                 // table-lookup. cas-85bf.
                 let session_uuid = agent.cc_session_id.as_deref().unwrap_or(&agent.id);
+                // Context usage (cas-573c): cheap tail-read of the session
+                // transcript to surface a coarse band so the supervisor can
+                // proactively preserve work before compaction. Falls back
+                // silently when the transcript isn't found yet (new workers).
+                let context_info = {
+                    let tp = transcript_path_fast(clone_path.as_deref(), session_uuid);
+                    match tp.and_then(|p| read_context_usage_from_tail(&p)) {
+                        Some(total) => {
+                            let band = context_band(total);
+                            let ktok = total / 1_000;
+                            format!("\n    context: {band} (~{ktok}k tk)")
+                        }
+                        None => String::new(),
+                    }
+                };
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}{}{}\n    session: {}\n",
-                    &agent.name, since, liveness_label, clone_info, transcript_info, session_uuid
+                    "  • {} (heartbeat: {}){}{}{}{}\n    session: {}\n",
+                    &agent.name,
+                    since,
+                    liveness_label,
+                    clone_info,
+                    transcript_info,
+                    context_info,
+                    session_uuid
                 ));
             }
         }
@@ -1380,6 +1401,102 @@ fn render_transcript_block(
     }
 }
 
+// ============================================================================
+// cas-573c: Context-usage indicator for worker_status
+// ============================================================================
+
+/// Standard Claude context window in tokens. Most frontier models (Sonnet,
+/// Opus) support 200 K input tokens. Haiku is 100 K but we don't distinguish
+/// at this layer — the bands are conservative enough that a Haiku worker only
+/// reaches `near-limit` when it's genuinely close to compaction.
+const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
+/// Classify a token count as a coarse context-usage band.
+///
+/// Thresholds (against `DEFAULT_CONTEXT_WINDOW = 200k`):
+/// - `ok`          — 0–49 % (< 100k) — no action needed
+/// - `approaching` — 50–79 % (100k–159k) — warn supervisor
+/// - `near-limit`  — ≥ 80 % (≥ 160k) — proactively preserve work
+pub(crate) fn context_band(total_input_tokens: u64) -> &'static str {
+    let pct = total_input_tokens * 100 / DEFAULT_CONTEXT_WINDOW;
+    match pct {
+        0..=49 => "ok",
+        50..=79 => "approaching",
+        _ => "near-limit",
+    }
+}
+
+/// Resolve the on-disk transcript path for a live worker without a glob walk.
+///
+/// Reconstructs the synthesized path from `clone_path` + `session_id` and
+/// checks whether that file exists via a single `stat(2)`. Returns `None`
+/// when the home dir is unresolvable, `clone_path` is absent, or the file
+/// doesn't exist yet (worker just started).
+fn transcript_path_fast(clone_path: Option<&str>, session_id: &str) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    let clone = clone_path?;
+    let synthesized = synthesized_transcript_path(clone, session_id);
+    // synthesized is "~/.claude/projects/<escaped>/<session_id>.jsonl"
+    let relative = synthesized.strip_prefix("~/")?;
+    let real = home.join(relative);
+    if real.exists() { Some(real) } else { None }
+}
+
+/// Read the last ≤ 8 KB of a JSONL session transcript and return the total
+/// input-token count from the most recent assistant message that carries usage.
+///
+/// **Why tail-only?** Session transcripts grow throughout a session and can
+/// reach tens of MB. Reading the full file on every `worker_status` poll
+/// would violate the latency AC (cas-573c). The tail approach reads a
+/// bounded slice (~8 KB, one `read(2)` after a `lseek(2)`) and scans it
+/// backward for the latest assistant entry — the freshest usage snapshot.
+///
+/// Returns `None` when the file can't be opened, the tail has no parseable
+/// assistant entry with a `usage` field, or any I/O error occurs.
+pub(crate) fn read_context_usage_from_tail(path: &std::path::Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+
+    const TAIL_BYTES: u64 = 8192;
+    let start = file_len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Scan in reverse: the last assistant entry with usage is the freshest.
+    for line in buf.lines().rev() {
+        // Quick pre-filter before full parse to avoid repeated serde overhead.
+        if !line.contains("\"type\":\"assistant\"") {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let usage = v.get("message")?.get("usage")?;
+        let input = usage
+            .get("input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let cache_create = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        return Some(input + cache_create + cache_read);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1754,10 +1871,11 @@ mod tests {
         const NAME: &str = "worker-backfill";
         const UUID: &str = "0a7f2802-e977-493b-965b-c620e99f04ef";
 
-        // Reproduce the format! call from factory_worker_status (cas-85bf).
+        // Reproduce the format! call from factory_worker_status (cas-85bf +
+        // cas-573c): context_info is the 6th positional arg.
         let output = format!(
-            "  • {} (heartbeat: {}){}{}{}\n    session: {}\n",
-            NAME, "5s ago", "", "", "", UUID
+            "  • {} (heartbeat: {}){}{}{}{}\n    session: {}\n",
+            NAME, "5s ago", "", "", "", "", UUID
         );
 
         assert!(
@@ -1772,5 +1890,107 @@ mod tests {
             output.contains("session:"),
             "output must have 'session:' label: {output}"
         );
+    }
+
+    // ---- cas-573c: context-usage band + tail reader -----------------------
+
+    #[test]
+    fn context_band_ok_below_50_pct() {
+        assert_eq!(context_band(0), "ok");
+        assert_eq!(context_band(49_999), "ok");
+        // 99_999 / 200_000 * 100 = 49 → ok
+        assert_eq!(context_band(99_999), "ok");
+    }
+
+    #[test]
+    fn context_band_approaching_50_to_79_pct() {
+        // 100_000 / 200_000 * 100 = 50 → approaching
+        assert_eq!(context_band(100_000), "approaching");
+        assert_eq!(context_band(150_000), "approaching");
+        // 159_999 / 200_000 * 100 = 79 → approaching
+        assert_eq!(context_band(159_999), "approaching");
+    }
+
+    #[test]
+    fn context_band_near_limit_at_80_pct_and_above() {
+        // 160_000 / 200_000 * 100 = 80 → near-limit
+        assert_eq!(context_band(160_000), "near-limit");
+        assert_eq!(context_band(200_000), "near-limit");
+        assert_eq!(context_band(210_000), "near-limit");
+    }
+
+    /// `read_context_usage_from_tail` must extract the correct total from a
+    /// minimal JSONL snippet that matches the real CC session format.
+    #[test]
+    fn read_context_usage_from_tail_extracts_usage_sum() {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path();
+
+        // Write a minimal assistant entry matching the CC session JSONL format.
+        // Total = 1000 (input) + 5000 (cache_create) + 2000 (cache_read) = 8000.
+        writeln!(
+            tmp.as_file(),
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":1000,"cache_creation_input_tokens":5000,"cache_read_input_tokens":2000,"output_tokens":50}}}}}}"#
+        )
+        .unwrap();
+
+        let total = read_context_usage_from_tail(path).expect("should parse usage");
+        assert_eq!(total, 8_000, "input+cache_create+cache_read = 8000");
+    }
+
+    /// When the tail has multiple assistant entries, the LAST one wins.
+    #[test]
+    fn read_context_usage_from_tail_takes_last_entry() {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path();
+
+        // First entry: total 1000. Second entry: total 9000 → should win.
+        writeln!(
+            tmp.as_file(),
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":10}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            tmp.as_file(),
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":3000,"cache_creation_input_tokens":4000,"cache_read_input_tokens":2000,"output_tokens":20}}}}}}"#
+        )
+        .unwrap();
+
+        let total = read_context_usage_from_tail(path).expect("should parse usage");
+        assert_eq!(total, 9_000, "last entry's total should win");
+    }
+
+    /// Non-assistant entries (user, attachment) are skipped.
+    #[test]
+    fn read_context_usage_from_tail_skips_non_assistant_entries() {
+        use std::io::Write;
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path();
+
+        writeln!(
+            tmp.as_file(),
+            r#"{{"type":"user","message":{{"content":"hello"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            tmp.as_file(),
+            r#"{{"type":"attachment","content":"data"}}"#
+        )
+        .unwrap();
+
+        let total = read_context_usage_from_tail(path);
+        assert!(total.is_none(), "no assistant entry → should return None");
+    }
+
+    /// Missing file returns None gracefully.
+    #[test]
+    fn read_context_usage_from_tail_missing_file_returns_none() {
+        let path = std::path::Path::new("/tmp/cas_573c_nonexistent_fixture.jsonl");
+        assert!(read_context_usage_from_tail(path).is_none());
     }
 }
