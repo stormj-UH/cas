@@ -3009,17 +3009,33 @@ pub(crate) fn run_lightweight_structural_lint(
 
     let mut violations: Vec<String> = Vec::new();
 
-    // Scan added lines only (prefixed with '+' but not '++' file header).
-    let added_lines: Vec<&str> = diff_text
-        .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .map(|l| &l[1..]) // strip the leading '+'
-        .collect();
+    // Scan added lines only, tracking which file each line belongs to so that
+    // Rust-specific macro checks can be scoped to `*.rs` files.
+    // Each entry is (line_content_after_stripping_'+', is_rust_file).
+    let added_lines: Vec<(&str, bool)> = {
+        let mut result = Vec::new();
+        let mut current_is_rust = false;
+        for line in diff_text.lines() {
+            if line.starts_with("+++ ") {
+                // "+++ b/path/to/file.ext" in a unified git diff.
+                // Strip the diff prefix ("b/") to obtain the bare path.
+                let path = line[4..].trim_start_matches("b/");
+                current_is_rust = path.ends_with(".rs");
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                result.push((&line[1..], current_is_rust));
+            }
+        }
+        result
+    };
 
-    // Check 1: unimplemented!() or todo!() macro calls anywhere on the line.
+    // Check 1: unimplemented!() or todo!() macro calls — Rust-only.
     // Use `contains("macro!(")` to catch both `macro!()` (no args) and
     // `macro!("msg")` forms, regardless of where they appear on the line.
-    for (i, line) in added_lines.iter().enumerate() {
+    // Scoped to `*.rs` files; TypeScript/JS/Python etc. are not checked.
+    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
+        if !is_rust_file {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.contains("unimplemented!(") {
             violations.push(format!(
@@ -3035,10 +3051,14 @@ pub(crate) fn run_lightweight_structural_lint(
         }
     }
 
-    // Check 2: dbg! macro calls
+    // Check 2: dbg! macro calls — Rust-only.
     // Use `contains("dbg!(")` to catch all forms regardless of preceding
     // whitespace: bare `dbg!(...)`, `=dbg!(...)`, `let x=dbg!(...)`, etc.
-    for (i, line) in added_lines.iter().enumerate() {
+    // Scoped to `*.rs` files; other languages do not use the dbg! macro.
+    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
+        if !is_rust_file {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.contains("dbg!(") {
             violations.push(format!(
@@ -3051,10 +3071,11 @@ pub(crate) fn run_lightweight_structural_lint(
     // Check 3: commented-out code blocks > 5 consecutive comment lines.
     // Heuristic: 6 or more consecutive lines that (a) start with '//'
     // and (b) are not doc comments ('///') or copyright headers.
+    // Applied across all languages (// comments exist in Rust, TS, JS, etc.).
     {
         let mut run = 0usize;
         let mut run_start = 0usize;
-        for (i, line) in added_lines.iter().enumerate() {
+        for (i, (line, _is_rust_file)) in added_lines.iter().enumerate() {
             let trimmed = line.trim();
             let is_code_comment = trimmed.starts_with("//")
                 && !trimmed.starts_with("///")
@@ -3114,6 +3135,14 @@ mod lightweight_lint_tests {
     use tempfile::TempDir;
 
     fn init_repo_with_diff(added_lines: &str) -> TempDir {
+        init_repo_with_diff_for_file("changed.rs", added_lines)
+    }
+
+    /// Like `init_repo_with_diff` but lets the caller choose the filename
+    /// (and therefore the extension) of the file being changed. This is used
+    /// to exercise the language-aware lint checks (e.g. Rust macros must not
+    /// fire for `.ts` / `.js` / `.py` changes).
+    fn init_repo_with_diff_for_file(filename: &str, added_lines: &str) -> TempDir {
         let dir = TempDir::new().unwrap();
         // init git
         Command::new("git")
@@ -3143,8 +3172,8 @@ mod lightweight_lint_tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        // write changed file
-        std::fs::write(dir.path().join("changed.rs"), added_lines).unwrap();
+        // write changed file using the requested filename/extension
+        std::fs::write(dir.path().join(filename), added_lines).unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(dir.path())
@@ -3257,6 +3286,100 @@ mod lightweight_lint_tests {
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
             "no-git directory should pass (graceful degradation)"
+        );
+    }
+
+    // --- cas-b829: language-aware Rust-macro gate ---
+    // Rust macros (todo!, unimplemented!, dbg!) must only fire for *.rs files.
+    // TypeScript / JS / Python diffs must never trigger these checks.
+
+    #[test]
+    fn lint_ignores_todo_macro_in_ts_file() {
+        // A TypeScript file may contain `todo!()` as a literal string in a
+        // comment, test description, or error message without it being an
+        // incomplete Rust stub. The lint must not flag it.
+        let dir =
+            init_repo_with_diff_for_file("component.ts", "// TODO: todo!(\"not done\") later\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_unimplemented_macro_in_ts_file() {
+        let dir = init_repo_with_diff_for_file(
+            "service.ts",
+            "throw new Error('unimplemented!()');\n",
+        );
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "unimplemented!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_dbg_macro_in_ts_file() {
+        let dir =
+            init_repo_with_diff_for_file("utils.ts", "const x = dbg!(value);\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "dbg!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_todo_macro_in_js_file() {
+        let dir = init_repo_with_diff_for_file("index.js", "// todo!(\"later\")\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .js file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_todo_macro_in_python_file() {
+        let dir = init_repo_with_diff_for_file("app.py", "# todo!(\"later\")\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .py file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_todo_in_rs_file() {
+        // Confirm existing Rust behaviour is preserved after the language-aware change.
+        let dir = init_repo_with_diff_for_file("lib.rs", "fn stub() { todo!(\"implement\") }\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "todo!() in a .rs file must still fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_unimplemented_in_rs_file() {
+        let dir =
+            init_repo_with_diff_for_file("lib.rs", "fn stub() { unimplemented!() }\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "unimplemented!() in a .rs file must still fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_dbg_in_rs_file() {
+        let dir = init_repo_with_diff_for_file("lib.rs", "let x = dbg!(value);\n");
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "dbg!() in a .rs file must still fail lint"
         );
     }
 }
