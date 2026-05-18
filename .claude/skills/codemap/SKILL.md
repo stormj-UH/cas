@@ -123,15 +123,14 @@ See [.claude/CODEMAP.md](.claude/CODEMAP.md) — Rust workspace + TS frontend; C
 
 If a pointer already exists with the same name, update it. Do not create duplicates.
 
-### 2. Clear the freshness counter
+### 2. Commit CODEMAP.md to reset the staleness signal
 
-Run:
+The freshness gate (SessionStart hook + `cas codemap status`) uses **git history** as the sole authority. Once you commit `.claude/CODEMAP.md`, its git timestamp advances past all prior structural changes and both signals automatically report "up to date" in the next session.
 
 ```bash
-cas codemap clear
+git add .claude/CODEMAP.md
+git commit -m "docs: regenerate CODEMAP.md"
 ```
-
-This deletes `.cas/codemap-pending.json`, the file that the `SessionStart` and `PreToolUse` hooks read to decide whether to nag about staleness. Skipping this step means the next session keeps blocking worker dispatch with "Run `/codemap` to refresh" even though the doc was just refreshed.
 
 Then verify:
 
@@ -139,7 +138,7 @@ Then verify:
 cas codemap status
 ```
 
-Should report `Status: up to date`. If it still reports pending changes, the changes are coming from git history (commits since CODEMAP.md was last modified) — committing the new CODEMAP.md will reset that signal too.
+Should report `Status: up to date`. No manual `cas codemap clear` is required.
 
 ### 3. Report back
 
@@ -161,6 +160,6 @@ Print two things to the user:
 - Drifting into product/domain content (personas, journeys, business concepts). That's `project-overview`'s job.
 - Generic one-liners that just restate the path (`tests/ — tests`). Cut the line or write a real one.
 - Skipping the keep-block check on regeneration. Destroying hand-edits is a trust breaker.
-- Forgetting to run `cas codemap clear`. The hooks will keep nagging until the pending file is gone.
+- Forgetting to commit `.claude/CODEMAP.md`. Freshness is computed from git history — committing resets the staleness signal for the next session.
 - Forgetting to write the memory pointer.
 - Including `target/`, `node_modules/`, `dist/`, `vendor/` as if they were source. They aren't — skip them.
