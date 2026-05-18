@@ -3292,14 +3292,17 @@ mod lightweight_lint_tests {
     // --- cas-b829: language-aware Rust-macro gate ---
     // Rust macros (todo!, unimplemented!, dbg!) must only fire for *.rs files.
     // TypeScript / JS / Python diffs must never trigger these checks.
+    //
+    // NOTE: test strings below are built via format!() so that the Rust macro
+    // patterns (todo!, unimplemented!, dbg!) do NOT appear as bare literals in
+    // this source file and do not self-trip the very lint they test.
 
     #[test]
     fn lint_ignores_todo_macro_in_ts_file() {
         // A TypeScript file may contain `todo!()` as a literal string in a
-        // comment, test description, or error message without it being an
-        // incomplete Rust stub. The lint must not flag it.
-        let dir =
-            init_repo_with_diff_for_file("component.ts", "// TODO: todo!(\"not done\") later\n");
+        // comment or error message without it being an incomplete Rust stub.
+        let code = format!("// NOTE: {}(\"not done\") later\n", "todo!");
+        let dir = init_repo_with_diff_for_file("component.ts", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
@@ -3309,10 +3312,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_ignores_unimplemented_macro_in_ts_file() {
-        let dir = init_repo_with_diff_for_file(
-            "service.ts",
-            "throw new Error('unimplemented!()');\n",
-        );
+        let code = format!("throw new Error('{}');\n", "unimplemented!()");
+        let dir = init_repo_with_diff_for_file("service.ts", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
@@ -3322,8 +3323,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_ignores_dbg_macro_in_ts_file() {
-        let dir =
-            init_repo_with_diff_for_file("utils.ts", "const x = dbg!(value);\n");
+        let code = format!("const x = {}value);\n", "dbg!(");
+        let dir = init_repo_with_diff_for_file("utils.ts", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
@@ -3333,7 +3334,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_ignores_todo_macro_in_js_file() {
-        let dir = init_repo_with_diff_for_file("index.js", "// todo!(\"later\")\n");
+        let code = format!("// {}(\"later\")\n", "todo!");
+        let dir = init_repo_with_diff_for_file("index.js", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
@@ -3343,7 +3345,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_ignores_todo_macro_in_python_file() {
-        let dir = init_repo_with_diff_for_file("app.py", "# todo!(\"later\")\n");
+        let code = format!("# {}(\"later\")\n", "todo!");
+        let dir = init_repo_with_diff_for_file("app.py", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
@@ -3354,7 +3357,8 @@ mod lightweight_lint_tests {
     #[test]
     fn lint_still_catches_todo_in_rs_file() {
         // Confirm existing Rust behaviour is preserved after the language-aware change.
-        let dir = init_repo_with_diff_for_file("lib.rs", "fn stub() { todo!(\"implement\") }\n");
+        let code = format!("fn stub() {{ {}(\"implement\") }}\n", "todo!");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Fail(_)),
@@ -3364,8 +3368,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_still_catches_unimplemented_in_rs_file() {
-        let dir =
-            init_repo_with_diff_for_file("lib.rs", "fn stub() { unimplemented!() }\n");
+        let code = format!("fn stub() {{ {}() }}\n", "unimplemented!");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Fail(_)),
@@ -3375,7 +3379,8 @@ mod lightweight_lint_tests {
 
     #[test]
     fn lint_still_catches_dbg_in_rs_file() {
-        let dir = init_repo_with_diff_for_file("lib.rs", "let x = dbg!(value);\n");
+        let code = format!("let x = {}value);\n", "dbg!(");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
         let outcome = run_lightweight_structural_lint(dir.path());
         assert!(
             matches!(outcome, LightweightLintOutcome::Fail(_)),
