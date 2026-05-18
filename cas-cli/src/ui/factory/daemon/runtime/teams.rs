@@ -340,6 +340,9 @@ impl TeamsManager {
     /// what actually short-circuits the team-mode leader-escalation deadlock
     /// on Claude Code 2.1.x — the `permissions.allow` list alone does not.
     ///
+    /// Emits exec-form `"args"` (cas-9a60).  CC ≥ 2.1.142 required
+    /// (anthropics/claude-code#58441 fixed in 2.1.142, verified on 2.1.143).
+    ///
     /// Defaults mirror `cli/hook/config_gen.rs`: 2000ms timeout for both.
     /// `PreToolUse` matcher is the filesystem tool list so we don't fire
     /// the hook on unrelated tools (MCP, Agent, etc. still flow through
@@ -353,7 +356,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PreToolUse",
+                            "args": ["cas", "hook", "PreToolUse"],
                             "timeout": 2000
                         }
                     ]
@@ -364,7 +367,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PermissionRequest",
+                            "args": ["cas", "hook", "PermissionRequest"],
                             "timeout": 2000
                         }
                     ]
@@ -865,6 +868,9 @@ mod tests {
     /// regressed when `715891c` stripped project-level hooks expecting them
     /// to live in per-member settings, but the per-member settings writer
     /// never had them).
+    ///
+    /// cas-9a60: emitters use exec-form `"args"` now that
+    /// anthropics/claude-code#58441 is fixed in CC ≥ 2.1.142.
     #[test]
     fn settings_contents_wire_factory_auto_approve_hooks() {
         for (role, body) in [
@@ -880,17 +886,18 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PreToolUse entry: {hooks}"));
-            let pre_cmd = pre
+            let pre_args: Vec<&str> = pre
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap_or_else(|| panic!("{role} PreToolUse missing shell-form command: {pre}"));
+                .and_then(|h| h.get("args"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_else(|| panic!("{role} PreToolUse missing exec-form args: {pre}"));
             assert_eq!(
-                pre_cmd,
-                "cas hook PreToolUse",
-                "{role} PreToolUse must invoke `cas hook PreToolUse` via shell-form command (cas-c17b)"
+                pre_args,
+                vec!["cas", "hook", "PreToolUse"],
+                "{role} PreToolUse must invoke `cas hook PreToolUse` via exec-form args (cas-9a60)"
             );
             let matcher = pre
                 .get("matcher")
@@ -908,17 +915,18 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PermissionRequest entry: {hooks}"));
-            let perm_cmd = perm
+            let perm_args: Vec<&str> = perm
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap_or_else(|| panic!("{role} PermissionRequest missing shell-form command: {perm}"));
+                .and_then(|h| h.get("args"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_else(|| panic!("{role} PermissionRequest missing exec-form args: {perm}"));
             assert_eq!(
-                perm_cmd,
-                "cas hook PermissionRequest",
-                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via shell-form command (cas-c17b)"
+                perm_args,
+                vec!["cas", "hook", "PermissionRequest"],
+                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via exec-form args (cas-9a60)"
             );
         }
     }

@@ -49,6 +49,7 @@ fn make_agent(id: &str, name: &str, current_task: Option<&str>) -> AgentSummary 
         current_task: current_task.map(String::from),
         latest_activity: None,
         last_heartbeat: Some(chrono::Utc::now()),
+        pending_messages: 0,
     }
 }
 
@@ -1074,6 +1075,75 @@ fn test_blocked_task_not_dispatched() {
             DirectorEvent::TaskAssigned { task_id, .. } if task_id == "task-1"
         )),
         "Blocked task must not produce TaskAssigned: {events:?}"
+    );
+}
+
+/// Regression test for cas-afb7: spawn race where `WorkerIdle` fires before
+/// the prompt queue is drained on first poll.
+///
+/// A freshly spawned worker appears task-less before it has polled its first
+/// assignment from the prompt queue. The idle detector must not emit
+/// `WorkerIdle` as long as `pending_messages > 0`. Once the queue is drained
+/// (pending_messages == 0), normal debounce-threshold idle detection resumes.
+#[test]
+fn test_no_worker_idle_while_pending_messages_in_queue() {
+    let mut detector =
+        DirectorEventDetector::new(vec!["swift-fox".to_string()], "supervisor".to_string());
+
+    // Fresh worker: no task, one pending message (task assignment queued).
+    let data_with_pending = DirectorData {
+        ready_tasks: vec![],
+        in_progress_tasks: vec![],
+        epic_tasks: vec![],
+        agents: vec![AgentSummary {
+            id: "agent-1".to_string(),
+            name: "swift-fox".to_string(),
+            status: AgentStatus::Active,
+            current_task: None,
+            latest_activity: None,
+            last_heartbeat: Some(chrono::Utc::now()),
+            pending_messages: 1,
+        }],
+        activity: vec![],
+        agent_id_to_name: [("agent-1".to_string(), "swift-fox".to_string())]
+            .into_iter()
+            .collect(),
+        changes: vec![],
+        git_loaded: true,
+        reminders: vec![],
+        epic_closed_counts: HashMap::new(),
+    };
+    detector.initialize(&data_with_pending);
+
+    // Two consecutive ticks with pending_messages == 1: must NOT emit WorkerIdle.
+    let events_tick1 = detector.detect_changes(&data_with_pending, None);
+    let events_tick2 = detector.detect_changes(&data_with_pending, None);
+    assert!(
+        !events_tick1
+            .iter()
+            .chain(events_tick2.iter())
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "WorkerIdle must not fire while the worker has unread prompt-queue messages (spawn race)"
+    );
+
+    // Once the queue drains (pending_messages == 0), idle detection resumes.
+    // IDLE_CONSECUTIVE_TICKS == 2, so tick-1 must still be suppressed.
+    let idle = idle_data_for("agent-1", "swift-fox");
+    let events_after_drain_tick1 = detector.detect_changes(&idle, None);
+    assert!(
+        !events_after_drain_tick1
+            .iter()
+            .any(|e| matches!(e, DirectorEvent::WorkerIdle { .. })),
+        "First idle tick after queue drained must not fire (debounce threshold not yet reached)"
+    );
+    // Tick-2 crosses the threshold: WorkerIdle must now fire.
+    let events_after_drain_tick2 = detector.detect_changes(&idle, None);
+    assert!(
+        events_after_drain_tick2.iter().any(|e| matches!(
+            e,
+            DirectorEvent::WorkerIdle { worker } if worker == "swift-fox"
+        )),
+        "WorkerIdle must fire once pending messages are gone and idle threshold is met"
     );
 }
 

@@ -518,6 +518,18 @@ impl DirectorEventDetector {
                 continue;
             }
 
+            if agent.pending_messages > 0 {
+                // Worker has unread messages in the prompt queue — don't count
+                // this tick as idle. A freshly spawned worker appears task-less
+                // before it has polled its first assignment; firing `WorkerIdle`
+                // here would cause the supervisor to re-assign on top of the
+                // queued message (spawn race, cas-afb7). Reset the streak so the
+                // counter only starts accumulating after the queue is drained.
+                self.consecutive_idle_ticks.remove(&agent.id);
+                self.idle_already_emitted.remove(&agent.id);
+                continue;
+            }
+
             let count = self
                 .consecutive_idle_ticks
                 .entry(agent.id.clone())

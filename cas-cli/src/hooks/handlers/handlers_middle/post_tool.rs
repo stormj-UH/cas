@@ -576,6 +576,23 @@ fn check_ripple_consistency(stores: &mut ToolHookStores, input: &HookInput) -> O
 
     let path = std::path::Path::new(file_path);
 
+    // Scope ripple-check to the current project only.
+    //
+    // Cross-project edits (editing a file outside the project root) produce
+    // false positives because common filenames like CLAUDE.md, README.md, or
+    // Cargo.toml match task bodies across unrelated projects.  If the edited
+    // file is not under the current project's root, suppress the check silently.
+    //
+    // The project root is cas_root.parent() (e.g. ~/Petrastella/cas-src when
+    // cas_root = ~/Petrastella/cas-src/.cas).  Only absolute paths are checked
+    // here; relative paths are assumed to live inside the current project.
+    if path.is_absolute() {
+        let project_root = stores.cas_root.parent()?;
+        if !is_file_within_project(path, project_root) {
+            return None;
+        }
+    }
+
     // Compute relative path from cwd for matching against task descriptions
     let cwd = std::env::current_dir().ok()?;
     let relative = path
@@ -664,6 +681,26 @@ fn check_ripple_consistency(stores: &mut ToolHookStores, input: &HookInput) -> O
         relative,
         parts.join(" and "),
     ))
+}
+
+/// Returns `true` if `file_path` is located inside `project_root`.
+///
+/// Uses `std::fs::canonicalize` to resolve symlinks before comparison so that
+/// symlinked project roots don't produce false negatives (and to avoid
+/// accidental infinite loops through circular symlinks). When canonicalization
+/// fails — e.g. the file does not exist yet — falls back to a lexical
+/// `starts_with` check on the original paths.
+///
+/// Exported for unit testing; not part of the public CAS API.
+pub(crate) fn is_file_within_project(
+    file_path: &std::path::Path,
+    project_root: &std::path::Path,
+) -> bool {
+    let canon_root = std::fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canon_file = std::fs::canonicalize(file_path)
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    canon_file.starts_with(&canon_root)
 }
 
 /// Check if a task's text fields reference a given file path.

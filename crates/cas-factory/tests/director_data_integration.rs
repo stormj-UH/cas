@@ -530,6 +530,7 @@ fn test_agent_summary_fields() {
         current_task: Some("cas-1234".to_string()),
         latest_activity: Some(("Edited file".to_string(), now)),
         last_heartbeat: Some(now),
+        pending_messages: 0,
     };
 
     assert_eq!(summary.id, "agent-123");

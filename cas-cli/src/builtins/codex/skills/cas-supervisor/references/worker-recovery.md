@@ -48,11 +48,37 @@ Workers fail in production. These are the three observed failure modes and their
 5. Spawn a fresh worker: `mcp__cas__coordination action=spawn_workers count=1 isolate=true`
 6. Reassign the task to the new worker. If partial work was cherry-picked, include that context in the assignment message so the new worker builds on it rather than redoing it.
 
+### Pre-compaction Triage via worker_status context indicator (cas-573c)
+
+`mcp__cas__coordination action=worker_status` now includes a `context:` line per worker:
+
+```
+  • bright-leopard-9 (heartbeat: 8s ago)
+    context: approaching (~112k tk)
+    session: f90d2ee1-...
+```
+
+**Bands:**
+
+| Band | Tokens | Action |
+|---|---|---|
+| `ok` | < 100k | Normal — no action. |
+| `approaching` | 100k–159k | Note it. Remind the worker to commit any WIP. |
+| `near-limit` | ≥ 160k | Act immediately — see recovery steps below. |
+
+**Pre-compaction recovery (context: near-limit):**
+1. Send: `mcp__cas__coordination action=message target=<worker> message="Your context is near the limit. Commit any in-progress work immediately (git add / git commit), then report what you committed."`
+2. Wait for the commit confirmation (watch `mcp__cas__coordination action=worker_activity`).
+3. If the worker is mid-task and not responding: check the worktree manually: `git -C .cas/worktrees/<worker> log --oneline HEAD~5..HEAD`
+4. Once work is committed: shut down the worker cleanly and respawn with a fresh context.
+
+**Why the indicator may be absent:** The context line is read from the tail of the worker's session transcript. A newly spawned worker that hasn't produced an assistant message yet will show no `context:` line — this is expected. The line appears after the worker's first response.
+
 ### Garbage Output (Context Exhaustion)
 
 **Signature:** Worker output degrades into garbled multi-language text (Russian/Chinese characters mixed with English, repeating pseudo-words like "updofficial/action/official", BPE fragment nonsense). May be followed by a generic "violates Usage Policy" API error. This is token sampling collapse from an exhausted context window, not a real policy violation.
 
-**Triggering conditions:** Long iterative fix-test-rerun loops, heavy stack trace volume in tool results, extended sessions with rapid context churn (20+ file edits in a short window).
+**Triggering conditions:** Long iterative fix-test-rerun loops, heavy stack trace volume in tool results, extended sessions with rapid context churn (20+ file edits in a short window). The `context: near-limit` indicator in `worker_status` fires before this stage — if you act on `near-limit`, you typically avoid reaching the garbled-output stage.
 
 **Recovery:**
 1. **Do NOT send revision instructions.** The worker's context is poisoned — any further messages make it worse, not better.

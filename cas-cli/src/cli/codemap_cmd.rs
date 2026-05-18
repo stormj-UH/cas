@@ -43,41 +43,34 @@ fn execute_status(cas_root: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Get last modified time from git or filesystem
+    // Get last modified time from git or filesystem (display only)
     let last_updated = get_codemap_last_updated(&codemap_path);
     println!("CODEMAP.md: {}", codemap_path.display());
     println!("  Last updated: {last_updated}");
 
-    // Check pending changes from file
-    let pending_count = count_pending_changes(&pending_path);
-
-    // Check git-based staleness
-    let git_changes = get_git_structural_changes_since(project_root, &codemap_path);
-
-    let total = pending_count + git_changes;
-    if total == 0 {
-        println!("  Status: up to date");
-    } else {
-        println!("  Pending changes: {total}");
-        if pending_count > 0 {
-            println!("    From pending file: {pending_count}");
-        }
-        if git_changes > 0 {
-            println!("    From git history: {git_changes}");
+    // Authoritative freshness signal — same function used by the SessionStart hook.
+    // This ensures `cas codemap status` and the hook can never disagree.
+    match check_codemap_freshness(cas_root) {
+        None => println!("  Status: up to date"),
+        Some(staleness) => {
+            // Strip XML wrapper tags (with any attributes) for CLI display
+            let injection = staleness.format_injection(false);
+            let clean = injection
+                .lines()
+                .filter(|l| !l.starts_with("<codemap-freshness") && !l.starts_with("</codemap-freshness"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            println!("  Status: stale");
+            println!("  {clean}");
         }
     }
 
-    // Also show the hook-level freshness check for completeness
-    if let Some(staleness) = check_codemap_freshness(cas_root) {
-        // Strip XML tags for CLI display
-        let injection = staleness.format_injection(false);
-        // Strip XML wrapper tags (with any attributes) for CLI display
-        let clean = injection
-            .lines()
-            .filter(|l| !l.starts_with("<codemap-freshness") && !l.starts_with("</codemap-freshness"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        println!("\n  Hook message: {clean}");
+    // Informational: show pending-ledger entries (not used for staleness decisions,
+    // but useful for understanding what changed within the session).
+    let pending_count = count_pending_changes(&pending_path);
+    if pending_count > 0 {
+        println!("  Pending ledger: {pending_count} in-session structural change(s) recorded");
+        println!("  (ledger is informational — commit CODEMAP.md to reset the staleness signal)");
     }
 
     Ok(())
@@ -202,16 +195,16 @@ fn get_codemap_last_updated(codemap_path: &Path) -> String {
     "unknown".to_string()
 }
 
-/// Count structural changes from git history since CODEMAP.md was last updated.
-fn get_git_structural_changes_since(project_root: &Path, codemap_path: &Path) -> usize {
-    get_git_structural_change_list(project_root, codemap_path).len()
-}
+// Note: get_git_structural_changes_since (the usize wrapper) was removed by cas-2de1 —
+// execute_status() now calls check_codemap_freshness() directly so both surfaces agree.
+// get_git_structural_change_list is kept because execute_pending() uses it for display.
 
 /// Get structural change lines from git since CODEMAP.md was last updated.
+/// Used by execute_pending() to display what has changed — NOT used for
+/// freshness decisions (check_codemap_freshness() in codemap.rs owns that).
 fn get_git_structural_change_list(project_root: &Path, codemap_path: &Path) -> Vec<String> {
     // Get CODEMAP.md's last commit timestamp
-    let since = get_codemap_git_timestamp(codemap_path);
-    let since = match since {
+    let since = match get_codemap_git_timestamp(codemap_path) {
         Some(s) => s,
         None => return Vec::new(),
     };
@@ -245,7 +238,8 @@ fn get_git_structural_change_list(project_root: &Path, codemap_path: &Path) -> V
         .collect()
 }
 
-/// Get the ISO timestamp of CODEMAP.md's last commit.
+/// Get the ISO timestamp of CODEMAP.md's last commit (for display in execute_pending).
+/// Returns None when CODEMAP.md has no git history (gitignored or never committed).
 fn get_codemap_git_timestamp(codemap_path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["log", "-1", "--format=%cI", "--"])

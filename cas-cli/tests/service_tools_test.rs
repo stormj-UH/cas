@@ -411,6 +411,24 @@ fn test_task_transfer() {
     assert_eq!(req.notes, Some("Handoff notes here".to_string()));
 }
 
+/// cas-3ed5: supervisor force-transfer — TaskRequest accepts bypass_code_review=true
+/// as the supervisor-override flag for the transfer action.
+#[test]
+fn test_task_transfer_supervisor_override_deserializes() {
+    let json = json!({
+        "action": "transfer",
+        "id": "cas-1234",
+        "to_agent": "agent-5678",
+        "bypass_code_review": true,
+        "notes": "Supervisor reassign"
+    });
+
+    let req: TaskRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(req.to_agent, Some("agent-5678".to_string()));
+    assert_eq!(req.bypass_code_review, Some(true));
+    assert_eq!(req.notes, Some("Supervisor reassign".to_string()));
+}
+
 #[test]
 fn test_context_for_subagent() {
     let json = json!({

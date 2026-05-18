@@ -1,5 +1,7 @@
 use crate::support::*;
 use cas::mcp::tools::*;
+use cas::mcp::CasCore;
+use cas::store::open_agent_store;
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 
@@ -532,6 +534,119 @@ async fn test_task_ready() {
 
     let text = extract_text(result);
     assert!(text.contains("Ready task") || text.contains("ready") || text.contains("Tasks"));
+}
+
+/// Regression test for cas-978e: `task action=ready epic=<id>` must return only ready tasks
+/// that are children of the specified EPIC; without `epic`, behavior is unchanged.
+#[tokio::test]
+async fn test_task_ready_epic_filter() {
+    let (_temp, service) = setup_cas();
+
+    // Create an epic.
+    let epic_result = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Test Epic".to_string(),
+            description: None,
+            priority: 1,
+            task_type: "epic".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("epic create should succeed");
+    let epic_id = extract_task_id(&extract_text(epic_result))
+        .expect("should have epic ID")
+        .to_string();
+
+    // Create 2 tasks under the epic.
+    for i in 0..2 {
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                title: format!("Epic subtask {i}"),
+                description: None,
+                priority: 2,
+                task_type: "task".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: Some(epic_id.clone()),
+            }))
+            .await
+            .expect("subtask create should succeed");
+    }
+
+    // Create 1 task NOT under the epic.
+    service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Unrelated task".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("unrelated task create should succeed");
+
+    // With epic filter: only the 2 subtasks should appear, not the unrelated task.
+    let epic_filtered = service
+        .cas_task_ready(Parameters(TaskReadyBlockedRequest {
+            scope: "all".to_string(),
+            limit: Some(20),
+            sort: None,
+            sort_order: None,
+            epic: Some(epic_id.clone()),
+        }))
+        .await
+        .expect("task_ready with epic filter should succeed");
+    let filtered_text = extract_text(epic_filtered);
+    assert!(
+        filtered_text.contains("Epic subtask"),
+        "Epic-filtered ready list must include the epic subtasks: {filtered_text}"
+    );
+    assert!(
+        !filtered_text.contains("Unrelated task"),
+        "Epic-filtered ready list must not include tasks outside the epic: {filtered_text}"
+    );
+
+    // Without epic filter: all 3 tasks appear (2 subtasks + 1 unrelated).
+    let unfiltered = service
+        .cas_task_ready(Parameters(TaskReadyBlockedRequest {
+            scope: "all".to_string(),
+            limit: Some(20),
+            sort: None,
+            sort_order: None,
+            epic: None,
+        }))
+        .await
+        .expect("task_ready without epic filter should succeed");
+    let unfiltered_text = extract_text(unfiltered);
+    assert!(
+        unfiltered_text.contains("Epic subtask") && unfiltered_text.contains("Unrelated task"),
+        "Unfiltered ready list must include all ready tasks: {unfiltered_text}"
+    );
 }
 
 #[tokio::test]
@@ -1723,3 +1838,567 @@ async fn test_task_mine_matches_case_insensitive_and_trimmed() {
         "mine should tolerate case + whitespace drift in assignee: {text}"
     );
 }
+
+// =============================================================================
+// cas-3ed5: supervisor force-transfer (bypass live-worker lease without shutdown)
+// =============================================================================
+
+/// RAII guard that sets CAS_AGENT_ROLE=supervisor for the duration of a test.
+struct ScopedSupervisorRole;
+
+impl ScopedSupervisorRole {
+    fn enter() -> Self {
+        // SAFETY: held under env_test_lock() in all callers.
+        unsafe { std::env::set_var("CAS_AGENT_ROLE", "supervisor") }
+        Self
+    }
+}
+
+impl Drop for ScopedSupervisorRole {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("CAS_AGENT_ROLE") }
+    }
+}
+
+fn make_task_create_req(title: &str) -> TaskCreateRequest {
+    TaskCreateRequest {
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    }
+}
+
+/// Happy path: supervisor force-transfers a task claimed by a live worker.
+///
+/// AC: Supervisor has a documented, supported path to reassign a
+/// live-worker-claimed task without shutting the worker down.
+/// AC: Audit-log entry surfaces the override action with the supervisor session ID.
+#[tokio::test]
+async fn test_supervisor_force_transfer_live_worker_task() {
+    // setup_cas() creates a "test-agent" (the worker that claims the task).
+    let (temp, worker_core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // Register a "target worker" the task will be transferred to.
+    let mut target_worker =
+        cas::types::Agent::new("target-worker-id".to_string(), "target-worker".to_string());
+    target_worker.role = cas::types::AgentRole::Worker;
+    target_worker.heartbeat(); // mark alive
+    agent_store
+        .register(&target_worker)
+        .expect("register target worker");
+
+    // Register the supervisor agent that will force-transfer.
+    let supervisor_id = "supervisor-session-id".to_string();
+    let mut supervisor_agent =
+        cas::types::Agent::new(supervisor_id.clone(), "test-supervisor".to_string());
+    supervisor_agent.role = cas::types::AgentRole::Supervisor;
+    supervisor_agent.heartbeat();
+    agent_store
+        .register(&supervisor_agent)
+        .expect("register supervisor");
+
+    // Create a task under the worker CasCore.
+    let create_result = worker_core
+        .cas_task_create(Parameters(make_task_create_req(
+            "Task held by live worker — supervisor force-transfer test",
+        )))
+        .await
+        .expect("task create should succeed");
+    let task_id = extract_task_id(&extract_text(create_result))
+        .expect("should have task id")
+        .to_string();
+
+    // Simulate a live worker claiming the task directly via agent_store
+    // (bypassing the assignee check). This represents the state where a worker
+    // has started and claimed its task — the scenario the supervisor must bypass.
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&task_id).expect("task should exist");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some("test-session-placeholder".to_string()); // worker "holds" it
+    task_store.update(&task).expect("update task to InProgress");
+
+    // The "test-agent" (worker_core) has a session id of the form "test-session-<pid>".
+    // Use the actual id from the core setup to simulate the lease.
+    let worker_session_id = format!("test-session-{}", std::process::id());
+    agent_store
+        .try_claim(&task_id, &worker_session_id, 600, Some("worker lease"))
+        .expect("worker agent store claim should succeed");
+
+    // Confirm the worker owns the lease.
+    let task_before = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(
+        task_before.status,
+        cas::types::TaskStatus::InProgress,
+        "task should be InProgress after worker claim"
+    );
+
+    // Build a second CasCore acting as the supervisor.
+    let supervisor_core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    supervisor_core.set_agent_id_for_testing(supervisor_id.clone());
+
+    // Set the supervisor role env var.
+    let _role_guard = ScopedSupervisorRole::enter();
+
+    // Supervisor force-transfers the task to the target worker.
+    let transfer_req = TaskTransferRequest {
+        task_id: task_id.clone(),
+        to_agent: "target-worker-id".to_string(),
+        note: Some("Supervisor reassign — rebalancing workload".to_string()),
+        supervisor_override: Some(true),
+    };
+    let result = supervisor_core
+        .cas_task_transfer(Parameters(transfer_req))
+        .await
+        .expect("supervisor force-transfer should succeed");
+
+    let text = extract_text(result);
+
+    // Response must confirm transfer and note the override was used.
+    assert!(
+        text.contains("Transferred task"),
+        "response should confirm transfer: {text}"
+    );
+    assert!(
+        text.contains("SUPERVISOR FORCE-TRANSFER") || text.contains("force-transfer"),
+        "response should mention the override: {text}"
+    );
+
+    // Task notes must contain the audit entry.
+    let task_after = task_store.get(&task_id).expect("task should exist after transfer");
+    assert!(
+        task_after.notes.contains("SUPERVISOR FORCE-TRANSFER"),
+        "audit entry must be appended to task notes: {}",
+        task_after.notes
+    );
+    assert!(
+        task_after.notes.contains(&supervisor_id),
+        "audit entry must include supervisor session ID: {}",
+        task_after.notes
+    );
+    assert!(
+        task_after.notes.contains("Supervisor reassign"),
+        "handoff note must be preserved: {}",
+        task_after.notes
+    );
+
+    // Task assignee must be updated to the target worker.
+    assert_eq!(
+        task_after.assignee.as_deref(),
+        Some("target-worker-id"),
+        "task assignee must be updated to target worker"
+    );
+}
+
+/// Negative: non-supervisor callers cannot use supervisor_override=true.
+///
+/// AC: The override is gated — non-supervisors get an explicit rejection.
+#[tokio::test]
+async fn test_non_supervisor_cannot_force_transfer() {
+    let (temp, worker_core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // Register a second live agent holding a conflicting lease.
+    let mut other_worker =
+        cas::types::Agent::new("other-worker-id".to_string(), "other-worker".to_string());
+    other_worker.role = cas::types::AgentRole::Worker;
+    other_worker.heartbeat();
+    agent_store
+        .register(&other_worker)
+        .expect("register other worker");
+
+    // Create a task and have the "other worker" claim it directly via the store.
+    let create_result = worker_core
+        .cas_task_create(Parameters(make_task_create_req(
+            "Task for non-supervisor override rejection test",
+        )))
+        .await
+        .expect("task create should succeed");
+    let task_id = extract_task_id(&extract_text(create_result))
+        .expect("should have task id")
+        .to_string();
+
+    agent_store
+        .try_claim(&task_id, "other-worker-id", 600, Some("other worker holds lease"))
+        .expect("other worker claim should succeed");
+
+    // Register a target agent for the transfer destination.
+    let mut target =
+        cas::types::Agent::new("target-agent-id".to_string(), "target-agent".to_string());
+    target.role = cas::types::AgentRole::Worker;
+    target.heartbeat();
+    agent_store.register(&target).expect("register target");
+
+    // Caller is a plain worker (no supervisor role) — must be rejected.
+    // Do NOT set CAS_AGENT_ROLE=supervisor.
+    let transfer_req = TaskTransferRequest {
+        task_id: task_id.clone(),
+        to_agent: "target-agent-id".to_string(),
+        note: None,
+        supervisor_override: Some(true),
+    };
+    let result = worker_core.cas_task_transfer(Parameters(transfer_req)).await;
+
+    // Must return an error (McpError) with a clear rejection message.
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("supervisor") || msg.contains("CAS_AGENT_ROLE"),
+                "rejection message should explain the supervisor requirement: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            panic!(
+                "expected rejection for non-supervisor override, but got success: {text}"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// cas-6009: dep_remove honors dep_type — does not silently remove the wrong dep
+// =============================================================================
+
+/// Regression: the schema allows only one dependency row per (from_id, to_id)
+/// pair. Before the fix, `dep_remove A B dep_type=blocks` would silently delete
+/// whatever dep existed — including a ParentChild dep — because dep_type was
+/// ignored.  After the fix, `dep_remove` must return a clear error when the
+/// existing dep is NOT of the requested type, leaving the dep intact.
+#[tokio::test]
+async fn test_dep_remove_type_mismatch_does_not_delete_existing_dep() {
+    let (_temp, service) = setup_cas();
+
+    let task_a = make_task_create_req("Task A — dep_type mismatch regression");
+    let task_b = make_task_create_req("Task B — dep_type mismatch regression");
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(task_a))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(task_b))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+
+    // Add a ParentChild dep from A to B.
+    // NOTE: dep_add matches "parent" | "parentchild" (not "parent-child").
+    service
+        .cas_task_dep_add(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "parent".to_string(),
+        }))
+        .await
+        .expect("add parent-child dep");
+
+    // Verify the ParentChild dep exists
+    let deps_before = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list before"),
+    );
+    assert!(
+        deps_before.contains("ParentChild") || deps_before.contains("parent"),
+        "parent-child dep should exist: {deps_before}"
+    );
+
+    // Attempt to remove a Blocks dep (wrong type) — must fail, not delete the ParentChild
+    let result = service
+        .cas_task_dep_remove(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "blocks".to_string(),
+        }))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("No") || msg.contains("not found") || msg.contains("found"),
+                "error should explain dep not found: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // If the tool returns a tool-error (not McpError), it should surface the not-found message
+            assert!(
+                text.contains("No") || text.contains("not found") || text.contains("found"),
+                "tool response should surface the not-found error: {text}"
+            );
+        }
+    }
+
+    // ParentChild dep must still be intact — the wrong-type dep_remove must NOT have deleted it
+    let deps_after = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list after"),
+    );
+    assert!(
+        deps_after.contains("ParentChild") || deps_after.contains("parent"),
+        "parent-child dep must survive type-mismatched dep_remove: {deps_after}"
+    );
+}
+
+/// Regression: dep_remove with a dep_type that does NOT match any existing dep
+/// between the pair must return a clear error, not a silent success.
+/// Here we add a Related dep and try to remove it as Blocks — must fail.
+#[tokio::test]
+async fn test_dep_remove_wrong_type_returns_error() {
+    let (_temp, service) = setup_cas();
+
+    let req_a = make_task_create_req("Task A — no-dep-found error regression");
+    let req_b = make_task_create_req("Task B — no-dep-found error regression");
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req_a))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req_b))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+
+    // Add a Related dep (not Blocks)
+    service
+        .cas_task_dep_add(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "related".to_string(),
+        }))
+        .await
+        .expect("add related dep");
+
+    // Attempt to remove a Blocks dep (which doesn't exist) — must fail
+    let result = service
+        .cas_task_dep_remove(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "blocks".to_string(),
+        }))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("No") || msg.contains("not found") || msg.contains("found"),
+                "error should explain dep not found: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // dep_remove returned a tool-error response rather than McpError
+            assert!(
+                text.contains("No") || text.contains("not found") || text.contains("found"),
+                "tool response should surface the not-found error: {text}"
+            );
+        }
+    }
+
+    // Related dep must still be intact
+    let deps_after = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list after"),
+    );
+    assert!(
+        deps_after.contains("Related") || deps_after.contains("related"),
+        "related dep must survive type-mismatched dep_remove: {deps_after}"
+    );
+}
+
+/// Regression: creating a task with the same ID as both `epic` and `blocked_by`
+/// must be rejected — the mixed ParentChild+Blocks scenario is the root cause
+/// of the silent dep_remove data-loss bug (cas-6009).
+#[tokio::test]
+async fn test_create_rejects_blocked_by_same_as_epic() {
+    let (_temp, service) = setup_cas();
+
+    // Create an epic first
+    let epic_create = TaskCreateRequest {
+        title: "Epic for mixed-dep rejection test".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "epic".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let epic_text = extract_text(
+        service
+            .cas_task_create(Parameters(epic_create))
+            .await
+            .expect("create epic"),
+    );
+    let epic_id = extract_task_id(&epic_text).expect("epic id").to_string();
+
+    // Attempt to create a child task that is ALSO blocked by the same epic
+    let bad_create = TaskCreateRequest {
+        title: "Child blocked by its own epic".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: Some(epic_id.clone()),
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: Some(epic_id.clone()),
+    };
+
+    let result = service.cas_task_create(Parameters(bad_create)).await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("epic") || msg.contains("child"),
+                "rejection should reference the conflict: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // Should not succeed
+            panic!(
+                "expected rejection when blocked_by == epic, got success: {text}"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// cas-85bf: Task ownership errors surface worker name (not just UUID)
+// ============================================================================
+
+/// When a task is locked by another worker, the "locked by" error must include
+/// the holding worker's friendly name alongside the session UUID so the
+/// supervisor can identify who has the task without cross-referencing
+/// worker_status output.
+#[tokio::test]
+async fn test_task_start_locked_error_includes_worker_name() {
+    use cas::store::open_agent_store;
+    use cas::types::{Agent, AgentRole};
+
+    let (temp, service) = setup_cas();
+    let cas_dir = service.project_path().to_path_buf();
+
+    // Register a "blocker" worker with a recognizable name.
+    const BLOCKER_SESSION: &str = "blocker-session-0000-0000-000000000001";
+    const BLOCKER_NAME: &str = "worker-backfill";
+
+    let blocker = Agent::new_with_role(
+        BLOCKER_SESSION.to_string(),
+        BLOCKER_NAME.to_string(),
+        AgentRole::Worker,
+    );
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    agent_store.register(&blocker).expect("register blocker");
+
+    // Create a task.
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Locked task for name-in-error test".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    // Have the blocker claim the task directly at store level.
+    agent_store
+        .try_claim(&id, BLOCKER_SESSION, 600, Some("blocking for test"))
+        .expect("blocker claim");
+
+    // Now try to start the same task via the test service — should fail
+    // because our test agent doesn't own the lease.
+    let start_err = service
+        .cas_task_start(Parameters(cas::mcp::tools::IdRequest { id: id.clone() }))
+        .await
+        .expect_err("start must fail when another agent holds the lease");
+
+    let msg = start_err.message.to_string();
+    assert!(
+        msg.contains(BLOCKER_NAME),
+        "error must contain holder's name '{BLOCKER_NAME}': {msg}"
+    );
+    assert!(
+        msg.contains(BLOCKER_SESSION),
+        "error must contain holder's session UUID '{BLOCKER_SESSION}': {msg}"
+    );
+    assert!(
+        msg.contains("locked"),
+        "error must mention 'locked': {msg}"
+    );
+
+    drop(temp);
+}
+
+// worker_status UUID surfacing is verified by code inspection + build:
+// factory_ops.rs emits "    session: {uuid}" for every active worker entry.
+// The format is tested indirectly via the lib unit test
+// `test_worker_status_format_includes_session_uuid` in factory_ops.rs.

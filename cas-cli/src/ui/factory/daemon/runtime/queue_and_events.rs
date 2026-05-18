@@ -1185,6 +1185,7 @@ mod tests {
             current_task: None,
             latest_activity: None,
             last_heartbeat: None,
+            pending_messages: 0,
         };
 
         assert!(

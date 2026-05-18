@@ -1,4 +1,4 @@
-use crate::harness_policy::is_worker_without_subagents_from_env;
+use crate::harness_policy::{is_supervisor_from_env, is_worker_without_subagents_from_env};
 use crate::mcp::tools::core::imports::*;
 
 impl CasCore {
@@ -395,14 +395,32 @@ impl CasCore {
 
     /// Reset a task to a clean Open state, clearing any lease + assignee.
     ///
-    /// ### Dead-session recovery verb (EPIC cas-9508 / cas-1a7c)
+    /// ### Dead-session recovery AND live-worker reassign verb (EPIC cas-9508 / cas-1a7c, cas-3ed5)
     ///
-    /// `reset` is the atomic "revive this task from a dead session" verb.
+    /// `reset` is the atomic "return this task to a clean Open state" verb.
     /// Unlike `release`, it does not require the caller to own the lease —
-    /// it force-releases any active lease on the task, clears the assignee,
-    /// transitions the status to `Open`, and records an audit note. Intended
-    /// for supervisor / operator use when a worker died mid-task and left
-    /// orphaned lease + InProgress rows behind.
+    /// it force-releases any active lease on the task (dead OR live),
+    /// clears the assignee, transitions the status to `Open`, and records
+    /// an audit note.
+    ///
+    /// Two legitimate use cases:
+    ///
+    /// 1. **Dead-session recovery** — a worker died mid-task and left an
+    ///    orphaned lease + InProgress row. `reset` unblocks the task so a
+    ///    new worker can pick it up.
+    ///
+    /// 2. **Supervisor reassign without worker cooperation** — the target
+    ///    task is claimed by a live worker, but the supervisor wants to
+    ///    reassign it without shutting the worker down. Call `reset` to
+    ///    drop the live lease, then `update assignee=<new-worker>` to
+    ///    route it to the new worker, then message the new worker. The
+    ///    prior worker's lease is released silently; alert the prior
+    ///    worker separately if needed.
+    ///
+    ///    Prefer `transfer to_agent=<new-worker> supervisor_override=true`
+    ///    when you want a single atomic step that also sets the assignee
+    ///    and attempts to pre-claim for the target — `reset` is the
+    ///    two-step fallback if `transfer` is unavailable.
     ///
     /// Safety: refuses to reset a `Closed` task (use `reopen` instead).
     pub async fn cas_task_reset(
@@ -509,7 +527,20 @@ impl CasCore {
         Ok(Self::success(output))
     }
 
-    /// Transfer a task to another agent
+    /// Transfer a task to another agent.
+    ///
+    /// ### Supervisor force-transfer (cas-3ed5)
+    ///
+    /// Normally the caller must own the task's active lease to transfer it.
+    /// When `supervisor_override=true` and the caller is a supervisor
+    /// (`CAS_AGENT_ROLE=supervisor`), the handler force-releases the current
+    /// lease (regardless of who holds it) and reassigns the task to the target
+    /// agent. An audit-log entry is appended to `task.notes` identifying the
+    /// supervisor session ID and the prior lease holder so the override is
+    /// always traceable.
+    ///
+    /// Non-supervisor callers that set `supervisor_override=true` receive an
+    /// explicit rejection; the flag is not silently ignored.
     pub async fn cas_task_transfer(
         &self,
         Parameters(req): Parameters<TaskTransferRequest>,
@@ -528,24 +559,66 @@ impl CasCore {
                 data: None,
             })?;
 
-        // Verify current agent owns the lease
+        let supervisor_override_requested = req.supervisor_override.unwrap_or(false);
+
+        // Verify current agent owns the lease — with supervisor force-transfer escape hatch.
         let lease = agent_store.get_lease(&req.task_id).map_err(|e| McpError {
             code: ErrorCode::INTERNAL_ERROR,
             message: Cow::from(format!("Failed to get lease: {e}")),
             data: None,
         })?;
 
-        let _lease = match lease {
-            Some(l) if l.agent_id == agent_id && l.status == LeaseStatus::Active => l,
+        // prior_lease_holder is Some(<agent_id>) when we force-released a live lease.
+        // Used below for the audit note.
+        let prior_lease_holder: Option<String> = match &lease {
+            Some(l) if l.agent_id == agent_id && l.status == LeaseStatus::Active => {
+                // Caller owns the lease — normal transfer path.
+                None
+            }
             Some(l) if l.agent_id != agent_id => {
-                return Err(McpError {
-                    code: ErrorCode::INVALID_PARAMS,
-                    message: Cow::from(format!(
-                        "Task {} is owned by {}, not {}",
-                        req.task_id, l.agent_id, agent_id
-                    )),
-                    data: None,
-                });
+                // Lease is held by a different agent.
+                // Resolve UUID → friendly name so the supervisor can identify
+                // the holding worker without cross-referencing worker_status.
+                let holder_display = agent_store
+                    .get(&l.agent_id)
+                    .map(|a| format!("{} ({})", a.name, l.agent_id))
+                    .unwrap_or_else(|_| l.agent_id.clone());
+                if supervisor_override_requested {
+                    if !is_supervisor_from_env() {
+                        return Err(McpError {
+                            code: ErrorCode::INVALID_PARAMS,
+                            message: Cow::from(
+                                "supervisor_override=true is only honored when the caller is a \
+                                 supervisor (CAS_AGENT_ROLE=supervisor). Non-supervisor callers \
+                                 cannot force-transfer a task owned by another agent.",
+                            ),
+                            data: None,
+                        });
+                    }
+                    // Supervisor force-transfer: release the live worker's lease.
+                    let holder = l.agent_id.clone();
+                    agent_store
+                        .release_lease_for_task(&req.task_id)
+                        .map_err(|e| McpError {
+                            code: ErrorCode::INTERNAL_ERROR,
+                            message: Cow::from(format!(
+                                "Supervisor force-transfer: failed to release live lease: {e}"
+                            )),
+                            data: None,
+                        })?;
+                    Some(holder)
+                } else {
+                    return Err(McpError {
+                        code: ErrorCode::INVALID_PARAMS,
+                        message: Cow::from(format!(
+                            "Task {} is owned by {}, not {}. \
+                             Supervisors can force-transfer with supervisor_override=true \
+                             (bypasses the lease check and logs an audit entry).",
+                            req.task_id, holder_display, agent_id
+                        )),
+                        data: None,
+                    });
+                }
             }
             _ => {
                 return Err(McpError {
@@ -574,7 +647,7 @@ impl CasCore {
             });
         }
 
-        // Add handoff note to task
+        // Add handoff note (plus supervisor-override audit entry when applicable) to task
         let mut task = task_store.get(&req.task_id).map_err(|e| McpError {
             code: ErrorCode::INVALID_PARAMS,
             message: Cow::from(format!("Task not found: {e}")),
@@ -582,16 +655,25 @@ impl CasCore {
         })?;
 
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M");
-        let handoff_note = if let Some(note) = &req.note {
+        let handoff_note = if let Some(prior_holder) = &prior_lease_holder {
+            // Supervisor force-transfer: include audit information.
+            let note_suffix = req
+                .note
+                .as_deref()
+                .map(|n| format!(": {n}"))
+                .unwrap_or_default();
             format!(
-                "[{}] Handoff from {} to {}: {}",
-                timestamp, agent_id, req.to_agent, note
+                "[{timestamp}] SUPERVISOR FORCE-TRANSFER by {agent_id}: \
+                 released live lease from '{prior_holder}', reassigned to '{}'{}",
+                req.to_agent, note_suffix
+            )
+        } else if let Some(note) = &req.note {
+            format!(
+                "[{timestamp}] Handoff from {agent_id} to {}: {note}",
+                req.to_agent
             )
         } else {
-            format!(
-                "[{}] Handoff from {} to {}",
-                timestamp, agent_id, req.to_agent
-            )
+            format!("[{timestamp}] Handoff from {agent_id} to {}", req.to_agent)
         };
 
         if task.notes.is_empty() {
@@ -599,6 +681,8 @@ impl CasCore {
         } else {
             task.notes = format!("{}\n\n{}", task.notes, handoff_note);
         }
+        // Update assignee to the target agent
+        task.assignee = Some(req.to_agent.clone());
         task.updated_at = chrono::Utc::now();
 
         task_store.update(&task).map_err(|e| McpError {
@@ -607,14 +691,17 @@ impl CasCore {
             data: None,
         })?;
 
-        // Release our lease
-        agent_store
-            .release_lease(&req.task_id, &agent_id)
-            .map_err(|e| McpError {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: Cow::from(format!("Failed to release lease: {e}")),
-                data: None,
-            })?;
+        // Release our lease (only needed for the normal transfer path; the
+        // supervisor force-transfer path already released the live lease above).
+        if prior_lease_holder.is_none() {
+            agent_store
+                .release_lease(&req.task_id, &agent_id)
+                .map_err(|e| McpError {
+                    code: ErrorCode::INTERNAL_ERROR,
+                    message: Cow::from(format!("Failed to release lease: {e}")),
+                    data: None,
+                })?;
+        }
 
         // Try to claim for target agent (best effort - they may need to claim themselves)
         let claim_result = agent_store.try_claim(
@@ -637,13 +724,20 @@ impl CasCore {
             ),
         };
 
+        let override_note = if prior_lease_holder.is_some() {
+            "\n⚠️ Supervisor force-transfer used — audit entry appended to task notes."
+        } else {
+            ""
+        };
+
         Ok(Self::success(format!(
-            "Transferred task {} from {} to {}\n{}\nNote: {}",
+            "Transferred task {} from {} to {}\n{}\nNote: {}{}",
             req.task_id,
             agent_id,
             req.to_agent,
             claim_msg,
-            req.note.as_deref().unwrap_or("(none)")
+            req.note.as_deref().unwrap_or("(none)"),
+            override_note
         )))
     }
 

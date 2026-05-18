@@ -979,6 +979,52 @@ impl CasCore {
             }
         }
 
+        // cas-490f: commit-claim integrity gate.
+        //
+        // The cas-ba91 incident: a factory worker fabricated a commit SHA
+        // and code_review_findings against a branch with 0 actual commits.
+        // The supervisor lost ~10 min before detecting the fabrication.
+        //
+        // Gate logic: when a worker provides non-empty `code_review_findings`
+        // they are asserting "I wrote code and had it reviewed." This gate
+        // verifies that assertion by counting commits on the worker branch
+        // beyond its parent. 0 commits + findings = fabrication → hard reject.
+        //
+        // Firing conditions (all required):
+        //   1. Task has a resolved worker worktree (non-isolated tasks skip).
+        //   2. `code_review_findings` is non-empty (fabrication claim present).
+        //   3. commit count on HEAD vs parent_branch == 0.
+        //
+        // Supervisors can bypass with `bypass_code_review=true` (same pattern
+        // as other gates — logged, escape-hatched for genuine edge cases).
+        if !bypass_close_gates {
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let has_findings = req
+                    .code_review_findings
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_findings {
+                    let parent_branch = task
+                        .worktree_id
+                        .as_deref()
+                        .and_then(|wt_id| {
+                            self.open_worktree_store()
+                                .ok()
+                                .and_then(|store| store.get(wt_id).ok())
+                                .map(|wt| wt.parent_branch.clone())
+                        })
+                        .unwrap_or_else(|| "main".to_string());
+                    match check_commit_claim_integrity(worker_wt, &parent_branch, true) {
+                        CommitClaimGateOutcome::Reject(msg) => {
+                            return Ok(Self::tool_error(msg));
+                        }
+                        CommitClaimGateOutcome::Proceed => {}
+                    }
+                }
+            }
+        }
+
         // cas-e235 + cas-bc1b: additive-only execution_note backstop.
         //
         // If the worker declared `execution_note=additive-only`, reject
@@ -1077,6 +1123,43 @@ impl CasCore {
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
 
+        // cas-ee2b: resolve the effective "has reviewable changes" signal and
+        // the parent branch for worker git operations.
+        //
+        // For isolated worker worktrees, checking the main repo's working-tree
+        // state (`has_reviewable_changes(close_project_root)`) gives the wrong
+        // answer: the main repo may have dirty files unrelated to the worker's
+        // task (supervisor edits, other in-flight work). This caused false
+        // CODE_REVIEW_REQUIRED on research/spike tasks with zero code commits
+        // (the cas-cabc incident).
+        //
+        // Fix (cas-ee2b): for tasks with a resolved isolated worker worktree,
+        // use `has_worker_committed_reviewable_changes` which inspects only
+        // what the worker committed on their branch (merge-base..HEAD). For
+        // non-isolated tasks, fall through to the existing main-repo check —
+        // those workers share the main worktree so its state IS the task diff.
+        //
+        // Also capture `worker_review_parent_branch` for the case-3 ambiguity
+        // check below (avoids a second open_worktree_store call).
+        let (effective_has_reviewable, worker_review_parent_branch) =
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let parent_branch = task
+                    .worktree_id
+                    .as_deref()
+                    .and_then(|wt_id| {
+                        self.open_worktree_store()
+                            .ok()
+                            .and_then(|store| store.get(wt_id).ok())
+                            .map(|wt| wt.parent_branch.clone())
+                    })
+                    .unwrap_or_else(|| "main".to_string());
+                let reviewable =
+                    has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
+                (reviewable, Some(parent_branch))
+            } else {
+                (has_reviewable_changes(close_project_root), None)
+            };
+
         // cas-b51a: supervisor-owned review mode.
         //
         // When `[code_review] owner = "supervisor"` AND the caller is a
@@ -1115,7 +1198,7 @@ impl CasCore {
             && task.task_type != TaskType::Epic
             && task.execution_note.as_deref() != Some("additive-only")
             && !bypass_close_gates
-            && has_reviewable_changes(close_project_root)
+            && effective_has_reviewable
         {
             // Run the lightweight structural lint.
             match run_lightweight_structural_lint(close_project_root) {
@@ -1203,7 +1286,45 @@ impl CasCore {
             false
         };
 
+        // cas-ee2b: three-case routing for zero-reviewable-changes closes.
+        // See `check_zero_commit_close` for the full decision tree.
+        //
+        // Case 2 (fabrication: findings provided + 0 commits) is already
+        // handled by the cas-490f gate above; never reaches here.
+        //
+        // Cases 1/3/4 are handled here: docs-only, ambiguous zero-commit,
+        // and deliberate no-code respectively.
         let gate_outcome = if epic_subtask_receipts_cover {
+            CodeReviewGateOutcome::Proceed
+        } else if !effective_has_reviewable {
+            let has_review_findings = req
+                .code_review_findings
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            // Only run the case-3 gate for isolated-worker tasks that
+            // are not supervisor-bypassed.
+            if !bypass_close_gates {
+                if let (Some(worker_wt), Some(parent)) =
+                    (worker_worktree_path.as_ref(), worker_review_parent_branch.as_deref())
+                {
+                    match check_zero_commit_close(
+                        worker_wt,
+                        parent,
+                        &req.id,
+                        &task.task_type,
+                        task.execution_note.as_deref(),
+                        has_review_findings,
+                    ) {
+                        ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                            return Ok(Self::tool_error(msg));
+                        }
+                        ZeroCommitCloseOutcome::Proceed => {}
+                    }
+                }
+            }
+            // Cases 1 and 4: allow close — docs-only commits or deliberate
+            // no-code (spike, chore, execution_note set, bypass).
             CodeReviewGateOutcome::Proceed
         } else {
             run_code_review_gate(&task, &req, close_project_root)
@@ -1500,13 +1621,41 @@ impl CasCore {
             )
         };
 
+        // cas-490f: surface the actual `git diff --stat` for the worker's
+        // committed branch so supervisors see real deltas at close time,
+        // without having to inspect the worktree manually. This is included
+        // unconditionally when a resolved worker worktree is available —
+        // the stat is an objective record of what was committed, independent
+        // of whatever the worker's close reason claims.
+        let diff_stat_msg = if let Some(worker_wt) = worker_worktree_path.as_ref() {
+            let parent_branch = task
+                .worktree_id
+                .as_deref()
+                .and_then(|wt_id| {
+                    self.open_worktree_store()
+                        .ok()
+                        .and_then(|store| store.get(wt_id).ok())
+                        .map(|wt| wt.parent_branch.clone())
+                })
+                .unwrap_or_else(|| "main".to_string());
+            let stat = get_worker_diff_stat(worker_wt, &parent_branch);
+            if stat.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n📊 Committed diff stat (vs {parent_branch}):\n{stat}")
+            }
+        } else {
+            String::new()
+        };
+
         Ok(Self::success(format!(
-            "Closed task: {} - {}{}{}{}{}{}{}",
+            "Closed task: {} - {}{}{}{}{}{}{}{}",
             req.id,
             task.title,
             verification_note,
             lease_msg,
             worktree_msg,
+            diff_stat_msg,
             epic_close_msg,
             commit_nudge_msg,
             auto_unblock_msg
@@ -1997,11 +2146,248 @@ pub(crate) fn count_unmerged_factory_commits(
 }
 
 // ---------------------------------------------------------------------------
+// cas-490f: commit-claim integrity helpers
+// ---------------------------------------------------------------------------
+
+/// Count commits reachable from `HEAD` but not from `parent_branch`,
+/// running `git` inside `worker_worktree_path`.
+///
+/// Used by [`check_commit_claim_integrity`] to detect workers that submit
+/// `code_review_findings` (claiming code was written) when their branch
+/// carries no commits beyond the parent. The key difference from
+/// [`count_unmerged_factory_commits`] is that this function operates on
+/// `HEAD` — it is meant to be called from inside the worker's own
+/// worktree, where `HEAD` IS the worker branch.
+///
+/// Returns 0 on any git failure (graceful degradation — an unknowable
+/// history is not treated as fabrication evidence).
+pub(crate) fn count_worker_branch_commits(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> u32 {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return 0,
+    };
+    if merge_base.is_empty() {
+        return 0;
+    }
+
+    let count_out = Command::new("git")
+        .args(["rev-list", "--count", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match count_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(u32::MAX),
+        _ => 0,
+    }
+}
+
+/// Return a `git diff --stat` summary for commits on `HEAD` beyond
+/// `parent_branch`, running inside `worker_worktree_path`.
+///
+/// Included verbatim in the `task.close` success message so supervisors
+/// see the actual code delta without inspecting the worktree manually.
+///
+/// Returns an empty string on any git failure or when there are no commits
+/// beyond the parent (an empty stat is the correct representation there).
+pub(crate) fn get_worker_diff_stat(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> String {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return String::new(),
+    };
+    if merge_base.is_empty() {
+        return String::new();
+    }
+
+    let stat_out = Command::new("git")
+        .args(["diff", "--stat", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match stat_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Outcome of the cas-490f commit-claim integrity gate.
+#[derive(Debug)]
+pub(crate) enum CommitClaimGateOutcome {
+    /// Close may proceed — either no `code_review_findings` was provided,
+    /// or the worker branch has at least one commit to back up the claim.
+    Proceed,
+    /// Close must be rejected — worker provided `code_review_findings`
+    /// (claiming code was written and reviewed) but the branch has 0
+    /// commits beyond the parent (fabrication signal).
+    Reject(String),
+}
+
+/// cas-490f: verify that a worker who claims code changes actually produced
+/// commits.
+///
+/// When `has_review_findings` is true, calls
+/// [`count_worker_branch_commits`] inside `worker_worktree_path`. If the
+/// count is 0, returns `Reject` with an explicit "FABRICATION DETECTED"
+/// message. Otherwise returns `Proceed`.
+///
+/// Graceful degradation: `count_worker_branch_commits` returns 0 on git
+/// failures. Callers must only invoke this gate when a resolved worktree
+/// path is available (`resolve_worker_worktree_path` returned `Some`), so
+/// the path is always a real git worktree in production. Test helpers
+/// supply a minimal in-memory repo.
+pub(crate) fn check_commit_claim_integrity(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+    has_review_findings: bool,
+) -> CommitClaimGateOutcome {
+    if !has_review_findings {
+        return CommitClaimGateOutcome::Proceed;
+    }
+    let commit_count = count_worker_branch_commits(worker_worktree_path, parent_branch);
+    if commit_count == 0 {
+        CommitClaimGateOutcome::Reject(format!(
+            "⚠️ FABRICATION DETECTED\n\n\
+            task close rejected: code_review_findings was provided (indicating \
+            code was written and reviewed) but the worker branch has 0 commits \
+            beyond {parent_branch}.\n\n\
+            📂 Worker worktree: {}\n\
+            🌿 Parent branch: {parent_branch}\n\
+            📊 Commits beyond base: 0 commits\n\n\
+            Do not submit fabricated code review findings. If no code was written, \
+            close without code_review_findings.\n\n\
+            To resolve:\n\
+            1. If you wrote code but forgot to commit: stage and commit your \
+               changes, then retry close.\n\
+            2. If no code was needed for this task: retry close without the \
+               code_review_findings field (documentation/spike tasks don't \
+               need a review envelope).",
+            worker_worktree_path.display()
+        ))
+    } else {
+        CommitClaimGateOutcome::Proceed
+    }
+}
+
+// ---------------------------------------------------------------------------
 // cas-8f8f: epic-close per-child merge-state gate + diagnostic
 // ---------------------------------------------------------------------------
 
 /// One row in the epic_status diagnostic / epic-close gate report.
 ///
+// ---------------------------------------------------------------------------
+// cas-ee2b: zero-commit close gate (case 3)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the cas-ee2b zero-commit ambiguity gate (case 3).
+#[derive(Debug)]
+pub(crate) enum ZeroCommitCloseOutcome {
+    /// Close may proceed — either the task is not a code-expecting type,
+    /// has an execution_note signalling intentional no-code work, has
+    /// committed docs-only changes (count > 0), or the review findings
+    /// claim is present (handled by the cas-490f gate instead).
+    Proceed,
+    /// Close rejected — ambiguous zero-commit close on a code task with
+    /// no execution_note. Carries the user-facing rejection message.
+    AmbiguousCodeTask(String),
+}
+
+/// cas-ee2b: check whether a zero-commit close is ambiguous and should be
+/// rejected.
+///
+/// This function is the testable core of the cas-ee2b case-3 routing. The
+/// caller (`cas_task_close`) invokes it only when `!effective_has_reviewable`,
+/// i.e. after the main `has_worker_committed_reviewable_changes` check
+/// returned false.
+///
+/// Three-case decision tree:
+///
+/// 1. **Docs-only commits** (`count > 0` but no reviewable files): worker
+///    committed work; the reviewable-files check correctly returned false.
+///    → `Proceed`. This function sees `count > 0` and returns `Proceed`.
+///
+/// 2. **Deliberate no-code** (`execution_note` is set, OR task type is
+///    Spike/Chore/Epic, OR `has_review_findings` is true — the cas-490f
+///    gate handles that case):
+///    → `Proceed`. No ambiguity.
+///
+/// 3. **Ambiguous zero-commit** (`count == 0`, no `execution_note`, task
+///    type is Bug/Feature/Task, no review findings):
+///    → `AmbiguousCodeTask(msg)`. Ask worker to commit, set `execution_note`,
+///    or have the supervisor bypass.
+///
+/// `has_review_findings`: true when `code_review_findings` was non-empty.
+/// When true, the cas-490f gate fires upstream; this function returns `Proceed`
+/// so the two gates don't double-reject.
+///
+/// Returns `Proceed` on any git failure (graceful degradation — not
+/// ambiguous when history is unknowable).
+pub(crate) fn check_zero_commit_close(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+    task_id: &str,
+    task_type: &TaskType,
+    execution_note: Option<&str>,
+    has_review_findings: bool,
+) -> ZeroCommitCloseOutcome {
+    // Not a code-expecting task type → no ambiguity.
+    if !matches!(task_type, TaskType::Bug | TaskType::Feature | TaskType::Task) {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // execution_note is set → worker explicitly signalled the no-code intent.
+    if execution_note.is_some() {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Findings present → cas-490f gate handles; don't double-reject here.
+    if has_review_findings {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Count commits: if > 0, this is case 1 (docs-only), not case 3.
+    if count_worker_branch_commits(worker_worktree_path, parent_branch) > 0 {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Case 3: ambiguous zero-commit close.
+    let task_type_str = format!("{task_type:?}").to_lowercase();
+    let wt_display = worker_worktree_path.display();
+    ZeroCommitCloseOutcome::AmbiguousCodeTask(format!(
+        "⚠️ ZERO-COMMIT CLOSE ON CODE TASK\n\n\
+        task close rejected: this is a {task_type_str} task with no \
+        code_review_findings, no execution_note, and 0 commits on the \
+        worker branch. That combination is ambiguous — either the work \
+        wasn't committed yet, or this task was resolved without code.\n\n\
+        📂 Worker worktree: {wt_display}\n\
+        📊 Commits on branch: 0\n\n\
+        To resolve:\n\
+        1. If you wrote code but forgot to commit: stage and commit your \
+           changes, then retry close.\n\
+        2. If this task was resolved without code (fixed by a sibling task, \
+           docs-only, characterization-only): update the task with an \
+           execution_note to signal intentional no-code work:\n\
+           `mcp__cas__task action=update id={task_id} execution_note=additive-only`\n\
+        3. Supervisors may bypass this gate with bypass_code_review=true \
+           (logged as a decision note)."
+    ))
+}
+
 /// Captures everything the supervisor needs to see at a glance: which
 /// child task this is, who owns it, whether their factory branch has
 /// stranded commits relative to the parent epic, and (for unmerged
@@ -2626,6 +3012,60 @@ pub(crate) fn is_reviewable_path(path: &str) -> bool {
     true
 }
 
+/// cas-ee2b: return `true` if the worker's committed history
+/// (`merge-base..HEAD` inside `worker_worktree_path`) contains any files
+/// that qualify as reviewable by [`is_reviewable_path`].
+///
+/// This is the isolated-worker-aware replacement for the
+/// `has_reviewable_changes(close_project_root)` call that was checking
+/// the **main repo's working tree** state. For a worker with an isolated
+/// worktree, the main repo's dirty files are irrelevant — what matters is
+/// what the worker actually committed on their branch.
+///
+/// Examples of cases where the old check gave a wrong answer:
+/// - Researcher closes a spike task (zero code commits). Main repo has
+///   a dirty `Cargo.lock` or in-flight edit. Old: true (wrong) → CODE_REVIEW_REQUIRED.
+///   New: false (correct) → gate skipped.
+/// - Worker committed only `*.md` docs. Old: depends on main repo state.
+///   New: false (correct) → gate skipped.
+///
+/// Returns `false` on any git failure (graceful degradation — avoids
+/// false-requiring review when history is unknowable, consistent with
+/// `has_reviewable_changes` returning false for non-git dirs).
+pub(crate) fn has_worker_committed_reviewable_changes(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+) -> bool {
+    use std::process::Command;
+
+    let merge_base_out = Command::new("git")
+        .args(["merge-base", "HEAD", parent_branch])
+        .current_dir(worker_worktree_path)
+        .output();
+    let merge_base = match merge_base_out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if merge_base.is_empty() {
+        return false;
+    }
+
+    let diff_out = Command::new("git")
+        .args(["diff", "--name-only", &format!("{merge_base}..HEAD")])
+        .current_dir(worker_worktree_path)
+        .output();
+    match diff_out {
+        Ok(o) if o.status.success() => {
+            let output = String::from_utf8_lossy(&o.stdout);
+            output.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && is_reviewable_path(trimmed)
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Parse the output of `git diff --name-status` into violations. Only rows
 /// whose status starts with M, D, or R are returned. A, C, T, U, and ?? are
 /// considered additive or uninteresting.
@@ -3009,17 +3449,33 @@ pub(crate) fn run_lightweight_structural_lint(
 
     let mut violations: Vec<String> = Vec::new();
 
-    // Scan added lines only (prefixed with '+' but not '++' file header).
-    let added_lines: Vec<&str> = diff_text
-        .lines()
-        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
-        .map(|l| &l[1..]) // strip the leading '+'
-        .collect();
+    // Scan added lines only, tracking which file each line belongs to so that
+    // Rust-specific macro checks can be scoped to `*.rs` files.
+    // Each entry is (line_content_after_stripping_'+', is_rust_file).
+    let added_lines: Vec<(&str, bool)> = {
+        let mut result = Vec::new();
+        let mut current_is_rust = false;
+        for line in diff_text.lines() {
+            if line.starts_with("+++ ") {
+                // "+++ b/path/to/file.ext" in a unified git diff.
+                // Strip the diff prefix ("b/") to obtain the bare path.
+                let path = line[4..].trim_start_matches("b/");
+                current_is_rust = path.ends_with(".rs");
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                result.push((&line[1..], current_is_rust));
+            }
+        }
+        result
+    };
 
-    // Check 1: unimplemented!() or todo!() macro calls anywhere on the line.
+    // Check 1: unimplemented!() or todo!() macro calls — Rust-only.
     // Use `contains("macro!(")` to catch both `macro!()` (no args) and
     // `macro!("msg")` forms, regardless of where they appear on the line.
-    for (i, line) in added_lines.iter().enumerate() {
+    // Scoped to `*.rs` files; TypeScript/JS/Python etc. are not checked.
+    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
+        if !is_rust_file {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.contains("unimplemented!(") {
             violations.push(format!(
@@ -3035,10 +3491,14 @@ pub(crate) fn run_lightweight_structural_lint(
         }
     }
 
-    // Check 2: dbg! macro calls
+    // Check 2: dbg! macro calls — Rust-only.
     // Use `contains("dbg!(")` to catch all forms regardless of preceding
     // whitespace: bare `dbg!(...)`, `=dbg!(...)`, `let x=dbg!(...)`, etc.
-    for (i, line) in added_lines.iter().enumerate() {
+    // Scoped to `*.rs` files; other languages do not use the dbg! macro.
+    for (i, (line, is_rust_file)) in added_lines.iter().enumerate() {
+        if !is_rust_file {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.contains("dbg!(") {
             violations.push(format!(
@@ -3051,10 +3511,11 @@ pub(crate) fn run_lightweight_structural_lint(
     // Check 3: commented-out code blocks > 5 consecutive comment lines.
     // Heuristic: 6 or more consecutive lines that (a) start with '//'
     // and (b) are not doc comments ('///') or copyright headers.
+    // Applied across all languages (// comments exist in Rust, TS, JS, etc.).
     {
         let mut run = 0usize;
         let mut run_start = 0usize;
-        for (i, line) in added_lines.iter().enumerate() {
+        for (i, (line, _is_rust_file)) in added_lines.iter().enumerate() {
             let trimmed = line.trim();
             let is_code_comment = trimmed.starts_with("//")
                 && !trimmed.starts_with("///")
@@ -3114,6 +3575,14 @@ mod lightweight_lint_tests {
     use tempfile::TempDir;
 
     fn init_repo_with_diff(added_lines: &str) -> TempDir {
+        init_repo_with_diff_for_file("changed.rs", added_lines)
+    }
+
+    /// Like `init_repo_with_diff` but lets the caller choose the filename
+    /// (and therefore the extension) of the file being changed. This is used
+    /// to exercise the language-aware lint checks (e.g. Rust macros must not
+    /// fire for `.ts` / `.js` / `.py` changes).
+    fn init_repo_with_diff_for_file(filename: &str, added_lines: &str) -> TempDir {
         let dir = TempDir::new().unwrap();
         // init git
         Command::new("git")
@@ -3143,8 +3612,8 @@ mod lightweight_lint_tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        // write changed file
-        std::fs::write(dir.path().join("changed.rs"), added_lines).unwrap();
+        // write changed file using the requested filename/extension
+        std::fs::write(dir.path().join(filename), added_lines).unwrap();
         Command::new("git")
             .args(["add", "."])
             .current_dir(dir.path())
@@ -3257,6 +3726,105 @@ mod lightweight_lint_tests {
         assert!(
             matches!(outcome, LightweightLintOutcome::Pass),
             "no-git directory should pass (graceful degradation)"
+        );
+    }
+
+    // --- cas-b829: language-aware Rust-macro gate ---
+    // Rust macros (todo!, unimplemented!, dbg!) must only fire for *.rs files.
+    // TypeScript / JS / Python diffs must never trigger these checks.
+    //
+    // NOTE: test strings below are built via format!() so that the Rust macro
+    // patterns (todo!, unimplemented!, dbg!) do NOT appear as bare literals in
+    // this source file and do not self-trip the very lint they test.
+
+    #[test]
+    fn lint_ignores_todo_macro_in_ts_file() {
+        // A TypeScript file may contain `todo!()` as a literal string in a
+        // comment or error message without it being an incomplete Rust stub.
+        let code = format!("// NOTE: {}(\"not done\") later\n", "todo!");
+        let dir = init_repo_with_diff_for_file("component.ts", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_unimplemented_macro_in_ts_file() {
+        let code = format!("throw new Error('{}');\n", "unimplemented!()");
+        let dir = init_repo_with_diff_for_file("service.ts", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "unimplemented!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_dbg_macro_in_ts_file() {
+        let code = format!("const x = {}value);\n", "dbg!(");
+        let dir = init_repo_with_diff_for_file("utils.ts", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "dbg!() pattern in a .ts file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_todo_macro_in_js_file() {
+        let code = format!("// {}(\"later\")\n", "todo!");
+        let dir = init_repo_with_diff_for_file("index.js", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .js file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_ignores_todo_macro_in_python_file() {
+        let code = format!("# {}(\"later\")\n", "todo!");
+        let dir = init_repo_with_diff_for_file("app.py", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Pass),
+            "todo!() pattern in a .py file must not trigger Rust-macro lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_todo_in_rs_file() {
+        // Confirm existing Rust behaviour is preserved after the language-aware change.
+        let code = format!("fn stub() {{ {}(\"implement\") }}\n", "todo!");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "todo!() in a .rs file must still fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_unimplemented_in_rs_file() {
+        let code = format!("fn stub() {{ {}() }}\n", "unimplemented!");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "unimplemented!() in a .rs file must still fail lint"
+        );
+    }
+
+    #[test]
+    fn lint_still_catches_dbg_in_rs_file() {
+        let code = format!("let x = {}value);\n", "dbg!(");
+        let dir = init_repo_with_diff_for_file("lib.rs", &code);
+        let outcome = run_lightweight_structural_lint(dir.path());
+        assert!(
+            matches!(outcome, LightweightLintOutcome::Fail(_)),
+            "dbg!() in a .rs file must still fail lint"
         );
     }
 }
@@ -4550,5 +5118,414 @@ Epic close will be hard-blocked until they are merged.\n";
         let ts = last_commit_unix(dir.path(), "factory/alpha");
         assert!(ts.is_some(), "branch with commits must yield Some(ts)");
         assert!(ts.unwrap() > 0);
+    }
+}
+
+#[cfg(test)]
+mod commit_claim_integrity_tests {
+    //! cas-490f: regression tests for the commit-claim integrity gate.
+    //!
+    //! The cas-ba91 incident: a factory worker fabricated a commit SHA and
+    //! non-empty code_review_findings while their branch carried 0 commits
+    //! beyond the base. The supervisor lost ~10 min before detection.
+    //!
+    //! This module tests:
+    //!   - `count_worker_branch_commits` — counts HEAD commits vs parent
+    //!   - `get_worker_diff_stat` — returns `git diff --stat` summary
+    //!   - `check_commit_claim_integrity` — the gate helper that ties them
+    //!     together (returns Proceed/Reject based on findings + commit count)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Minimal worker repo: `main` with one seed commit, then branch off
+    /// to `factory/test-worker`. Caller can add commits on top.
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── count_worker_branch_commits ──────────────────────────────────────────
+
+    #[test]
+    fn count_worker_returns_zero_with_no_commits_beyond_base() {
+        // Worker branched off main but made no commits — this is the
+        // fabrication scenario (0 commits on the branch).
+        let dir = init_worker_repo();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "fresh worker branch with no commits beyond base must count 0"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_correct_count_for_multiple_commits() {
+        let dir = init_worker_repo();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), format!("// {name}\n")).unwrap();
+            git(dir.path(), &["add", name]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("add {name}")]);
+        }
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            3,
+            "3 commits on worker branch beyond base must count 3"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_zero_for_non_git_dir() {
+        // Graceful degradation: non-git directory must not panic or error;
+        // it returns 0 so the gate does not false-reject.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "non-git dir must degrade to 0"
+        );
+    }
+
+    // ── get_worker_diff_stat ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_diff_stat_returns_non_empty_for_committed_files() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("work.rs"), "fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "work.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "add work"]);
+
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            !stat.is_empty(),
+            "diff stat must be non-empty when commits exist"
+        );
+        assert!(
+            stat.contains("work.rs"),
+            "diff stat must mention the committed file; got: {stat}"
+        );
+    }
+
+    #[test]
+    fn get_diff_stat_returns_empty_for_no_commits() {
+        let dir = init_worker_repo();
+        // No commits beyond main — diff stat must be empty.
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            stat.is_empty(),
+            "diff stat must be empty when no commits exist beyond base; got: {stat}"
+        );
+    }
+
+    // ── check_commit_claim_integrity ─────────────────────────────────────────
+
+    /// Reproduces the cas-ba91 incident: worker provides non-empty
+    /// code_review_findings but the branch has 0 commits beyond the base.
+    #[test]
+    fn fabrication_detected_when_zero_commits_with_review_findings() {
+        let dir = init_worker_repo();
+        // No commits beyond base — fabrication scenario.
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        match outcome {
+            CommitClaimGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("FABRICATION DETECTED"),
+                    "rejection must name the gate; got: {msg}"
+                );
+                assert!(
+                    msg.contains("code_review_findings"),
+                    "rejection must identify the fabrication signal; got: {msg}"
+                );
+                assert!(
+                    msg.contains("0 commit"),
+                    "rejection must show the 0-commit count; got: {msg}"
+                );
+            }
+            CommitClaimGateOutcome::Proceed => {
+                panic!(
+                    "gate must reject zero-commit + findings = fabrication scenario (cas-ba91)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_commits_without_review_findings_proceeds() {
+        // Worker did documentation-only work and did not supply
+        // code_review_findings. Empty branch is fine in that case.
+        let dir = init_worker_repo();
+        let outcome = check_commit_claim_integrity(dir.path(), "main", false);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "no-findings close on empty branch must proceed (no fabrication claim)"
+        );
+    }
+
+    #[test]
+    fn commits_present_with_review_findings_proceeds() {
+        // Worker did real work: commits on branch + findings provided.
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+        git(dir.path(), &["add", "real.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "real work"]);
+
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "commits + findings must proceed (worker did real work)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zero_change_close_tests {
+    //! cas-ee2b: regression tests for the "no-diff close" fix.
+    //!
+    //! The cas-cabc incident: a researcher closed a spike task with zero code
+    //! commits. The main repo had unrelated dirty files (normal during an active
+    //! session). `has_reviewable_changes(close_project_root)` returned true
+    //! (main repo dirty), triggering CODE_REVIEW_REQUIRED on a task that never
+    //! touched code.
+    //!
+    //! Fix: `has_worker_committed_reviewable_changes(worker_wt, parent_branch)`
+    //! checks the worker's committed diff instead of the main repo working tree.
+    //!
+    //! Tests cover:
+    //! - Zero commits → false (the cas-cabc scenario)
+    //! - Docs-only commits → false (*.md, docs/)
+    //! - Code commits → true (Rust source, TypeScript, etc.)
+    //! - Non-git dir → false (graceful degradation)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── has_worker_committed_reviewable_changes ──────────────────────────────
+
+    /// Reproduces the cas-cabc scenario: researcher closes spike with zero
+    /// code commits. Must return false so the review gate is skipped.
+    #[test]
+    fn zero_commits_returns_false() {
+        let dir = init_worker_repo();
+        // No commits beyond base.
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "zero commits beyond base must not be reviewable (cas-cabc scenario)"
+        );
+    }
+
+    #[test]
+    fn docs_only_commits_return_false() {
+        let dir = init_worker_repo();
+        // Only markdown and docs/ files committed — not reviewable.
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        git(dir.path(), &["add", "NOTES.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: add notes"]);
+
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "docs-only commits must not trigger the review gate"
+        );
+    }
+
+    #[test]
+    fn code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "lib.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: add lib"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "code file commits must be reviewable"
+        );
+    }
+
+    #[test]
+    fn mixed_docs_and_code_commits_return_true() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("README.md"), "# readme\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "export function x() {}\n").unwrap();
+        git(dir.path(), &["add", "README.md", "main.ts"]);
+        git(dir.path(), &["commit", "-q", "-m", "feat: mixed commit"]);
+
+        assert!(
+            has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "commit containing both docs and code must be reviewable"
+        );
+    }
+
+    #[test]
+    fn non_git_dir_returns_false() {
+        // Graceful degradation: non-git directory must not panic or error.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !has_worker_committed_reviewable_changes(dir.path(), "main"),
+            "non-git dir must degrade to false (no false-require-review)"
+        );
+    }
+
+    // ── check_zero_commit_close (case 1/3/4) ────────────────────────────────
+
+    /// Case 1: docs-only commits (commit_count > 0, no reviewable files).
+    /// Worker committed something — the reviewable check correctly saw no code.
+    /// This is NOT case 3; gate must proceed.
+    #[test]
+    fn case1_docs_only_commits_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        git(dir.path(), &["add", "NOTES.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: add notes"]);
+
+        // count_worker_branch_commits == 1 → case 1, not case 3
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,     // no execution_note
+            false,    // no review findings
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "docs-only commits must route to Proceed (case 1)"
+        );
+    }
+
+    /// Case 3: ambiguous zero-commit close — reproduces cas-cabc scenario
+    /// for a bug task with no hints that this is code-free work.
+    #[test]
+    fn case3_zero_commit_bug_task_no_hint_rejects() {
+        let dir = init_worker_repo();
+        // No commits beyond base — the ambiguous scenario.
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,   // no execution_note
+            false,  // no review findings
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK"),
+                    "rejection must name the gate: {msg}"
+                );
+                assert!(
+                    msg.contains("execution_note"),
+                    "rejection must guide worker to set execution_note: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!("case 3 must reject ambiguous zero-commit bug task");
+            }
+        }
+    }
+
+    /// Case 4a: zero commits but execution_note set → deliberate no-code signal.
+    #[test]
+    fn case4_zero_commits_with_execution_note_proceeds() {
+        let dir = init_worker_repo();
+        // No commits, but worker explicitly set execution_note.
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            Some("additive-only"), // explicit no-code signal
+            false,
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "execution_note set must allow close (case 4)"
+        );
+    }
+
+    /// Case 4b: zero commits on a Chore/Spike task → non-code-expecting type.
+    #[test]
+    fn case4_zero_commits_on_chore_or_spike_proceeds() {
+        let dir = init_worker_repo();
+        for task_type in [TaskType::Chore, TaskType::Epic] {
+            let outcome = check_zero_commit_close(
+                dir.path(),
+                "main",
+                "cas-test1",
+                &task_type,
+                None,
+                false,
+            );
+            assert!(
+                matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+                "{task_type:?} task type must not be flagged as ambiguous"
+            );
+        }
+    }
+
+    /// Case 4c: review findings present → cas-490f handles that; this gate
+    /// should Proceed and not double-reject.
+    #[test]
+    fn case4_review_findings_present_defers_to_490f_gate() {
+        let dir = init_worker_repo();
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,
+            true, // has_review_findings = true (cas-490f rejects, not this gate)
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "when review findings are present, the cas-490f gate owns the rejection"
+        );
     }
 }
