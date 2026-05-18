@@ -46,6 +46,23 @@ impl CasCore {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string);
 
+        // Reject the case where the epic and a blocker are the same task (cas-6009).
+        // A task cannot be blocked by its own parent epic — the ParentChild dep and
+        // a Blocks dep would share the same (from_id, to_id) pair, and `dep_remove`
+        // used to delete both silently when given just an ID with no dep_type.
+        if let Some(ref epic) = epic_id {
+            if blocked_by_ids.contains(epic) {
+                return Err(McpError {
+                    code: ErrorCode::INVALID_PARAMS,
+                    message: Cow::from(format!(
+                        "Task cannot be both a child of and blocked by the same task ({epic}). \
+                        Use `blocked_by` for peer tasks only."
+                    )),
+                    data: None,
+                });
+            }
+        }
+
         let execution_note = crate::mcp::tools::types::validate_execution_note(
             req.execution_note.as_deref(),
         )

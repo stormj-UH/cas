@@ -253,6 +253,23 @@ impl TaskStore for MockTaskStore {
         Ok(())
     }
 
+    fn remove_dependency_of_type(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        dep_type: DependencyType,
+    ) -> Result<bool> {
+        self.check_error()?;
+        let mut deps = self.dependencies.write().unwrap();
+        let len_before = deps.len();
+        deps.retain(|dependency| {
+            !(dependency.from_id == from_id
+                && dependency.to_id == to_id
+                && dependency.dep_type == dep_type)
+        });
+        Ok(deps.len() < len_before)
+    }
+
     fn get_dependencies(&self, task_id: &str) -> Result<Vec<Dependency>> {
         self.check_error()?;
         let deps = self.dependencies.read().unwrap();

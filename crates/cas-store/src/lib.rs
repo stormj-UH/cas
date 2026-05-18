@@ -396,6 +396,18 @@ pub trait TaskStore: Send + Sync {
     /// Remove a dependency
     fn remove_dependency(&self, from_id: &str, to_id: &str) -> Result<()>;
 
+    /// Remove a dependency of a specific type (cas-6009).
+    ///
+    /// Returns `Ok(true)` if a dep of that type was found and deleted.
+    /// Returns `Ok(false)` if no dep of that type exists between the two tasks.
+    /// Leaves any deps of OTHER types between the same pair untouched.
+    fn remove_dependency_of_type(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        dep_type: DependencyType,
+    ) -> Result<bool>;
+
     /// Get dependencies of a task (what it depends on)
     fn get_dependencies(&self, task_id: &str) -> Result<Vec<Dependency>>;
 

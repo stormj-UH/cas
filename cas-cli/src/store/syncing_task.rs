@@ -161,6 +161,15 @@ impl TaskStore for SyncingTaskStore {
         self.inner.remove_dependency(from_id, to_id)
     }
 
+    fn remove_dependency_of_type(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        dep_type: DependencyType,
+    ) -> Result<bool> {
+        self.inner.remove_dependency_of_type(from_id, to_id, dep_type)
+    }
+
     fn get_dependencies(&self, task_id: &str) -> Result<Vec<Dependency>> {
         self.inner.get_dependencies(task_id)
     }
