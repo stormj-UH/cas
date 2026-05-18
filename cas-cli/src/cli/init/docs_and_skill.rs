@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const CAS_SECTION_BEGIN: &str =
     "<!-- CAS:BEGIN - This section is managed by CAS. Do not edit manually. -->";
@@ -23,9 +23,67 @@ pub(crate) fn build_cas_section() -> String {
     format!("{CAS_SECTION_BEGIN}\n{CAS_DIRECTIVE_CONTENT}\n{CAS_SECTION_END}")
 }
 
+/// Returns true if any ancestor directory of `project_root` (from its parent
+/// up to and including `$HOME`) already contains a CLAUDE.md with the CAS
+/// managed block.
+///
+/// If `project_root` IS `$HOME`, returns false immediately — the root is
+/// always the canonical injection point, never a "descendant" of itself.
+///
+/// Paths are canonicalized before comparison to avoid symlink loops.
+fn ancestor_has_cas_block(project_root: &Path) -> bool {
+    // Resolve $HOME once; if unset or unresolvable, walk to filesystem root.
+    let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from).map(|h| {
+        h.canonicalize().unwrap_or(h)
+    });
+
+    // Canonicalize project_root to resolve any symlinks in the path.
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    // If project_root IS $HOME, it is the root anchor — always inject here.
+    if let Some(ref home) = home {
+        if canonical_root == *home {
+            return false;
+        }
+    }
+
+    let mut current = canonical_root.parent();
+    while let Some(dir) = current {
+        let claude_md = dir.join("CLAUDE.md");
+        if claude_md.exists() {
+            if let Ok(content) = std::fs::read_to_string(&claude_md) {
+                if content.contains(CAS_SECTION_BEGIN) {
+                    return true;
+                }
+            }
+        }
+
+        // Stop after checking $HOME — do not traverse above it.
+        if let Some(ref home) = home {
+            if dir == home.as_path() {
+                break;
+            }
+        }
+
+        current = dir.parent();
+    }
+
+    false
+}
+
 /// Update or create CLAUDE.md with CAS directive section
 /// Returns Ok(true) if file was modified, Ok(false) if no changes needed
 pub fn update_claude_md(project_root: &Path) -> anyhow::Result<bool> {
+    // Skip injection when an ancestor already carries the managed block.
+    // The shallowest ancestor (typically ~/CLAUDE.md) is the canonical copy;
+    // injecting into every descendent project multiplies context noise without value.
+    // Existing duplicate blocks at this level are left untouched (not deleted).
+    if ancestor_has_cas_block(project_root) {
+        return Ok(false);
+    }
+
     let claude_md_path = project_root.join("CLAUDE.md");
     let new_section = build_cas_section();
 
