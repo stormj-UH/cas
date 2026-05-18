@@ -534,6 +534,119 @@ async fn test_task_ready() {
     assert!(text.contains("Ready task") || text.contains("ready") || text.contains("Tasks"));
 }
 
+/// Regression test for cas-978e: `task action=ready epic=<id>` must return only ready tasks
+/// that are children of the specified EPIC; without `epic`, behavior is unchanged.
+#[tokio::test]
+async fn test_task_ready_epic_filter() {
+    let (_temp, service) = setup_cas();
+
+    // Create an epic.
+    let epic_result = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Test Epic".to_string(),
+            description: None,
+            priority: 1,
+            task_type: "epic".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("epic create should succeed");
+    let epic_id = extract_task_id(&extract_text(epic_result))
+        .expect("should have epic ID")
+        .to_string();
+
+    // Create 2 tasks under the epic.
+    for i in 0..2 {
+        service
+            .cas_task_create(Parameters(TaskCreateRequest {
+                title: format!("Epic subtask {i}"),
+                description: None,
+                priority: 2,
+                task_type: "task".to_string(),
+                labels: None,
+                notes: None,
+                blocked_by: None,
+                design: None,
+                acceptance_criteria: None,
+                external_ref: None,
+                assignee: None,
+                demo_statement: None,
+                execution_note: None,
+                epic: Some(epic_id.clone()),
+            }))
+            .await
+            .expect("subtask create should succeed");
+    }
+
+    // Create 1 task NOT under the epic.
+    service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Unrelated task".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("unrelated task create should succeed");
+
+    // With epic filter: only the 2 subtasks should appear, not the unrelated task.
+    let epic_filtered = service
+        .cas_task_ready(Parameters(TaskReadyBlockedRequest {
+            scope: "all".to_string(),
+            limit: Some(20),
+            sort: None,
+            sort_order: None,
+            epic: Some(epic_id.clone()),
+        }))
+        .await
+        .expect("task_ready with epic filter should succeed");
+    let filtered_text = extract_text(epic_filtered);
+    assert!(
+        filtered_text.contains("Epic subtask"),
+        "Epic-filtered ready list must include the epic subtasks: {filtered_text}"
+    );
+    assert!(
+        !filtered_text.contains("Unrelated task"),
+        "Epic-filtered ready list must not include tasks outside the epic: {filtered_text}"
+    );
+
+    // Without epic filter: all 3 tasks appear (2 subtasks + 1 unrelated).
+    let unfiltered = service
+        .cas_task_ready(Parameters(TaskReadyBlockedRequest {
+            scope: "all".to_string(),
+            limit: Some(20),
+            sort: None,
+            sort_order: None,
+            epic: None,
+        }))
+        .await
+        .expect("task_ready without epic filter should succeed");
+    let unfiltered_text = extract_text(unfiltered);
+    assert!(
+        unfiltered_text.contains("Epic subtask") && unfiltered_text.contains("Unrelated task"),
+        "Unfiltered ready list must include all ready tasks: {unfiltered_text}"
+    );
+}
+
 #[tokio::test]
 async fn test_task_delete() {
     let (_temp, service) = setup_cas();
