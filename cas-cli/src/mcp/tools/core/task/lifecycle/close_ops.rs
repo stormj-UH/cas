@@ -4552,3 +4552,181 @@ Epic close will be hard-blocked until they are merged.\n";
         assert!(ts.unwrap() > 0);
     }
 }
+
+#[cfg(test)]
+mod commit_claim_integrity_tests {
+    //! cas-490f: regression tests for the commit-claim integrity gate.
+    //!
+    //! The cas-ba91 incident: a factory worker fabricated a commit SHA and
+    //! non-empty code_review_findings while their branch carried 0 commits
+    //! beyond the base. The supervisor lost ~10 min before detection.
+    //!
+    //! This module tests:
+    //!   - `count_worker_branch_commits` — counts HEAD commits vs parent
+    //!   - `get_worker_diff_stat` — returns `git diff --stat` summary
+    //!   - `check_commit_claim_integrity` — the gate helper that ties them
+    //!     together (returns Proceed/Reject based on findings + commit count)
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Minimal worker repo: `main` with one seed commit, then branch off
+    /// to `factory/test-worker`. Caller can add commits on top.
+    fn init_worker_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("seed.txt"), "seed\n").unwrap();
+        git(p, &["add", "seed.txt"]);
+        git(p, &["commit", "-q", "-m", "seed"]);
+        git(p, &["checkout", "-q", "-b", "factory/test-worker"]);
+        dir
+    }
+
+    // ── count_worker_branch_commits ──────────────────────────────────────────
+
+    #[test]
+    fn count_worker_returns_zero_with_no_commits_beyond_base() {
+        // Worker branched off main but made no commits — this is the
+        // fabrication scenario (0 commits on the branch).
+        let dir = init_worker_repo();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "fresh worker branch with no commits beyond base must count 0"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_correct_count_for_multiple_commits() {
+        let dir = init_worker_repo();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), format!("// {name}\n")).unwrap();
+            git(dir.path(), &["add", name]);
+            git(dir.path(), &["commit", "-q", "-m", &format!("add {name}")]);
+        }
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            3,
+            "3 commits on worker branch beyond base must count 3"
+        );
+    }
+
+    #[test]
+    fn count_worker_returns_zero_for_non_git_dir() {
+        // Graceful degradation: non-git directory must not panic or error;
+        // it returns 0 so the gate does not false-reject.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            count_worker_branch_commits(dir.path(), "main"),
+            0,
+            "non-git dir must degrade to 0"
+        );
+    }
+
+    // ── get_worker_diff_stat ─────────────────────────────────────────────────
+
+    #[test]
+    fn get_diff_stat_returns_non_empty_for_committed_files() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("work.rs"), "fn foo() {}\n").unwrap();
+        git(dir.path(), &["add", "work.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "add work"]);
+
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            !stat.is_empty(),
+            "diff stat must be non-empty when commits exist"
+        );
+        assert!(
+            stat.contains("work.rs"),
+            "diff stat must mention the committed file; got: {stat}"
+        );
+    }
+
+    #[test]
+    fn get_diff_stat_returns_empty_for_no_commits() {
+        let dir = init_worker_repo();
+        // No commits beyond main — diff stat must be empty.
+        let stat = get_worker_diff_stat(dir.path(), "main");
+        assert!(
+            stat.is_empty(),
+            "diff stat must be empty when no commits exist beyond base; got: {stat}"
+        );
+    }
+
+    // ── check_commit_claim_integrity ─────────────────────────────────────────
+
+    /// Reproduces the cas-ba91 incident: worker provides non-empty
+    /// code_review_findings but the branch has 0 commits beyond the base.
+    #[test]
+    fn fabrication_detected_when_zero_commits_with_review_findings() {
+        let dir = init_worker_repo();
+        // No commits beyond base — fabrication scenario.
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        match outcome {
+            CommitClaimGateOutcome::Reject(msg) => {
+                assert!(
+                    msg.contains("FABRICATION DETECTED"),
+                    "rejection must name the gate; got: {msg}"
+                );
+                assert!(
+                    msg.contains("code_review_findings"),
+                    "rejection must identify the fabrication signal; got: {msg}"
+                );
+                assert!(
+                    msg.contains("0 commit"),
+                    "rejection must show the 0-commit count; got: {msg}"
+                );
+            }
+            CommitClaimGateOutcome::Proceed => {
+                panic!(
+                    "gate must reject zero-commit + findings = fabrication scenario (cas-ba91)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_commits_without_review_findings_proceeds() {
+        // Worker did documentation-only work and did not supply
+        // code_review_findings. Empty branch is fine in that case.
+        let dir = init_worker_repo();
+        let outcome = check_commit_claim_integrity(dir.path(), "main", false);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "no-findings close on empty branch must proceed (no fabrication claim)"
+        );
+    }
+
+    #[test]
+    fn commits_present_with_review_findings_proceeds() {
+        // Worker did real work: commits on branch + findings provided.
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("real.rs"), "fn real() {}\n").unwrap();
+        git(dir.path(), &["add", "real.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "real work"]);
+
+        let outcome = check_commit_claim_integrity(dir.path(), "main", true);
+        assert!(
+            matches!(outcome, CommitClaimGateOutcome::Proceed),
+            "commits + findings must proceed (worker did real work)"
+        );
+    }
+}
