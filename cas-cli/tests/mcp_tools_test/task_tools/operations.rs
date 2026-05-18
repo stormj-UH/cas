@@ -1,5 +1,7 @@
 use crate::support::*;
 use cas::mcp::tools::*;
+use cas::mcp::CasCore;
+use cas::store::open_agent_store;
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 
@@ -1722,4 +1724,237 @@ async fn test_task_mine_matches_case_insensitive_and_trimmed() {
         text.contains(&id),
         "mine should tolerate case + whitespace drift in assignee: {text}"
     );
+}
+
+// =============================================================================
+// cas-3ed5: supervisor force-transfer (bypass live-worker lease without shutdown)
+// =============================================================================
+
+/// RAII guard that sets CAS_AGENT_ROLE=supervisor for the duration of a test.
+struct ScopedSupervisorRole;
+
+impl ScopedSupervisorRole {
+    fn enter() -> Self {
+        // SAFETY: held under env_test_lock() in all callers.
+        unsafe { std::env::set_var("CAS_AGENT_ROLE", "supervisor") }
+        Self
+    }
+}
+
+impl Drop for ScopedSupervisorRole {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("CAS_AGENT_ROLE") }
+    }
+}
+
+fn make_task_create_req(title: &str) -> TaskCreateRequest {
+    TaskCreateRequest {
+        title: title.to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    }
+}
+
+/// Happy path: supervisor force-transfers a task claimed by a live worker.
+///
+/// AC: Supervisor has a documented, supported path to reassign a
+/// live-worker-claimed task without shutting the worker down.
+/// AC: Audit-log entry surfaces the override action with the supervisor session ID.
+#[tokio::test]
+async fn test_supervisor_force_transfer_live_worker_task() {
+    // setup_cas() creates a "test-agent" (the worker that claims the task).
+    let (temp, worker_core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // Register a "target worker" the task will be transferred to.
+    let mut target_worker =
+        cas::types::Agent::new("target-worker-id".to_string(), "target-worker".to_string());
+    target_worker.role = cas::types::AgentRole::Worker;
+    target_worker.heartbeat(); // mark alive
+    agent_store
+        .register(&target_worker)
+        .expect("register target worker");
+
+    // Register the supervisor agent that will force-transfer.
+    let supervisor_id = "supervisor-session-id".to_string();
+    let mut supervisor_agent =
+        cas::types::Agent::new(supervisor_id.clone(), "test-supervisor".to_string());
+    supervisor_agent.role = cas::types::AgentRole::Supervisor;
+    supervisor_agent.heartbeat();
+    agent_store
+        .register(&supervisor_agent)
+        .expect("register supervisor");
+
+    // Create a task under the worker CasCore.
+    let create_result = worker_core
+        .cas_task_create(Parameters(make_task_create_req(
+            "Task held by live worker — supervisor force-transfer test",
+        )))
+        .await
+        .expect("task create should succeed");
+    let task_id = extract_task_id(&extract_text(create_result))
+        .expect("should have task id")
+        .to_string();
+
+    // Simulate a live worker claiming the task directly via agent_store
+    // (bypassing the assignee check). This represents the state where a worker
+    // has started and claimed its task — the scenario the supervisor must bypass.
+    let task_store = cas::store::open_task_store(&cas_dir).expect("open task store");
+    let mut task = task_store.get(&task_id).expect("task should exist");
+    task.status = cas::types::TaskStatus::InProgress;
+    task.assignee = Some("test-session-placeholder".to_string()); // worker "holds" it
+    task_store.update(&task).expect("update task to InProgress");
+
+    // The "test-agent" (worker_core) has a session id of the form "test-session-<pid>".
+    // Use the actual id from the core setup to simulate the lease.
+    let worker_session_id = format!("test-session-{}", std::process::id());
+    agent_store
+        .try_claim(&task_id, &worker_session_id, 600, Some("worker lease"))
+        .expect("worker agent store claim should succeed");
+
+    // Confirm the worker owns the lease.
+    let task_before = task_store.get(&task_id).expect("task should exist");
+    assert_eq!(
+        task_before.status,
+        cas::types::TaskStatus::InProgress,
+        "task should be InProgress after worker claim"
+    );
+
+    // Build a second CasCore acting as the supervisor.
+    let supervisor_core = CasCore::with_daemon(cas_dir.clone(), None, None);
+    supervisor_core.set_agent_id_for_testing(supervisor_id.clone());
+
+    // Set the supervisor role env var.
+    let _role_guard = ScopedSupervisorRole::enter();
+
+    // Supervisor force-transfers the task to the target worker.
+    let transfer_req = TaskTransferRequest {
+        task_id: task_id.clone(),
+        to_agent: "target-worker-id".to_string(),
+        note: Some("Supervisor reassign — rebalancing workload".to_string()),
+        supervisor_override: Some(true),
+    };
+    let result = supervisor_core
+        .cas_task_transfer(Parameters(transfer_req))
+        .await
+        .expect("supervisor force-transfer should succeed");
+
+    let text = extract_text(result);
+
+    // Response must confirm transfer and note the override was used.
+    assert!(
+        text.contains("Transferred task"),
+        "response should confirm transfer: {text}"
+    );
+    assert!(
+        text.contains("SUPERVISOR FORCE-TRANSFER") || text.contains("force-transfer"),
+        "response should mention the override: {text}"
+    );
+
+    // Task notes must contain the audit entry.
+    let task_after = task_store.get(&task_id).expect("task should exist after transfer");
+    assert!(
+        task_after.notes.contains("SUPERVISOR FORCE-TRANSFER"),
+        "audit entry must be appended to task notes: {}",
+        task_after.notes
+    );
+    assert!(
+        task_after.notes.contains(&supervisor_id),
+        "audit entry must include supervisor session ID: {}",
+        task_after.notes
+    );
+    assert!(
+        task_after.notes.contains("Supervisor reassign"),
+        "handoff note must be preserved: {}",
+        task_after.notes
+    );
+
+    // Task assignee must be updated to the target worker.
+    assert_eq!(
+        task_after.assignee.as_deref(),
+        Some("target-worker-id"),
+        "task assignee must be updated to target worker"
+    );
+}
+
+/// Negative: non-supervisor callers cannot use supervisor_override=true.
+///
+/// AC: The override is gated — non-supervisors get an explicit rejection.
+#[tokio::test]
+async fn test_non_supervisor_cannot_force_transfer() {
+    let (temp, worker_core) = setup_cas();
+    let _env_lock = env_test_lock();
+    let cas_dir = temp.path().join(".cas");
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+
+    // Register a second live agent holding a conflicting lease.
+    let mut other_worker =
+        cas::types::Agent::new("other-worker-id".to_string(), "other-worker".to_string());
+    other_worker.role = cas::types::AgentRole::Worker;
+    other_worker.heartbeat();
+    agent_store
+        .register(&other_worker)
+        .expect("register other worker");
+
+    // Create a task and have the "other worker" claim it directly via the store.
+    let create_result = worker_core
+        .cas_task_create(Parameters(make_task_create_req(
+            "Task for non-supervisor override rejection test",
+        )))
+        .await
+        .expect("task create should succeed");
+    let task_id = extract_task_id(&extract_text(create_result))
+        .expect("should have task id")
+        .to_string();
+
+    agent_store
+        .try_claim(&task_id, "other-worker-id", 600, Some("other worker holds lease"))
+        .expect("other worker claim should succeed");
+
+    // Register a target agent for the transfer destination.
+    let mut target =
+        cas::types::Agent::new("target-agent-id".to_string(), "target-agent".to_string());
+    target.role = cas::types::AgentRole::Worker;
+    target.heartbeat();
+    agent_store.register(&target).expect("register target");
+
+    // Caller is a plain worker (no supervisor role) — must be rejected.
+    // Do NOT set CAS_AGENT_ROLE=supervisor.
+    let transfer_req = TaskTransferRequest {
+        task_id: task_id.clone(),
+        to_agent: "target-agent-id".to_string(),
+        note: None,
+        supervisor_override: Some(true),
+    };
+    let result = worker_core.cas_task_transfer(Parameters(transfer_req)).await;
+
+    // Must return an error (McpError) with a clear rejection message.
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("supervisor") || msg.contains("CAS_AGENT_ROLE"),
+                "rejection message should explain the supervisor requirement: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            panic!(
+                "expected rejection for non-supervisor override, but got success: {text}"
+            );
+        }
+    }
 }
