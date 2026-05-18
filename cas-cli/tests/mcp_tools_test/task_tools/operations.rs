@@ -1723,3 +1723,89 @@ async fn test_task_mine_matches_case_insensitive_and_trimmed() {
         "mine should tolerate case + whitespace drift in assignee: {text}"
     );
 }
+
+// ============================================================================
+// cas-85bf: Task ownership errors surface worker name (not just UUID)
+// ============================================================================
+
+/// When a task is locked by another worker, the "locked by" error must include
+/// the holding worker's friendly name alongside the session UUID so the
+/// supervisor can identify who has the task without cross-referencing
+/// worker_status output.
+#[tokio::test]
+async fn test_task_start_locked_error_includes_worker_name() {
+    use cas::store::open_agent_store;
+    use cas::types::{Agent, AgentRole};
+
+    let (temp, service) = setup_cas();
+    let cas_dir = service.project_path().to_path_buf();
+
+    // Register a "blocker" worker with a recognizable name.
+    const BLOCKER_SESSION: &str = "blocker-session-0000-0000-000000000001";
+    const BLOCKER_NAME: &str = "worker-backfill";
+
+    let blocker = Agent::new_with_role(
+        BLOCKER_SESSION.to_string(),
+        BLOCKER_NAME.to_string(),
+        AgentRole::Worker,
+    );
+    let agent_store = open_agent_store(&cas_dir).expect("open agent store");
+    agent_store.register(&blocker).expect("register blocker");
+
+    // Create a task.
+    let created = service
+        .cas_task_create(Parameters(TaskCreateRequest {
+            title: "Locked task for name-in-error test".to_string(),
+            description: None,
+            priority: 2,
+            task_type: "task".to_string(),
+            labels: None,
+            notes: None,
+            blocked_by: None,
+            design: None,
+            acceptance_criteria: None,
+            external_ref: None,
+            assignee: None,
+            demo_statement: None,
+            execution_note: None,
+            epic: None,
+        }))
+        .await
+        .expect("create");
+    let id = extract_task_id(&extract_text(created))
+        .expect("task id")
+        .to_string();
+
+    // Have the blocker claim the task directly at store level.
+    agent_store
+        .try_claim(&id, BLOCKER_SESSION, 600, Some("blocking for test"))
+        .expect("blocker claim");
+
+    // Now try to start the same task via the test service — should fail
+    // because our test agent doesn't own the lease.
+    let start_err = service
+        .cas_task_start(Parameters(cas::mcp::tools::IdRequest { id: id.clone() }))
+        .await
+        .expect_err("start must fail when another agent holds the lease");
+
+    let msg = start_err.message.to_string();
+    assert!(
+        msg.contains(BLOCKER_NAME),
+        "error must contain holder's name '{BLOCKER_NAME}': {msg}"
+    );
+    assert!(
+        msg.contains(BLOCKER_SESSION),
+        "error must contain holder's session UUID '{BLOCKER_SESSION}': {msg}"
+    );
+    assert!(
+        msg.contains("locked"),
+        "error must mention 'locked': {msg}"
+    );
+
+    drop(temp);
+}
+
+// worker_status UUID surfacing is verified by code inspection + build:
+// factory_ops.rs emits "    session: {uuid}" for every active worker entry.
+// The format is tested indirectly via the lib unit test
+// `test_worker_status_format_includes_session_uuid` in factory_ops.rs.

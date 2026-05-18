@@ -538,11 +538,17 @@ impl CasCore {
         let _lease = match lease {
             Some(l) if l.agent_id == agent_id && l.status == LeaseStatus::Active => l,
             Some(l) if l.agent_id != agent_id => {
+                // Resolve UUID → friendly name so the supervisor can identify
+                // the holding worker without cross-referencing worker_status.
+                let holder_display = agent_store
+                    .get(&l.agent_id)
+                    .map(|a| format!("{} ({})", a.name, l.agent_id))
+                    .unwrap_or_else(|_| l.agent_id.clone());
                 return Err(McpError {
                     code: ErrorCode::INVALID_PARAMS,
                     message: Cow::from(format!(
                         "Task {} is owned by {}, not {}",
-                        req.task_id, l.agent_id, agent_id
+                        req.task_id, holder_display, agent_id
                     )),
                     data: None,
                 });

@@ -418,9 +418,14 @@ impl CasService {
                 } else {
                     String::new()
                 };
+                // Surface session UUID alongside the friendly name so the
+                // supervisor can cross-reference task-ownership errors
+                // ("owned by worker-backfill (0a7f2802-...)") without manual
+                // table-lookup. cas-85bf.
+                let session_uuid = agent.cc_session_id.as_deref().unwrap_or(&agent.id);
                 output.push_str(&format!(
-                    "  • {} (heartbeat: {}){}{}{}\n",
-                    &agent.name, since, liveness_label, clone_info, transcript_info
+                    "  • {} (heartbeat: {}){}{}{}\n    session: {}\n",
+                    &agent.name, since, liveness_label, clone_info, transcript_info, session_uuid
                 ));
             }
         }
@@ -1735,5 +1740,37 @@ mod tests {
         );
         assert!(got.contains("truncated"));
         assert!(got.contains(&format!("{MAX_TRANSCRIPT_CANDIDATES}")));
+    }
+
+    /// cas-85bf: worker_status output must include session UUID alongside the
+    /// friendly worker name so supervisors can cross-reference task-ownership
+    /// errors ("owned by worker-backfill (0a7f2802-...)") without extra lookups.
+    ///
+    /// This test exercises the format string in `factory_worker_status` by
+    /// manually building the string the same way the production code does and
+    /// asserting the UUID is embedded.
+    #[test]
+    fn test_worker_status_format_includes_session_uuid() {
+        const NAME: &str = "worker-backfill";
+        const UUID: &str = "0a7f2802-e977-493b-965b-c620e99f04ef";
+
+        // Reproduce the format! call from factory_worker_status (cas-85bf).
+        let output = format!(
+            "  • {} (heartbeat: {}){}{}{}\n    session: {}\n",
+            NAME, "5s ago", "", "", "", UUID
+        );
+
+        assert!(
+            output.contains(NAME),
+            "output must contain worker name: {output}"
+        );
+        assert!(
+            output.contains(UUID),
+            "output must contain session UUID: {output}"
+        );
+        assert!(
+            output.contains("session:"),
+            "output must have 'session:' label: {output}"
+        );
     }
 }

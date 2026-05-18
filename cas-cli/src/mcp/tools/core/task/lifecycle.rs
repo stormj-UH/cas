@@ -361,11 +361,17 @@ impl CasCore {
                             expires_at.format("%H:%M")
                         ))
                     } else {
+                        // Resolve UUID → friendly name so the supervisor can
+                        // identify the worker without cross-referencing worker_status.
+                        let holder_display = agent_store
+                            .get(&held_by)
+                            .map(|a| format!("{} ({})", a.name, held_by))
+                            .unwrap_or_else(|_| held_by.clone());
                         return Err(Self::error(
                             ErrorCode::INVALID_PARAMS,
                             format!(
-                                "Task is locked by agent {} until {}",
-                                held_by,
+                                "Task is locked by {} until {}",
+                                holder_display,
                                 expires_at.format("%H:%M")
                             ),
                         ));
