@@ -18,10 +18,11 @@ use crate::types::{
 ///
 /// Returns `true` if the entity should be accepted, `false` if it should be skipped.
 ///
-/// An entity is accepted when:
-/// - It has no `project_canonical_id` or `project_id` field (legacy / server not yet scoping)
-/// - Its project field is `null`
-/// - Its project field matches `current_project_id`
+/// An entity is accepted only when its `project_canonical_id` or `project_id` field
+/// is a string that exactly matches `current_project_id`. All other cases — missing
+/// field, null field, wrong project, or unexpected type — are rejected. The legacy
+/// "no field = accept" and "null = accept" paths have been removed now that the cloud
+/// always echoes `project_id` in every pull-response row (cas-6479).
 fn entity_matches_project(
     raw: &serde_json::Value,
     current_project_id: &str,
@@ -32,17 +33,32 @@ fn entity_matches_project(
         .get("project_canonical_id")
         .or_else(|| raw.get("project_id"));
 
+    let entity_id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+
     match project_field {
-        None => true, // No field present — legacy entity, accept it
-        Some(serde_json::Value::Null) => true, // Explicitly null — not scoped, accept it
+        None => {
+            // Missing field — cloud now always includes project_id; treat as unscoped/foreign.
+            eprintln!(
+                "[CAS sync] WARNING: skipping {entity_kind} '{entity_id}' — no project_id field \
+                 (expected '{current_project_id}')"
+            );
+            false
+        }
+        Some(serde_json::Value::Null) => {
+            // Explicitly null — no longer accepted; cloud must scope all entities.
+            eprintln!(
+                "[CAS sync] WARNING: skipping {entity_kind} '{entity_id}' — null project_id \
+                 (expected '{current_project_id}')"
+            );
+            false
+        }
         Some(serde_json::Value::String(s)) => {
             if s == current_project_id {
                 true
             } else {
-                let entity_id = raw
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
                 eprintln!(
                     "[CAS sync] WARNING: skipping {entity_kind} '{entity_id}' from foreign \
                      project '{s}' (expected '{current_project_id}')"
@@ -50,7 +66,14 @@ fn entity_matches_project(
                 false
             }
         }
-        Some(_) => true, // Unexpected type — don't block on it, accept
+        Some(_) => {
+            // Unexpected type — reject; unexpected field shapes shouldn't be silently accepted.
+            eprintln!(
+                "[CAS sync] WARNING: skipping {entity_kind} '{entity_id}' — unexpected \
+                 project_id type (expected string '{current_project_id}')"
+            );
+            false
+        }
     }
 }
 
@@ -901,16 +924,16 @@ mod tests {
 
     #[test]
     fn test_entity_matches_project_no_field() {
-        // No project field — legacy entity, always accepted
+        // No project field — rejected now that cloud always echoes project_id (cas-6479)
         let entity = json!({ "id": "e-001", "content": "hello" });
-        assert!(entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+        assert!(!entity_matches_project(&entity, "github.com/owner/repo", "entry"));
     }
 
     #[test]
     fn test_entity_matches_project_null_field() {
-        // Null project_canonical_id — not scoped to any project, accepted
+        // Null project_canonical_id — rejected; cloud must scope all entities (cas-6479)
         let entity = json!({ "id": "e-001", "project_canonical_id": null });
-        assert!(entity_matches_project(&entity, "github.com/owner/repo", "entry"));
+        assert!(!entity_matches_project(&entity, "github.com/owner/repo", "entry"));
     }
 
     #[test]
@@ -942,9 +965,9 @@ mod tests {
 
     #[test]
     fn test_entity_matches_project_null_project_id() {
-        // Null project_id — accepted (not scoped)
+        // Null project_id — rejected; cloud must scope all entities (cas-6479)
         let entity = json!({ "id": "t-abc", "project_id": null });
-        assert!(entity_matches_project(&entity, "github.com/owner/repo", "task"));
+        assert!(!entity_matches_project(&entity, "github.com/owner/repo", "task"));
     }
 
     #[test]
