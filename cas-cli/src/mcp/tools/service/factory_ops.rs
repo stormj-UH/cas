@@ -314,11 +314,39 @@ impl CasService {
         // constants (cas-8240) for the two-band model that separates the
         // prune + `[stale]` indicator (30s) from the hard `[DEAD]` + transcript
         // surface (75s).
+        //
+        // cas-1ec7: cross-correlate with the worker_activity event log before
+        // pruning. A worker whose heartbeat lapsed during a long CPU-bound
+        // operation (cargo build/test stretches) but who has a recent
+        // WorkerFileEdited or WorkerGitCommit event within the same window is
+        // NOT stale — it's just busy. Suppress the prune for these workers and
+        // surface a "[heartbeat stale, active I/O]" annotation so the
+        // supervisor can see the dual-signal without misdiagnosing a dead worker.
         let worker_stale_threshold_secs: i64 = WORKER_STALE_SECS;
+
+        // Query recent I/O events once, reuse per agent in the prune loop.
+        let recent_io_cutoff =
+            chrono::Utc::now() - chrono::Duration::seconds(worker_stale_threshold_secs);
+        let recent_io_events: Vec<cas_types::Event> = {
+            use cas_store::{EventStore, SqliteEventStore};
+            SqliteEventStore::open(&self.inner.cas_root)
+                .and_then(|es| es.list_since(recent_io_cutoff, 50))
+                .unwrap_or_default()
+        };
+
+        // Agents suppressed from pruning due to recent I/O activity. Used in
+        // the render loop to show the dual-signal annotation.
+        let mut active_io_suppressed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut stale_pruned = 0usize;
         if let Ok(stale_agents) = store.list_stale(worker_stale_threshold_secs) {
             for agent in stale_agents {
                 if agent.role == AgentRole::Supervisor || agent.role == AgentRole::Director {
+                    continue;
+                }
+                // cas-1ec7: suppress stale-prune when observable I/O is recent.
+                if has_recent_worker_io_activity(&recent_io_events, &agent.id) {
+                    active_io_suppressed.insert(agent.id.clone());
                     continue;
                 }
                 if store.mark_stale(&agent.id).is_ok() {
@@ -382,7 +410,17 @@ impl CasService {
                 let elapsed = (chrono::Utc::now() - agent.last_heartbeat).num_seconds();
                 let since = format!("{elapsed}s ago");
                 // cas-8240 two-band model — see `liveness_label_for`.
-                let liveness_label = liveness_label_for(elapsed);
+                //
+                // cas-1ec7: prefer "[heartbeat stale, active I/O]" over "[stale]"
+                // for workers that were suppressed from the stale-prune because a
+                // recent WorkerFileEdited/WorkerGitCommit event confirms they are
+                // still making progress despite a heartbeat lapse (e.g. during a
+                // long cargo build/test run).
+                let liveness_label = if active_io_suppressed.contains(&agent.id) {
+                    " [heartbeat stale, active I/O]"
+                } else {
+                    liveness_label_for(elapsed)
+                };
                 let clone_path = agent.metadata.get("clone_path").cloned();
                 let clone_info = clone_path
                     .as_ref()
@@ -1178,6 +1216,35 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     format!("{}d ago", diff.num_days())
 }
 
+/// cas-1ec7: check whether the event log shows recent I/O progress
+/// (file edits or git commits) for the given agent session ID.
+///
+/// Used in `factory_worker_status` to suppress stale-detection for workers
+/// that are in long CPU-bound operations (e.g., `cargo build`/`cargo test`
+/// stretches that extend past the 30s heartbeat threshold). Heartbeat lag
+/// alone is insufficient evidence of death when observable I/O is
+/// progressing within the same window.
+///
+/// `events` should be pre-filtered to the stale time window (caller queries
+/// `list_since(now - WORKER_STALE_SECS, …)` once and passes the slice here
+/// to avoid one DB round-trip per agent).
+///
+/// Matching is done by `session_id == agent_id` (the CC session UUID, set
+/// identically in `agent.id` and `event.session_id` since daemon.rs stores
+/// both from the same session_id field).
+pub(crate) fn has_recent_worker_io_activity(
+    events: &[cas_types::Event],
+    agent_id: &str,
+) -> bool {
+    use cas_types::EventType;
+    events.iter().any(|e| {
+        matches!(
+            e.event_type,
+            EventType::WorkerFileEdited | EventType::WorkerGitCommit
+        ) && e.session_id.as_deref() == Some(agent_id)
+    })
+}
+
 /// cas-8240 two-band liveness label for `factory_worker_status`:
 ///
 /// * `elapsed >= WORKER_DEAD_SECS` → `" [DEAD]"` (hard escalation —
@@ -1889,6 +1956,103 @@ mod tests {
         assert!(
             output.contains("session:"),
             "output must have 'session:' label: {output}"
+        );
+    }
+
+    // ---- cas-1ec7: active-IO stale suppression ----------------------------
+
+    /// AC: a stale-heartbeat worker with a recent WorkerFileEdited event is
+    /// NOT reported as having no recent I/O.
+    #[test]
+    fn has_recent_worker_io_activity_matches_file_edited() {
+        use cas_types::{Event, EventEntityType, EventType};
+        let mut e = Event::new(
+            EventType::WorkerFileEdited,
+            EventEntityType::Agent,
+            "vivid-dolphin-10",
+            "edited src/lib.rs",
+        );
+        e.session_id = Some("ses-abc-123".to_string());
+        assert!(
+            has_recent_worker_io_activity(&[e], "ses-abc-123"),
+            "WorkerFileEdited with matching session_id must report active I/O"
+        );
+    }
+
+    /// AC: a stale-heartbeat worker with a recent WorkerGitCommit event is
+    /// NOT reported as having no recent I/O.
+    #[test]
+    fn has_recent_worker_io_activity_matches_git_commit() {
+        use cas_types::{Event, EventEntityType, EventType};
+        let mut e = Event::new(
+            EventType::WorkerGitCommit,
+            EventEntityType::Agent,
+            "rapid-shark-56",
+            "committed feat: add widget",
+        );
+        e.session_id = Some("ses-def-456".to_string());
+        assert!(
+            has_recent_worker_io_activity(&[e], "ses-def-456"),
+            "WorkerGitCommit with matching session_id must report active I/O"
+        );
+    }
+
+    /// AC: a worker with stale heartbeat AND no recent activity remains stale.
+    /// Verified by: no matching events → function returns false → caller prunes.
+    #[test]
+    fn has_recent_worker_io_activity_no_match_wrong_session() {
+        use cas_types::{Event, EventEntityType, EventType};
+        let mut e = Event::new(
+            EventType::WorkerFileEdited,
+            EventEntityType::Agent,
+            "other-worker",
+            "edited file.rs",
+        );
+        e.session_id = Some("ses-other".to_string());
+        assert!(
+            !has_recent_worker_io_activity(&[e], "ses-mine"),
+            "event for a different session_id must not suppress pruning for this agent"
+        );
+    }
+
+    #[test]
+    fn has_recent_worker_io_activity_no_match_wrong_event_type() {
+        use cas_types::{Event, EventEntityType, EventType};
+        let mut e = Event::new(
+            EventType::TaskStarted,
+            EventEntityType::Agent,
+            "worker-x",
+            "task started",
+        );
+        e.session_id = Some("ses-abc-123".to_string());
+        assert!(
+            !has_recent_worker_io_activity(&[e], "ses-abc-123"),
+            "non-IO event type (TaskStarted) must not count as active I/O"
+        );
+    }
+
+    #[test]
+    fn has_recent_worker_io_activity_empty_events_returns_false() {
+        assert!(
+            !has_recent_worker_io_activity(&[], "ses-any"),
+            "empty event list must report no active I/O"
+        );
+    }
+
+    #[test]
+    fn has_recent_worker_io_activity_no_session_id_does_not_match() {
+        use cas_types::{Event, EventEntityType, EventType};
+        // Event without session_id set — should not match any agent.
+        let e = Event::new(
+            EventType::WorkerFileEdited,
+            EventEntityType::Agent,
+            "ses-abc-123", // entity_id carries the name, but session_id is None
+            "edited foo.rs",
+        );
+        // session_id is None by default from Event::new
+        assert!(
+            !has_recent_worker_io_activity(&[e], "ses-abc-123"),
+            "event without session_id must not match (matching is by session_id, not entity_id)"
         );
     }
 
