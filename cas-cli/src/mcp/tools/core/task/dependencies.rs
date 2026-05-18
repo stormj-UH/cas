@@ -46,24 +46,46 @@ impl CasCore {
         )))
     }
 
-    /// Remove a dependency between tasks
+    /// Remove a dependency of a specific type between tasks (cas-6009).
+    ///
+    /// Uses `dep_type` to target exactly one dependency row, leaving any
+    /// other-typed deps between the same pair untouched.
     pub async fn cas_task_dep_remove(
         &self,
         Parameters(req): Parameters<DependencyRequest>,
     ) -> Result<CallToolResult, McpError> {
         let task_store = self.open_task_store()?;
 
-        task_store
-            .remove_dependency(&req.from_id, &req.to_id)
+        let dep_type = match req.dep_type.to_lowercase().as_str() {
+            "related" => DependencyType::Related,
+            "parent" | "parentchild" | "parent-child" => DependencyType::ParentChild,
+            "discovered" | "discoveredfrom" | "discovered-from" => DependencyType::DiscoveredFrom,
+            "extracted" | "extractedfrom" | "extracted-from" => DependencyType::ExtractedFrom,
+            _ => DependencyType::Blocks,
+        };
+
+        let found = task_store
+            .remove_dependency_of_type(&req.from_id, &req.to_id, dep_type)
             .map_err(|e| McpError {
                 code: ErrorCode::INTERNAL_ERROR,
                 message: Cow::from(format!("Failed to remove dependency: {e}")),
                 data: None,
             })?;
 
+        if !found {
+            return Err(McpError {
+                code: ErrorCode::INVALID_PARAMS,
+                message: Cow::from(format!(
+                    "No {:?} dependency found from {} to {}",
+                    dep_type, req.from_id, req.to_id
+                )),
+                data: None,
+            });
+        }
+
         Ok(Self::success(format!(
-            "Removed dependency: {} -> {}",
-            req.from_id, req.to_id
+            "Removed {:?} dependency: {} -> {}",
+            dep_type, req.from_id, req.to_id
         )))
     }
 }

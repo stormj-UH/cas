@@ -1958,3 +1958,248 @@ async fn test_non_supervisor_cannot_force_transfer() {
         }
     }
 }
+
+// =============================================================================
+// cas-6009: dep_remove honors dep_type — does not silently remove the wrong dep
+// =============================================================================
+
+/// Regression: the schema allows only one dependency row per (from_id, to_id)
+/// pair. Before the fix, `dep_remove A B dep_type=blocks` would silently delete
+/// whatever dep existed — including a ParentChild dep — because dep_type was
+/// ignored.  After the fix, `dep_remove` must return a clear error when the
+/// existing dep is NOT of the requested type, leaving the dep intact.
+#[tokio::test]
+async fn test_dep_remove_type_mismatch_does_not_delete_existing_dep() {
+    let (_temp, service) = setup_cas();
+
+    let task_a = make_task_create_req("Task A — dep_type mismatch regression");
+    let task_b = make_task_create_req("Task B — dep_type mismatch regression");
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(task_a))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(task_b))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+
+    // Add a ParentChild dep from A to B.
+    // NOTE: dep_add matches "parent" | "parentchild" (not "parent-child").
+    service
+        .cas_task_dep_add(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "parent".to_string(),
+        }))
+        .await
+        .expect("add parent-child dep");
+
+    // Verify the ParentChild dep exists
+    let deps_before = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list before"),
+    );
+    assert!(
+        deps_before.contains("ParentChild") || deps_before.contains("parent"),
+        "parent-child dep should exist: {deps_before}"
+    );
+
+    // Attempt to remove a Blocks dep (wrong type) — must fail, not delete the ParentChild
+    let result = service
+        .cas_task_dep_remove(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "blocks".to_string(),
+        }))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("No") || msg.contains("not found") || msg.contains("found"),
+                "error should explain dep not found: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // If the tool returns a tool-error (not McpError), it should surface the not-found message
+            assert!(
+                text.contains("No") || text.contains("not found") || text.contains("found"),
+                "tool response should surface the not-found error: {text}"
+            );
+        }
+    }
+
+    // ParentChild dep must still be intact — the wrong-type dep_remove must NOT have deleted it
+    let deps_after = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list after"),
+    );
+    assert!(
+        deps_after.contains("ParentChild") || deps_after.contains("parent"),
+        "parent-child dep must survive type-mismatched dep_remove: {deps_after}"
+    );
+}
+
+/// Regression: dep_remove with a dep_type that does NOT match any existing dep
+/// between the pair must return a clear error, not a silent success.
+/// Here we add a Related dep and try to remove it as Blocks — must fail.
+#[tokio::test]
+async fn test_dep_remove_wrong_type_returns_error() {
+    let (_temp, service) = setup_cas();
+
+    let req_a = make_task_create_req("Task A — no-dep-found error regression");
+    let req_b = make_task_create_req("Task B — no-dep-found error regression");
+
+    let id_a = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req_a))
+            .await
+            .expect("create A"),
+    ))
+    .expect("id A")
+    .to_string();
+
+    let id_b = extract_task_id(&extract_text(
+        service
+            .cas_task_create(Parameters(req_b))
+            .await
+            .expect("create B"),
+    ))
+    .expect("id B")
+    .to_string();
+
+    // Add a Related dep (not Blocks)
+    service
+        .cas_task_dep_add(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "related".to_string(),
+        }))
+        .await
+        .expect("add related dep");
+
+    // Attempt to remove a Blocks dep (which doesn't exist) — must fail
+    let result = service
+        .cas_task_dep_remove(Parameters(DependencyRequest {
+            from_id: id_a.clone(),
+            to_id: id_b.clone(),
+            dep_type: "blocks".to_string(),
+        }))
+        .await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string();
+            assert!(
+                msg.contains("No") || msg.contains("not found") || msg.contains("found"),
+                "error should explain dep not found: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // dep_remove returned a tool-error response rather than McpError
+            assert!(
+                text.contains("No") || text.contains("not found") || text.contains("found"),
+                "tool response should surface the not-found error: {text}"
+            );
+        }
+    }
+
+    // Related dep must still be intact
+    let deps_after = extract_text(
+        service
+            .cas_task_dep_list(Parameters(IdRequest { id: id_a.clone() }))
+            .await
+            .expect("dep_list after"),
+    );
+    assert!(
+        deps_after.contains("Related") || deps_after.contains("related"),
+        "related dep must survive type-mismatched dep_remove: {deps_after}"
+    );
+}
+
+/// Regression: creating a task with the same ID as both `epic` and `blocked_by`
+/// must be rejected — the mixed ParentChild+Blocks scenario is the root cause
+/// of the silent dep_remove data-loss bug (cas-6009).
+#[tokio::test]
+async fn test_create_rejects_blocked_by_same_as_epic() {
+    let (_temp, service) = setup_cas();
+
+    // Create an epic first
+    let epic_create = TaskCreateRequest {
+        title: "Epic for mixed-dep rejection test".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "epic".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: None,
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: None,
+    };
+    let epic_text = extract_text(
+        service
+            .cas_task_create(Parameters(epic_create))
+            .await
+            .expect("create epic"),
+    );
+    let epic_id = extract_task_id(&epic_text).expect("epic id").to_string();
+
+    // Attempt to create a child task that is ALSO blocked by the same epic
+    let bad_create = TaskCreateRequest {
+        title: "Child blocked by its own epic".to_string(),
+        description: None,
+        priority: 2,
+        task_type: "task".to_string(),
+        labels: None,
+        notes: None,
+        blocked_by: Some(epic_id.clone()),
+        design: None,
+        acceptance_criteria: None,
+        external_ref: None,
+        assignee: None,
+        demo_statement: None,
+        execution_note: None,
+        epic: Some(epic_id.clone()),
+    };
+
+    let result = service.cas_task_create(Parameters(bad_create)).await;
+
+    match result {
+        Err(e) => {
+            let msg = e.message.to_string().to_lowercase();
+            assert!(
+                msg.contains("blocked") || msg.contains("epic") || msg.contains("child"),
+                "rejection should reference the conflict: {msg}"
+            );
+        }
+        Ok(ok) => {
+            let text = extract_text(ok);
+            // Should not succeed
+            panic!(
+                "expected rejection when blocked_by == epic, got success: {text}"
+            );
+        }
+    }
+}

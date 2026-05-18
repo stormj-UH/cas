@@ -863,6 +863,21 @@ impl TaskStore for SqliteTaskStore {
         Ok(())
     }
 
+    fn remove_dependency_of_type(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        dep_type: DependencyType,
+    ) -> Result<bool> {
+        let dep_type_str = dep_type.to_string();
+        let conn = self.conn.lock().unwrap();
+        let rows_deleted = conn.execute(
+            "DELETE FROM dependencies WHERE from_id = ? AND to_id = ? AND dep_type = ?",
+            params![from_id, to_id, dep_type_str],
+        )?;
+        Ok(rows_deleted > 0)
+    }
+
     fn get_dependencies(&self, task_id: &str) -> Result<Vec<Dependency>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
