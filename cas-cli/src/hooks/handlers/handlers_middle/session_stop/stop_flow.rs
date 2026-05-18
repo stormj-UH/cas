@@ -4,7 +4,7 @@ use crate::hooks::handlers::handlers_middle::session_stop::{
     build_session_summary_context, handle_loop_iteration, synthesize_buffered_observations,
 };
 use crate::hooks::handlers::handlers_middle::utils::{
-    find_similar_rule, is_architectural_file, truncate_list, truncate_str,
+    find_similar_entry, find_similar_rule, is_architectural_file, truncate_list, truncate_str,
 };
 use crate::hooks::handlers::*;
 
@@ -346,6 +346,112 @@ pub fn handle_stop(input: &HookInput, cas_root: Option<&Path>) -> Result<HookOut
                     }
                     Err(e) => {
                         eprintln!("cas: Learning extraction failed: {e}");
+                    }
+                }
+            }
+        }
+
+        // session-learn: 7-signal memory classifier (cas-6156 / EPIC cas-ebea)
+        // Gated on [memory] session_learn_auto = true in .cas/config.toml.
+        // The obs_count >= 5 guard mirrors the SKILL.md "< 5 tool calls = skip"
+        // floor so we never pay a Haiku call on a trivial session.
+        let session_learn_auto = config
+            .memory
+            .as_ref()
+            .is_some_and(|m| m.session_learn_auto);
+
+        if session_learn_auto && obs_count >= 5 {
+            if let Some(ref transcript_path) = input.transcript_path {
+                let sl_file_paths: Vec<String> = session_observations
+                    .iter()
+                    .filter_map(|e| {
+                        let content = &e.content;
+                        if content.starts_with("Write: ") || content.starts_with("Edit: ") {
+                            content.split(": ").nth(1).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                match session_learn_sync(transcript_path, &sl_file_paths) {
+                    Ok(drafts) if !drafts.is_empty() => {
+                        eprintln!(
+                            "cas: session-learn: {} draft(s) from transcript",
+                            drafts.len()
+                        );
+
+                        let confidence_floor = |d: &SessionLearnDraft| {
+                            if d.signal == "correction" {
+                                d.confidence >= 0.5
+                            } else {
+                                d.confidence >= 0.6
+                            }
+                        };
+
+                        let mut stored = 0usize;
+                        for draft in drafts.iter().filter(|d| {
+                            confidence_floor(d) && d.dedup_hits.is_empty()
+                        }) {
+                            // BM25 overlap-detection gate
+                            if find_similar_entry(cas_root, &draft.content) {
+                                eprintln!(
+                                    "cas: session-learn: skipping near-duplicate: {}",
+                                    truncate_str(&draft.content, 50)
+                                );
+                                continue;
+                            }
+
+                            let entry_type = draft
+                                .entry_type
+                                .parse::<EntryType>()
+                                .unwrap_or(EntryType::Learning);
+                            let scope = if draft.scope.eq_ignore_ascii_case("global") {
+                                crate::types::Scope::Global
+                            } else {
+                                crate::types::Scope::Project
+                            };
+
+                            let id = match store.generate_id() {
+                                Ok(id) => id,
+                                Err(_) => continue,
+                            };
+
+                            let entry = Entry {
+                                id: id.clone(),
+                                entry_type,
+                                scope,
+                                content: draft.content.clone(),
+                                tags: draft.tags.clone(),
+                                session_id: Some(input.session_id.clone()),
+                                importance: draft.confidence,
+                                ..Default::default()
+                            };
+
+                            if store.add(&entry).is_ok() {
+                                let index_dir = cas_root.join("index/tantivy");
+                                if let Ok(search) = SearchIndex::open(&index_dir) {
+                                    let _ = search.index_entry(&entry);
+                                }
+                                stored += 1;
+                                eprintln!(
+                                    "cas: session-learn: stored {} [{}] {}",
+                                    id,
+                                    draft.signal,
+                                    truncate_str(&draft.content, 60)
+                                );
+                            }
+                        }
+
+                        if stored > 0 {
+                            eprintln!("cas: session-learn: {stored} memory entries written");
+                        }
+                    }
+                    Ok(_) => {
+                        // No drafts — trivial session or no signal-worthy findings
+                    }
+                    Err(e) => {
+                        eprintln!("cas: session-learn failed: {e}");
                     }
                 }
             }
