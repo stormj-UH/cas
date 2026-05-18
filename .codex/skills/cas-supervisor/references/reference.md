@@ -27,6 +27,33 @@ mcp__cas__task action=transfer id=cas-abc1 to_agent=<worker>
 
 The `transfer` action's target field is `to_agent` (not `assignee`). The `update` action's target field is `assignee` (not `to_agent`). Yes, they disagree. Remember: `update assignee=...` for initial assignment; `transfer to_agent=...` only when reassigning a claimed task.
 
+**Reassigning a task owned by a live worker (supervisor override):**
+
+When a task is claimed by a live worker and you need to reassign it without shutting the worker down, use `bypass_code_review=true` as the supervisor-override flag on `transfer`:
+
+```
+# Force-transfer from a live worker to another agent (single atomic step)
+mcp__cas__task action=transfer id=cas-abc1 to_agent=<new-worker> bypass_code_review=true \
+  notes="Reassigned due to <reason>"
+```
+
+This force-releases the live worker's lease, updates the assignee, attempts to pre-claim for the target agent, and appends an audit entry to the task notes with your supervisor session ID and the prior lease holder. The old worker loses its lease silently — message them separately if they need to know.
+
+Two-step alternative (if the atomic path errors):
+
+```
+# Step 1: Drop the live lease and reset the task to Open
+mcp__cas__task action=reset id=cas-abc1
+
+# Step 2: Assign to the new worker
+mcp__cas__task action=update id=cas-abc1 assignee=<new-worker>
+
+# Step 3: Notify the new worker
+mcp__cas__coordination action=message target=<new-worker> summary="..." message="..."
+```
+
+`reset` does NOT require you to own the lease — it is safe to call on any non-closed task regardless of who holds the current lease.
+
 **Dispatching tasks is a two-step operation.** Sending a coordination message telling a worker to "claim tasks X and Y" does not actually dispatch work — workers react to `assignee` changes on the task, not to message content. Full pattern:
 
 ```

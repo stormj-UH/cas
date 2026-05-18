@@ -128,6 +128,22 @@ pub struct TaskTransferRequest {
     #[schemars(description = "Notes for the receiving agent about the work done and what remains")]
     #[serde(default)]
     pub note: Option<String>,
+
+    /// Supervisor override: force-transfer a task owned by a live worker.
+    ///
+    /// When `true` and the caller is a supervisor, the transfer forcibly
+    /// releases the live worker's lease and reassigns the task without
+    /// requiring the worker to release it first. An audit-log entry is
+    /// appended to the task notes recording the supervisor's session ID
+    /// and that the override was used. Only honored when the caller runs
+    /// under a supervisor role (`CAS_AGENT_ROLE=supervisor`).
+    #[schemars(
+        description = "Supervisor override: force-transfer even when a live worker owns the lease. \
+                       Only honored when the caller is a supervisor; other roles are rejected. \
+                       Logs an audit entry on the task."
+    )]
+    #[serde(default)]
+    pub supervisor_override: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

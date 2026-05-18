@@ -478,6 +478,9 @@ impl CasService {
                     )
                 })?,
             note: req.notes,
+            // `bypass_code_review` is reused here as the supervisor-override flag for transfer.
+            // It is the existing mechanism for supervisor privilege escalation in TaskRequest.
+            supervisor_override: req.bypass_code_review,
         };
         self.inner.cas_task_transfer(Parameters(inner_req)).await
     }
