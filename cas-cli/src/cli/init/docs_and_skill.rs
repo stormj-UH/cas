@@ -10,6 +10,7 @@ const CAS_DIRECTIVE_CONTENT: &str = r#"# IMPORTANT: USE CAS FOR TASK AND MEMORY 
 **DO NOT USE BUILT-IN TOOLS (TodoWrite, EnterPlanMode) FOR TASK TRACKING.**
 
 Use CAS MCP tools instead:
+First use each session — load MCP schemas: ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")
 - `mcp__cas__task` with action: create - Create tasks (NOT TodoWrite)
 - `mcp__cas__task` with action: start/close - Manage task status
 - `mcp__cas__task` with action: ready - See ready tasks
@@ -213,3 +214,37 @@ pub fn generate_cas_skill(project_root: &Path) -> anyhow::Result<bool> {
 // ============================================================================
 // Agent and command generation (using builtins)
 // ============================================================================
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The managed block must document the ToolSearch bootstrap query so that
+    /// Claude knows how to load MCP schemas before calling task/memory/search.
+    #[test]
+    fn template_documents_toolsearch_bootstrap() {
+        let section = build_cas_section();
+        assert!(
+            section.contains(r#"ToolSearch(query="select:mcp__cas__task,mcp__cas__memory,mcp__cas__search")"#),
+            "Managed block must contain the exact ToolSearch bootstrap query; got:\n{section}"
+        );
+    }
+
+    /// The full managed block (markers + content) must stay ≤ 18 lines to
+    /// keep the per-session context tax small (sister task cas-253e dedupes
+    /// the block; this bounds its cost when it *does* appear).
+    #[test]
+    fn managed_block_line_count_within_budget() {
+        let section = build_cas_section();
+        let line_count = section.lines().count();
+        assert!(
+            line_count <= 18,
+            "Managed CLAUDE.md block must be ≤ 18 lines (current: {line_count});\
+             if you added content, trim elsewhere"
+        );
+    }
+}
