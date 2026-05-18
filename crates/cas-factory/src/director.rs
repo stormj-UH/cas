@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cas_store::{
-    AgentStore, EventStore, Reminder, ReminderStore, SqliteAgentStore, SqliteEventStore,
-    SqliteReminderStore, SqliteTaskStore, SqliteWorktreeStore, WorktreeStore,
+    AgentStore, EventStore, PromptQueueStore, QueuedPrompt, Reminder, ReminderStore,
+    SqliteAgentStore, SqliteEventStore, SqlitePromptQueueStore, SqliteReminderStore,
+    SqliteTaskStore, SqliteWorktreeStore, WorktreeStore,
 };
 use cas_types::{
     AgentRole, AgentStatus, Event, EventType, Priority, Task, TaskStatus, TaskType,
@@ -28,11 +29,16 @@ pub struct DirectorStores {
     pub agent_store: SqliteAgentStore,
     pub worktree_store: Option<SqliteWorktreeStore>,
     pub reminder_store: Option<SqliteReminderStore>,
+    /// Best-effort handle for per-agent pending-message counts. Used by the
+    /// idle detector to suppress `WorkerIdle` while a worker has unread
+    /// messages in the prompt queue (spawn-race fix, cas-afb7).
+    pub prompt_queue_store: Option<SqlitePromptQueueStore>,
 }
 
 impl DirectorStores {
-    /// Open all stores for a CAS directory. Worktree and reminder stores
-    /// are best-effort (None on failure) since they are not critical.
+    /// Open all stores for a CAS directory. Worktree, reminder, and
+    /// prompt-queue stores are best-effort (None on failure) since they are
+    /// not critical.
     pub fn open(cas_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             task_store: SqliteTaskStore::open(cas_dir)?,
@@ -40,6 +46,7 @@ impl DirectorStores {
             agent_store: SqliteAgentStore::open(cas_dir)?,
             worktree_store: SqliteWorktreeStore::open(cas_dir).ok(),
             reminder_store: SqliteReminderStore::open(cas_dir).ok(),
+            prompt_queue_store: SqlitePromptQueueStore::open(cas_dir).ok(),
         })
     }
 }
@@ -70,6 +77,10 @@ pub struct AgentSummary {
     pub latest_activity: Option<(String, chrono::DateTime<chrono::Utc>)>,
     /// Last heartbeat timestamp
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    /// Number of pending (unprocessed) prompt-queue messages addressed to
+    /// this agent. Used by the idle detector to suppress `WorkerIdle` when
+    /// the worker has unread messages (spawn race mitigation, cas-afb7).
+    pub pending_messages: u32,
 }
 
 /// A group of tasks under an epic
@@ -289,6 +300,26 @@ impl DirectorData {
         };
         let agents_list = AgentStore::list(agent_store, None)?;
 
+        // Compute per-agent pending message counts (best-effort, non-fatal).
+        // These are used by the idle detector to suppress `WorkerIdle` when a
+        // freshly spawned worker has unread messages waiting in the queue before
+        // it has had a chance to poll them (spawn race fix, cas-afb7).
+        let agent_names_for_pq: Vec<&str> = agents_list.iter().map(|a| a.name.as_str()).collect();
+        let pending_msgs: Vec<QueuedPrompt> =
+            if let Some(pq) = stores.and_then(|s| s.prompt_queue_store.as_ref()) {
+                pq.peek_for_targets(&agent_names_for_pq, None, 500)
+                    .unwrap_or_default()
+            } else {
+                SqlitePromptQueueStore::open(cas_dir)
+                    .ok()
+                    .and_then(|pq| pq.peek_for_targets(&agent_names_for_pq, None, 500).ok())
+                    .unwrap_or_default()
+            };
+        let mut pending_counts: HashMap<String, u32> = HashMap::new();
+        for msg in pending_msgs {
+            *pending_counts.entry(msg.target).or_insert(0) += 1;
+        }
+
         let mut agent_id_to_name = HashMap::new();
         let agents: Vec<AgentSummary> = agents_list
             .into_iter()
@@ -304,6 +335,7 @@ impl DirectorData {
                 // Task assignees store agent names (not IDs), so look up by name
                 let current_task = assignee_tasks.get(&a.name).cloned();
                 let latest_activity = agent_latest_activity.get(&a.id).cloned();
+                let pending_messages = pending_counts.get(&a.name).copied().unwrap_or(0);
                 AgentSummary {
                     id: a.id,
                     name: a.name,
@@ -311,6 +343,7 @@ impl DirectorData {
                     current_task,
                     latest_activity,
                     last_heartbeat: Some(a.last_heartbeat),
+                    pending_messages,
                 }
             })
             .collect();
