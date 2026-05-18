@@ -340,6 +340,9 @@ impl TeamsManager {
     /// what actually short-circuits the team-mode leader-escalation deadlock
     /// on Claude Code 2.1.x — the `permissions.allow` list alone does not.
     ///
+    /// Emits exec-form `"args"` (cas-9a60).  CC ≥ 2.1.142 required
+    /// (anthropics/claude-code#58441 fixed in 2.1.142, verified on 2.1.143).
+    ///
     /// Defaults mirror `cli/hook/config_gen.rs`: 2000ms timeout for both.
     /// `PreToolUse` matcher is the filesystem tool list so we don't fire
     /// the hook on unrelated tools (MCP, Agent, etc. still flow through
@@ -353,7 +356,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PreToolUse",
+                            "args": ["cas", "hook", "PreToolUse"],
                             "timeout": 2000
                         }
                     ]
@@ -364,7 +367,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "cas hook PermissionRequest",
+                            "args": ["cas", "hook", "PermissionRequest"],
                             "timeout": 2000
                         }
                     ]
