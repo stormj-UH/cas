@@ -88,6 +88,17 @@ mcp__cs__coordination action=spawn_workers count=2 cli=codex worker_names="alice
 
 `cli`, `model`, and `effort` are per-spawn overrides. See [references/reference.md](cas-supervisor/references/reference.md) for the full `spawn_workers` parameter table.
 
+## Running Scripts Against Prod
+
+For Vercel-deployed projects, pull real credentials into a local env file before running scripts that need to hit prod services (Neon, QStash, etc.):
+
+```bash
+vercel env pull .env.<env> --environment=<env>
+# e.g.: vercel env pull .env.production --environment=production
+```
+
+Run from the linked project directory. Add the resulting file to `.gitignore` immediately — never commit credentials.
+
 ## References
 
 Each file below is a focused chunk of the operational guide. Open the one you need — they are not pre-loaded.
