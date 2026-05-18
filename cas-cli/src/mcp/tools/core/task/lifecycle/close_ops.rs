@@ -1123,7 +1123,8 @@ impl CasCore {
         //     harness.
         let close_project_root = self.cas_root.parent().unwrap_or(&self.cas_root);
 
-        // cas-ee2b: resolve the effective "has reviewable changes" signal.
+        // cas-ee2b: resolve the effective "has reviewable changes" signal and
+        // the parent branch for worker git operations.
         //
         // For isolated worker worktrees, checking the main repo's working-tree
         // state (`has_reviewable_changes(close_project_root)`) gives the wrong
@@ -1137,21 +1138,27 @@ impl CasCore {
         // what the worker committed on their branch (merge-base..HEAD). For
         // non-isolated tasks, fall through to the existing main-repo check —
         // those workers share the main worktree so its state IS the task diff.
-        let effective_has_reviewable = if let Some(worker_wt) = worker_worktree_path.as_ref() {
-            let parent_branch = task
-                .worktree_id
-                .as_deref()
-                .and_then(|wt_id| {
-                    self.open_worktree_store()
-                        .ok()
-                        .and_then(|store| store.get(wt_id).ok())
-                        .map(|wt| wt.parent_branch.clone())
-                })
-                .unwrap_or_else(|| "main".to_string());
-            has_worker_committed_reviewable_changes(worker_wt, &parent_branch)
-        } else {
-            has_reviewable_changes(close_project_root)
-        };
+        //
+        // Also capture `worker_review_parent_branch` for the case-3 ambiguity
+        // check below (avoids a second open_worktree_store call).
+        let (effective_has_reviewable, worker_review_parent_branch) =
+            if let Some(worker_wt) = worker_worktree_path.as_ref() {
+                let parent_branch = task
+                    .worktree_id
+                    .as_deref()
+                    .and_then(|wt_id| {
+                        self.open_worktree_store()
+                            .ok()
+                            .and_then(|store| store.get(wt_id).ok())
+                            .map(|wt| wt.parent_branch.clone())
+                    })
+                    .unwrap_or_else(|| "main".to_string());
+                let reviewable =
+                    has_worker_committed_reviewable_changes(worker_wt, &parent_branch);
+                (reviewable, Some(parent_branch))
+            } else {
+                (has_reviewable_changes(close_project_root), None)
+            };
 
         // cas-b51a: supervisor-owned review mode.
         //
@@ -1279,17 +1286,45 @@ impl CasCore {
             false
         };
 
+        // cas-ee2b: three-case routing for zero-reviewable-changes closes.
+        // See `check_zero_commit_close` for the full decision tree.
+        //
+        // Case 2 (fabrication: findings provided + 0 commits) is already
+        // handled by the cas-490f gate above; never reaches here.
+        //
+        // Cases 1/3/4 are handled here: docs-only, ambiguous zero-commit,
+        // and deliberate no-code respectively.
         let gate_outcome = if epic_subtask_receipts_cover {
             CodeReviewGateOutcome::Proceed
         } else if !effective_has_reviewable {
-            // cas-ee2b: no reviewable changes on the worker's committed branch
-            // (or non-isolated task with a clean main-repo diff). Skip the
-            // review gate — this is the isolated-worker-aware equivalent of
-            // Skip 3 inside `run_code_review_gate`.
-            //
-            // This fixes the cas-cabc false-positive: researcher closes spike
-            // with zero code commits; main repo has unrelated dirty files;
-            // old code fired CODE_REVIEW_REQUIRED. Now the gate skips.
+            let has_review_findings = req
+                .code_review_findings
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            // Only run the case-3 gate for isolated-worker tasks that
+            // are not supervisor-bypassed.
+            if !bypass_close_gates {
+                if let (Some(worker_wt), Some(parent)) =
+                    (worker_worktree_path.as_ref(), worker_review_parent_branch.as_deref())
+                {
+                    match check_zero_commit_close(
+                        worker_wt,
+                        parent,
+                        &req.id,
+                        &task.task_type,
+                        task.execution_note.as_deref(),
+                        has_review_findings,
+                    ) {
+                        ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                            return Ok(Self::tool_error(msg));
+                        }
+                        ZeroCommitCloseOutcome::Proceed => {}
+                    }
+                }
+            }
+            // Cases 1 and 4: allow close — docs-only commits or deliberate
+            // no-code (spike, chore, execution_note set, bypass).
             CodeReviewGateOutcome::Proceed
         } else {
             run_code_review_gate(&task, &req, close_project_root)
@@ -2259,6 +2294,100 @@ pub(crate) fn check_commit_claim_integrity(
 
 /// One row in the epic_status diagnostic / epic-close gate report.
 ///
+// ---------------------------------------------------------------------------
+// cas-ee2b: zero-commit close gate (case 3)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the cas-ee2b zero-commit ambiguity gate (case 3).
+#[derive(Debug)]
+pub(crate) enum ZeroCommitCloseOutcome {
+    /// Close may proceed — either the task is not a code-expecting type,
+    /// has an execution_note signalling intentional no-code work, has
+    /// committed docs-only changes (count > 0), or the review findings
+    /// claim is present (handled by the cas-490f gate instead).
+    Proceed,
+    /// Close rejected — ambiguous zero-commit close on a code task with
+    /// no execution_note. Carries the user-facing rejection message.
+    AmbiguousCodeTask(String),
+}
+
+/// cas-ee2b: check whether a zero-commit close is ambiguous and should be
+/// rejected.
+///
+/// This function is the testable core of the cas-ee2b case-3 routing. The
+/// caller (`cas_task_close`) invokes it only when `!effective_has_reviewable`,
+/// i.e. after the main `has_worker_committed_reviewable_changes` check
+/// returned false.
+///
+/// Three-case decision tree:
+///
+/// 1. **Docs-only commits** (`count > 0` but no reviewable files): worker
+///    committed work; the reviewable-files check correctly returned false.
+///    → `Proceed`. This function sees `count > 0` and returns `Proceed`.
+///
+/// 2. **Deliberate no-code** (`execution_note` is set, OR task type is
+///    Spike/Chore/Epic, OR `has_review_findings` is true — the cas-490f
+///    gate handles that case):
+///    → `Proceed`. No ambiguity.
+///
+/// 3. **Ambiguous zero-commit** (`count == 0`, no `execution_note`, task
+///    type is Bug/Feature/Task, no review findings):
+///    → `AmbiguousCodeTask(msg)`. Ask worker to commit, set `execution_note`,
+///    or have the supervisor bypass.
+///
+/// `has_review_findings`: true when `code_review_findings` was non-empty.
+/// When true, the cas-490f gate fires upstream; this function returns `Proceed`
+/// so the two gates don't double-reject.
+///
+/// Returns `Proceed` on any git failure (graceful degradation — not
+/// ambiguous when history is unknowable).
+pub(crate) fn check_zero_commit_close(
+    worker_worktree_path: &std::path::Path,
+    parent_branch: &str,
+    task_id: &str,
+    task_type: &TaskType,
+    execution_note: Option<&str>,
+    has_review_findings: bool,
+) -> ZeroCommitCloseOutcome {
+    // Not a code-expecting task type → no ambiguity.
+    if !matches!(task_type, TaskType::Bug | TaskType::Feature | TaskType::Task) {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // execution_note is set → worker explicitly signalled the no-code intent.
+    if execution_note.is_some() {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Findings present → cas-490f gate handles; don't double-reject here.
+    if has_review_findings {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Count commits: if > 0, this is case 1 (docs-only), not case 3.
+    if count_worker_branch_commits(worker_worktree_path, parent_branch) > 0 {
+        return ZeroCommitCloseOutcome::Proceed;
+    }
+    // Case 3: ambiguous zero-commit close.
+    let task_type_str = format!("{task_type:?}").to_lowercase();
+    let wt_display = worker_worktree_path.display();
+    ZeroCommitCloseOutcome::AmbiguousCodeTask(format!(
+        "⚠️ ZERO-COMMIT CLOSE ON CODE TASK\n\n\
+        task close rejected: this is a {task_type_str} task with no \
+        code_review_findings, no execution_note, and 0 commits on the \
+        worker branch. That combination is ambiguous — either the work \
+        wasn't committed yet, or this task was resolved without code.\n\n\
+        📂 Worker worktree: {wt_display}\n\
+        📊 Commits on branch: 0\n\n\
+        To resolve:\n\
+        1. If you wrote code but forgot to commit: stage and commit your \
+           changes, then retry close.\n\
+        2. If this task was resolved without code (fixed by a sibling task, \
+           docs-only, characterization-only): update the task with an \
+           execution_note to signal intentional no-code work:\n\
+           `mcp__cas__task action=update id={task_id} execution_note=additive-only`\n\
+        3. Supervisors may bypass this gate with bypass_code_review=true \
+           (logged as a decision note)."
+    ))
+}
+
 /// Captures everything the supervisor needs to see at a glance: which
 /// child task this is, who owns it, whether their factory branch has
 /// stranded commits relative to the parent epic, and (for unmerged
@@ -5153,6 +5282,122 @@ mod zero_change_close_tests {
         assert!(
             !has_worker_committed_reviewable_changes(dir.path(), "main"),
             "non-git dir must degrade to false (no false-require-review)"
+        );
+    }
+
+    // ── check_zero_commit_close (case 1/3/4) ────────────────────────────────
+
+    /// Case 1: docs-only commits (commit_count > 0, no reviewable files).
+    /// Worker committed something — the reviewable check correctly saw no code.
+    /// This is NOT case 3; gate must proceed.
+    #[test]
+    fn case1_docs_only_commits_proceeds() {
+        let dir = init_worker_repo();
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        git(dir.path(), &["add", "NOTES.md"]);
+        git(dir.path(), &["commit", "-q", "-m", "docs: add notes"]);
+
+        // count_worker_branch_commits == 1 → case 1, not case 3
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,     // no execution_note
+            false,    // no review findings
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "docs-only commits must route to Proceed (case 1)"
+        );
+    }
+
+    /// Case 3: ambiguous zero-commit close — reproduces cas-cabc scenario
+    /// for a bug task with no hints that this is code-free work.
+    #[test]
+    fn case3_zero_commit_bug_task_no_hint_rejects() {
+        let dir = init_worker_repo();
+        // No commits beyond base — the ambiguous scenario.
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,   // no execution_note
+            false,  // no review findings
+        );
+        match outcome {
+            ZeroCommitCloseOutcome::AmbiguousCodeTask(msg) => {
+                assert!(
+                    msg.contains("ZERO-COMMIT CLOSE ON CODE TASK"),
+                    "rejection must name the gate: {msg}"
+                );
+                assert!(
+                    msg.contains("execution_note"),
+                    "rejection must guide worker to set execution_note: {msg}"
+                );
+            }
+            ZeroCommitCloseOutcome::Proceed => {
+                panic!("case 3 must reject ambiguous zero-commit bug task");
+            }
+        }
+    }
+
+    /// Case 4a: zero commits but execution_note set → deliberate no-code signal.
+    #[test]
+    fn case4_zero_commits_with_execution_note_proceeds() {
+        let dir = init_worker_repo();
+        // No commits, but worker explicitly set execution_note.
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            Some("additive-only"), // explicit no-code signal
+            false,
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "execution_note set must allow close (case 4)"
+        );
+    }
+
+    /// Case 4b: zero commits on a Chore/Spike task → non-code-expecting type.
+    #[test]
+    fn case4_zero_commits_on_chore_or_spike_proceeds() {
+        let dir = init_worker_repo();
+        for task_type in [TaskType::Chore, TaskType::Epic] {
+            let outcome = check_zero_commit_close(
+                dir.path(),
+                "main",
+                "cas-test1",
+                &task_type,
+                None,
+                false,
+            );
+            assert!(
+                matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+                "{task_type:?} task type must not be flagged as ambiguous"
+            );
+        }
+    }
+
+    /// Case 4c: review findings present → cas-490f handles that; this gate
+    /// should Proceed and not double-reject.
+    #[test]
+    fn case4_review_findings_present_defers_to_490f_gate() {
+        let dir = init_worker_repo();
+        let outcome = check_zero_commit_close(
+            dir.path(),
+            "main",
+            "cas-test1",
+            &TaskType::Bug,
+            None,
+            true, // has_review_findings = true (cas-490f rejects, not this gate)
+        );
+        assert!(
+            matches!(outcome, ZeroCommitCloseOutcome::Proceed),
+            "when review findings are present, the cas-490f gate owns the rejection"
         );
     }
 }
