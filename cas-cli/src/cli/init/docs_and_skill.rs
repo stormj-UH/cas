@@ -213,3 +213,105 @@ pub fn generate_cas_skill(project_root: &Path) -> anyhow::Result<bool> {
 // ============================================================================
 // Agent and command generation (using builtins)
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::with_temp_home;
+    use std::fs;
+
+    /// No ancestor has the managed block → injection proceeds.
+    #[test]
+    fn test_no_ancestor_block_writes_block() {
+        with_temp_home(|home| {
+            let project = home.join("project");
+            fs::create_dir_all(&project).unwrap();
+
+            let result = update_claude_md(&project).unwrap();
+            assert!(result, "expected block to be written when no ancestor has it");
+            let content = fs::read_to_string(project.join("CLAUDE.md")).unwrap();
+            assert!(content.contains(CAS_SECTION_BEGIN));
+        });
+    }
+
+    /// An ancestor directory already has the CAS block → injection is skipped.
+    /// FAILING before fix: current code writes the block regardless of ancestors.
+    #[test]
+    fn test_ancestor_has_block_skips_injection() {
+        with_temp_home(|home| {
+            // Parent dir inside HOME gets the managed block.
+            let parent = home.join("parent");
+            fs::create_dir_all(&parent).unwrap();
+            fs::write(parent.join("CLAUDE.md"), build_cas_section()).unwrap();
+
+            // Project is a child of parent.
+            let project = parent.join("project");
+            fs::create_dir_all(&project).unwrap();
+
+            let result = update_claude_md(&project).unwrap();
+            assert!(
+                !result,
+                "expected injection to be skipped when ancestor has the block"
+            );
+            assert!(
+                !project.join("CLAUDE.md").exists(),
+                "CLAUDE.md should not be created when ancestor already has the block"
+            );
+        });
+    }
+
+    /// The user-global ($HOME-level) CLAUDE.md always receives the block (root of chain).
+    #[test]
+    fn test_home_level_always_injects() {
+        with_temp_home(|home| {
+            let result = update_claude_md(home).unwrap();
+            assert!(result, "expected block to be written at HOME level");
+            let content = fs::read_to_string(home.join("CLAUDE.md")).unwrap();
+            assert!(content.contains(CAS_SECTION_BEGIN));
+        });
+    }
+
+    /// Existing project-level block is left untouched when ancestor also has it.
+    /// The new logic must skip re-injection but NOT delete the existing block.
+    #[test]
+    fn test_existing_project_block_preserved_when_ancestor_has_block() {
+        with_temp_home(|home| {
+            // HOME-level CLAUDE.md has the managed block.
+            fs::write(home.join("CLAUDE.md"), build_cas_section()).unwrap();
+
+            // Project also has the block (pre-existing duplicate).
+            let project = home.join("project");
+            fs::create_dir_all(&project).unwrap();
+            let project_claude = project.join("CLAUDE.md");
+            fs::write(&project_claude, build_cas_section()).unwrap();
+
+            // update_claude_md must not delete the existing block.
+            let _ = update_claude_md(&project);
+            let content = fs::read_to_string(&project_claude).unwrap();
+            assert!(
+                content.contains(CAS_SECTION_BEGIN),
+                "existing project-level block must not be deleted"
+            );
+        });
+    }
+
+    /// A symlinked project path doesn't cause an infinite loop during ancestor walk.
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_ancestor_no_infinite_loop() {
+        with_temp_home(|home| {
+            let real_dir = home.join("real_project");
+            fs::create_dir_all(&real_dir).unwrap();
+
+            let link_path = home.join("linked_project");
+            std::os::unix::fs::symlink(&real_dir, &link_path).unwrap();
+
+            // Should complete without hanging or panicking.
+            let result = update_claude_md(&link_path);
+            assert!(
+                result.is_ok(),
+                "symlinked project path must not cause an error"
+            );
+        });
+    }
+}
