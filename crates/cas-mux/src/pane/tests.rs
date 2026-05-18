@@ -308,4 +308,25 @@ mod cases {
     fn trailing_dec_partial_no_esc() {
         assert!(Pane::trailing_dec_partial(b"hello world").is_empty());
     }
+
+    /// Test that scrolling an empty pane (no scrollback) returns Ok (no-op, not an error).
+    ///
+    /// AC #5 (cas-3b18): `RUST_LOG=info` must produce no "Failed to scroll focused pane:"
+    /// or "Failed to scroll terminal: code …" log lines during normal scroll operations.
+    /// That warning fires only if `Pane::scroll` returns `Err`.  This test pins the
+    /// ghostty_vt contract: scrolling a viewport with no scrollback above the visible
+    /// region must be a silent no-op (return code 0), not an error.
+    #[test]
+    fn test_scroll_empty_pane_is_ok_not_error() {
+        let mut pane = Pane::director("test-empty", 24, 80).expect("create pane");
+        // No content fed — scrollback is empty (just the 24-row visible viewport).
+        assert!(
+            pane.scroll(-3).is_ok(),
+            "scrolling empty pane up should be a silent no-op (Ok), not an error"
+        );
+        assert!(
+            pane.scroll(3).is_ok(),
+            "scrolling empty pane down should be a silent no-op (Ok), not an error"
+        );
+    }
 }
