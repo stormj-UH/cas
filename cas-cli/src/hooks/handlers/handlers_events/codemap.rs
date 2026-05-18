@@ -300,74 +300,32 @@ impl CodemapStaleness {
 
 /// Check for codemap freshness and return staleness info.
 ///
-/// Called from SessionStart to inform the agent about:
-/// 1. Missing CODEMAP.md
-/// 2. Pending structural changes since last codemap update (from pending file)
-/// 3. Structural changes detected via git history (primary mechanism)
+/// Called from SessionStart and `cas codemap status` to determine whether
+/// CODEMAP.md needs regeneration.
 ///
-/// Returns None if no action needed.
+/// **Single source of truth (Strategy A):** uses git-based staleness exclusively.
+/// The pending-changes ledger (.cas/codemap-pending.json) is intentionally NOT
+/// consulted here — it only tracks committed changes (same signal as git) and
+/// was the source of divergence between this function and `cas codemap status`.
+/// The ledger remains available for `cas codemap pending` display; it is no
+/// longer authoritative for freshness decisions.
+///
+/// Returns None if no action needed (codemap is up to date or fresh enough).
 pub fn check_codemap_freshness(cas_root: &Path) -> Option<CodemapStaleness> {
     let project_root = cas_root.parent()?;
 
     let codemap_path = project_root.join(".claude/CODEMAP.md");
-    let pending_path = cas_root.join(CODEMAP_PENDING_FILE);
 
     if !codemap_path.exists() {
         return Some(CodemapStaleness::Missing);
     }
 
-    // Check pending file first (supplement — catches in-session uncommitted changes)
-    if pending_path.exists() {
-        if let Some(staleness) = check_staleness_from_pending(&pending_path) {
-            return Some(staleness);
-        }
-    }
-
-    // Primary mechanism: git-based staleness detection
-    // Works for terminal commits, worker commits, cherry-picks — any commit source
+    // Sole mechanism: git-based staleness detection.
+    // Works for terminal commits, worker commits, cherry-picks — any commit source.
+    // After `/codemap` regen + commit, CODEMAP.md's git timestamp advances past
+    // all prior structural changes → this returns None (up to date) automatically,
+    // with no manual `cas codemap clear` step required.
     check_staleness_from_git(project_root)
-}
-
-/// Check staleness using the pending file (supplement for in-session changes).
-fn check_staleness_from_pending(pending_path: &Path) -> Option<CodemapStaleness> {
-    let content = std::fs::read_to_string(pending_path).ok()?;
-    let mut total_changes = 0;
-    let mut file_list = Vec::new();
-    let mut first_commit = None;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(pending) = serde_json::from_str::<CodemapPending>(line) {
-            if first_commit.is_none() {
-                first_commit = Some(pending.commit.clone());
-            }
-            for change in &pending.changes {
-                total_changes += 1;
-                if file_list.len() < 10 {
-                    let prefix = match change.change_type.as_str() {
-                        "A" => "+",
-                        "D" => "-",
-                        "R" => "~",
-                        _ => "?",
-                    };
-                    file_list.push(format!("{prefix}{}", change.path));
-                }
-            }
-        }
-    }
-
-    if total_changes == 0 {
-        return None;
-    }
-
-    let commit_info = first_commit
-        .map(|c| format!(" since {}", &c[..7.min(c.len())]))
-        .unwrap_or_default();
-
-    Some(make_staleness(total_changes, file_list, commit_info))
 }
 
 /// Check staleness by comparing CODEMAP.md's last commit timestamp against
@@ -837,6 +795,46 @@ mod tests {
         let result = check_codemap_freshness(Path::new("/"));
         // Root has no parent, returns None
         assert!(result.is_none());
+    }
+
+    /// Strategy A invariant: pending-ledger entries alone do NOT mark the codemap stale.
+    /// Only git-based staleness drives the freshness signal.
+    ///
+    /// Before the Strategy A fix, check_codemap_freshness() would return Some(Stale)
+    /// when the pending file had entries, even after CODEMAP.md was regenerated and
+    /// committed. Now it ignores the pending file entirely.
+    ///
+    /// In this test we can't replicate a real git repo, but we CAN verify that:
+    /// - a pending file with entries does NOT cause the function to return Some
+    /// - the function falls through to git (which fails in a temp dir → returns None)
+    #[test]
+    fn test_codemap_freshness_pending_file_does_not_override_git() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        // Lay out: dir.path()/.cas/  →  cas_root
+        //          dir.path()/       →  project_root
+        let cas_root = dir.path().join(".cas");
+        let project_root = dir.path();
+
+        fs::create_dir_all(&cas_root).unwrap();
+
+        // Create CODEMAP.md so freshness check doesn't short-circuit to Missing.
+        let claude_dir = project_root.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("CODEMAP.md"), "# Codemap\n").unwrap();
+
+        // Populate the pending ledger with entries (simulates the pre-fix divergence state).
+        let pending_json = r#"{"changes":[{"type":"A","path":"src/new.rs"},{"type":"D","path":"src/old.rs"}],"commit":"abc1234","recorded_at":"2026-04-03T18:00:00Z"}"#;
+        fs::write(cas_root.join(CODEMAP_PENDING_FILE), pending_json).unwrap();
+
+        // With Strategy A: pending file is NOT consulted; git is the authority.
+        // There is no git repo here, so git returns no timestamp → check_staleness_from_git
+        // returns None → check_codemap_freshness returns None (up to date).
+        let result = check_codemap_freshness(&cas_root);
+        assert!(
+            result.is_none(),
+            "pending-ledger entries must not mark codemap stale when git shows up to date"
+        );
     }
 
     #[test]
