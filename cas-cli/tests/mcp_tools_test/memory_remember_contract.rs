@@ -34,6 +34,7 @@ fn base_request(content: String, title: &str, tags: &str) -> RememberRequest {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     }
 }
 

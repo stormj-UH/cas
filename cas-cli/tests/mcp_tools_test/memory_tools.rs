@@ -18,6 +18,7 @@ async fn test_remember_basic() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -47,6 +48,7 @@ async fn test_remember_with_defaults() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -76,6 +78,7 @@ async fn test_get_entry() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -128,6 +131,7 @@ async fn test_update_entry() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -184,6 +188,7 @@ async fn test_archive_and_unarchive() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -233,6 +238,7 @@ async fn test_helpful_and_harmful() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -283,6 +289,7 @@ async fn test_list_entries() {
             team_id: None,
             bypass_overlap: None,
         mode: None,
+        personal: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -326,6 +333,7 @@ async fn test_recent_entries() {
             team_id: None,
             bypass_overlap: None,
         mode: None,
+        personal: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -361,6 +369,7 @@ async fn test_delete_entry() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -405,6 +414,7 @@ async fn test_set_tier() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
 
@@ -459,6 +469,7 @@ async fn test_overlap_blocks_duplicate_insert() {
         team_id: None,
         bypass_overlap: Some(true),
         mode: None,
+        personal: None,
     };
     service
         .cas_remember(Parameters(first))
@@ -478,6 +489,7 @@ async fn test_overlap_blocks_duplicate_insert() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
     let result = service
         .cas_remember(Parameters(second))
@@ -524,6 +536,7 @@ async fn test_bypass_overlap_allows_duplicate() {
             team_id: None,
             bypass_overlap: Some(true),
         mode: None,
+        personal: None,
         };
         service
             .cas_remember(Parameters(req))
@@ -552,6 +565,7 @@ async fn test_unrelated_memory_inserts_normally() {
         team_id: None,
         bypass_overlap: Some(true),
         mode: None,
+        personal: None,
     };
     service
         .cas_remember(Parameters(first))
@@ -574,6 +588,7 @@ async fn test_unrelated_memory_inserts_normally() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
     let result = service
         .cas_remember(Parameters(second))
@@ -614,6 +629,7 @@ async fn test_moderate_overlap_creates_with_crossref() {
         team_id: None,
         bypass_overlap: Some(true),
         mode: None,
+        personal: None,
     };
     let first_result = service
         .cas_remember(Parameters(first))
@@ -648,6 +664,7 @@ async fn test_moderate_overlap_creates_with_crossref() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
     let second_result = service
         .cas_remember(Parameters(second))
@@ -677,4 +694,173 @@ async fn test_moderate_overlap_creates_with_crossref() {
         related.iter().any(|v| v.as_str() == Some(first_slug.as_str())),
         "cross-ref should include the first memory's slug {first_slug}"
     );
+}
+
+// ============================================================================
+// Team auto-promote regression tests (cas-6d96)
+//
+// Verify that `cas_remember()` in a team-linked project defaults to
+// team scope, and that `personal=true` opts back out.
+// ============================================================================
+
+/// In a project with an active team configured, `cas remember` with no
+/// explicit `team_id` must auto-fill `team_id` from `CloudConfig.active_team_id()`.
+#[tokio::test]
+async fn test_remember_team_linked_project_auto_promotes_to_team() {
+    use cas::cloud::CloudConfig;
+    use cas::store::open_store;
+
+    let (temp, service) = setup_cas();
+    let cas_dir = service.project_path().to_path_buf();
+
+    const TEAM_ID: &str = "auto-promote-team-0000-000000000001";
+
+    // Write a CloudConfig with a team_id into .cas/cloud.json
+    let mut cloud_cfg = CloudConfig::default();
+    cloud_cfg.set_team(TEAM_ID, "auto-promote-squad");
+    cloud_cfg.save_to_cas_dir(&cas_dir).expect("save cloud config");
+
+    // Remember without explicit team_id — should auto-promote.
+    let req = RememberRequest {
+        scope: "project".to_string(),
+        content: "team auto-promote regression test".to_string(),
+        entry_type: "learning".to_string(),
+        tags: None,
+        title: Some("team-auto-promote".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: None,
+        mode: None,
+        personal: None,
+    };
+
+    let result = service
+        .cas_remember(Parameters(req))
+        .await
+        .expect("remember should succeed");
+
+    let text = extract_text(result);
+    assert!(text.contains("Created entry"), "expected success: {text}");
+
+    // Extract the slug and read back the entry to check team_id.
+    let slug = extract_entry_id(&text).expect("slug in output");
+    let store = open_store(&cas_dir).expect("open store");
+    let entry = store.get(slug).expect("entry must exist");
+
+    assert_eq!(
+        entry.team_id.as_deref(),
+        Some(TEAM_ID),
+        "team_id must be auto-promoted to {TEAM_ID}, got {:?}",
+        entry.team_id
+    );
+
+    // Keep temp alive until end of test.
+    drop(temp);
+}
+
+/// `personal=true` opts out of team auto-promote even in a team-linked project.
+#[tokio::test]
+async fn test_remember_personal_flag_opts_out_of_team_auto_promote() {
+    use cas::cloud::CloudConfig;
+    use cas::store::open_store;
+
+    let (temp, service) = setup_cas();
+    let cas_dir = service.project_path().to_path_buf();
+
+    const TEAM_ID: &str = "personal-opt-out-team-0000-000000000002";
+
+    let mut cloud_cfg = CloudConfig::default();
+    cloud_cfg.set_team(TEAM_ID, "opt-out-squad");
+    cloud_cfg.save_to_cas_dir(&cas_dir).expect("save cloud config");
+
+    // Remember with personal=true — must NOT auto-promote.
+    let req = RememberRequest {
+        scope: "project".to_string(),
+        content: "personal opt-out regression test".to_string(),
+        entry_type: "learning".to_string(),
+        tags: None,
+        title: Some("personal-opt-out".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: None,
+        bypass_overlap: None,
+        mode: None,
+        personal: Some(true),
+    };
+
+    let result = service
+        .cas_remember(Parameters(req))
+        .await
+        .expect("remember should succeed");
+
+    let text = extract_text(result);
+    assert!(text.contains("Created entry"), "expected success: {text}");
+
+    let slug = extract_entry_id(&text).expect("slug in output");
+    let store = open_store(&cas_dir).expect("open store");
+    let entry = store.get(slug).expect("entry must exist");
+
+    assert_eq!(
+        entry.team_id,
+        None,
+        "personal=true must keep team_id=None even in a team-linked project"
+    );
+
+    drop(temp);
+}
+
+/// Explicit `team_id` in the request wins over auto-promote.
+#[tokio::test]
+async fn test_remember_explicit_team_id_wins_over_auto_promote() {
+    use cas::cloud::CloudConfig;
+    use cas::store::open_store;
+
+    let (temp, service) = setup_cas();
+    let cas_dir = service.project_path().to_path_buf();
+
+    const AUTO_TEAM: &str = "auto-team-0000-000000000003";
+    const EXPLICIT_TEAM: &str = "explicit-team-0000-000000000003";
+
+    let mut cloud_cfg = CloudConfig::default();
+    cloud_cfg.set_team(AUTO_TEAM, "auto-squad");
+    cloud_cfg.save_to_cas_dir(&cas_dir).expect("save cloud config");
+
+    let req = RememberRequest {
+        scope: "project".to_string(),
+        content: "explicit team_id wins test".to_string(),
+        entry_type: "learning".to_string(),
+        tags: None,
+        title: Some("explicit-team-id".to_string()),
+        importance: 0.5,
+        valid_from: None,
+        valid_until: None,
+        team_id: Some(EXPLICIT_TEAM.to_string()),
+        bypass_overlap: None,
+        mode: None,
+        personal: None,
+    };
+
+    let result = service
+        .cas_remember(Parameters(req))
+        .await
+        .expect("remember should succeed");
+
+    let text = extract_text(result);
+    assert!(text.contains("Created entry"), "expected success: {text}");
+
+    let slug = extract_entry_id(&text).expect("slug in output");
+    let store = open_store(&cas_dir).expect("open store");
+    let entry = store.get(slug).expect("entry must exist");
+
+    assert_eq!(
+        entry.team_id.as_deref(),
+        Some(EXPLICIT_TEAM),
+        "explicit team_id must win over auto-promote; got {:?}",
+        entry.team_id
+    );
+
+    drop(temp);
 }

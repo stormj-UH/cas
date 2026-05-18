@@ -79,6 +79,7 @@ async fn test_store_operations_work() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
     let result = service
@@ -107,6 +108,7 @@ async fn test_all_store_types_accessible() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
     service

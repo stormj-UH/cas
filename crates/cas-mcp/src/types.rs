@@ -111,6 +111,19 @@ pub struct MemoryRequest {
     )]
     #[serde(default)]
     pub valid_until: Option<String>,
+
+    /// Force a personal (non-team) note even in a team-linked project.
+    ///
+    /// By default, `remember` in a project with an active team auto-scopes
+    /// the entry to that team (team_auto_promote). Set `personal=true` to
+    /// opt out for a one-off private note.
+    ///
+    /// Ignored when `team_id` is set explicitly.
+    #[schemars(
+        description = "Set true to keep the note personal (skip team auto-promote) even in a team-linked project"
+    )]
+    #[serde(default)]
+    pub personal: Option<bool>,
 }
 
 /// Unified task operations request

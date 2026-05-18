@@ -19,6 +19,7 @@ async fn test_context() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
     service

@@ -41,6 +41,7 @@ async fn test_search_with_content() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
     service
@@ -84,6 +85,7 @@ async fn test_search_filter_by_type() {
         team_id: None,
         bypass_overlap: None,
         mode: None,
+        personal: None,
     };
 
     service

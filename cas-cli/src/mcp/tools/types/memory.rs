@@ -76,6 +76,21 @@ pub struct RememberRequest {
     #[schemars(description = "Overlap handling mode: 'interactive' (default) | 'autofix' (reserved, Phase 2)")]
     #[serde(default)]
     pub mode: Option<String>,
+
+    /// Force a personal (non-team) note even in a team-linked project.
+    ///
+    /// By default, `cas remember` in a project that has an active team will
+    /// automatically scope the entry to that team so other members receive it
+    /// on their next pull (`team_auto_promote`). Set `personal=true` to opt
+    /// out for a one-off private note that stays in your personal sync queue.
+    ///
+    /// Ignored when `team_id` is set explicitly — an explicit `team_id` always
+    /// wins regardless of this flag.
+    #[schemars(
+        description = "Set true to keep the note personal (skip team auto-promote) even in a team-linked project"
+    )]
+    #[serde(default)]
+    pub personal: Option<bool>,
 }
 
 // ============================================================================

@@ -1,3 +1,4 @@
+use crate::cloud::CloudConfig;
 use crate::mcp::tools::core::imports::*;
 use crate::mcp::tools::types::{
     BlockReason, DimensionBreakdown, MemoryRememberResponse, RecommendedAction,
@@ -480,6 +481,27 @@ impl CasCore {
             }
         }
 
+        // ====================================================================
+        // Team auto-promote (cas-6d96)
+        //
+        // Resolution order:
+        //   1. Explicit `team_id` in request → use as-is (caller wins).
+        //   2. `personal=true` → stay personal (None), skip auto-promote.
+        //   3. Neither set → consult project CloudConfig.active_team_id().
+        //
+        // Failure to load CloudConfig is non-fatal — behaves like "no team".
+        // This keeps `cas remember` working offline / in unconfigured projects.
+        // ====================================================================
+        let effective_team_id: Option<String> = if req.team_id.is_some() {
+            req.team_id.clone()
+        } else if req.personal == Some(true) {
+            None
+        } else {
+            CloudConfig::load_from_cas_dir(&self.cas_root)
+                .ok()
+                .and_then(|cfg| cfg.active_team_id())
+        };
+
         let entry = Entry {
             id: id.clone(),
             scope: Scope::default(),
@@ -511,7 +533,7 @@ impl CasCore {
             belief_type: Default::default(),
             confidence: 1.0,
             branch,
-            team_id: req.team_id.clone(),
+            team_id: effective_team_id,
             share: None,
         };
 

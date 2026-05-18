@@ -21,6 +21,7 @@ impl CasService {
             team_id: req.team_id,
             bypass_overlap: req.bypass_overlap,
             mode: req.mode.clone(),
+            personal: req.personal,
         };
         self.inner.cas_remember(Parameters(inner_req)).await
     }
