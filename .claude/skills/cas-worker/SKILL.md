@@ -71,6 +71,10 @@ mcp__cas__task action=update id=<task-id> status=blocked
 
 Before setting `status=blocked`, re-read with `action=show`. If the task already shows `Status: Closed`, do not update — the supervisor closed it concurrently. A stale `status=blocked` update can overwrite a completed close.
 
+## Running Scripts Against Prod
+
+For Vercel-deployed projects, `vercel env pull .env.<env> --environment=<env>` (run from the linked project dir) pulls real credentials for prod services (Neon, QStash, etc.) into a local file. Add that file to `.gitignore` — never commit credentials.
+
 ## References
 
 Open these on demand — they are not pre-loaded.
