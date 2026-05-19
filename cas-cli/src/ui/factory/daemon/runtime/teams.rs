@@ -340,8 +340,10 @@ impl TeamsManager {
     /// what actually short-circuits the team-mode leader-escalation deadlock
     /// on Claude Code 2.1.x — the `permissions.allow` list alone does not.
     ///
-    /// Emits exec-form `"args"` (cas-9a60).  CC ≥ 2.1.142 required
-    /// (anthropics/claude-code#58441 fixed in 2.1.142, verified on 2.1.143).
+    /// Emits shell-form `"command"` to match `cli/hook/config_gen.rs`
+    /// (cas-c17b). The earlier exec-form emit (cas-9a60) was malformed
+    /// (`"args": ["cas", ...]` with no `command` field) and tripped
+    /// /doctor on every CC version, regardless of #58441 state.
     ///
     /// Defaults mirror `cli/hook/config_gen.rs`: 2000ms timeout for both.
     /// `PreToolUse` matcher is the filesystem tool list so we don't fire
@@ -356,7 +358,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "args": ["cas", "hook", "PreToolUse"],
+                            "command": "cas hook PreToolUse",
                             "timeout": 2000
                         }
                     ]
@@ -367,7 +369,7 @@ impl TeamsManager {
                     "hooks": [
                         {
                             "type": "command",
-                            "args": ["cas", "hook", "PermissionRequest"],
+                            "command": "cas hook PermissionRequest",
                             "timeout": 2000
                         }
                     ]
@@ -869,8 +871,10 @@ mod tests {
     /// to live in per-member settings, but the per-member settings writer
     /// never had them).
     ///
-    /// cas-9a60: emitters use exec-form `"args"` now that
-    /// anthropics/claude-code#58441 is fixed in CC ≥ 2.1.142.
+    /// Emitter must produce shell-form `"command": "cas hook <event>"` so
+    /// /doctor accepts the entry on every CC version. The earlier exec-form
+    /// shape (cas-9a60) put `"cas"` inside `args` with no `command` field,
+    /// which is malformed regardless of #58441 state.
     #[test]
     fn settings_contents_wire_factory_auto_approve_hooks() {
         for (role, body) in [
@@ -886,18 +890,16 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PreToolUse entry: {hooks}"));
-            let pre_args: Vec<&str> = pre
+            let pre_command = pre
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("args"))
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_else(|| panic!("{role} PreToolUse missing exec-form args: {pre}"));
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| panic!("{role} PreToolUse missing shell-form command: {pre}"));
             assert_eq!(
-                pre_args,
-                vec!["cas", "hook", "PreToolUse"],
-                "{role} PreToolUse must invoke `cas hook PreToolUse` via exec-form args (cas-9a60)"
+                pre_command, "cas hook PreToolUse",
+                "{role} PreToolUse must invoke `cas hook PreToolUse` via shell-form command"
             );
             let matcher = pre
                 .get("matcher")
@@ -915,18 +917,18 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .unwrap_or_else(|| panic!("{role} hooks missing PermissionRequest entry: {hooks}"));
-            let perm_args: Vec<&str> = perm
+            let perm_command = perm
                 .get("hooks")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
-                .and_then(|h| h.get("args"))
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_else(|| panic!("{role} PermissionRequest missing exec-form args: {perm}"));
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or_else(|| {
+                    panic!("{role} PermissionRequest missing shell-form command: {perm}")
+                });
             assert_eq!(
-                perm_args,
-                vec!["cas", "hook", "PermissionRequest"],
-                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via exec-form args (cas-9a60)"
+                perm_command, "cas hook PermissionRequest",
+                "{role} PermissionRequest must invoke `cas hook PermissionRequest` via shell-form command"
             );
         }
     }
