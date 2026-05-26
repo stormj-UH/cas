@@ -1,10 +1,12 @@
 ---
 name: cas-code-review
-description: Multi-persona code review orchestrator, invoked by the supervisor at cherry-pick into the EPIC branch (per-task) and at EPIC→base merge (integration sweep) under the default `[code_review] owner = "supervisor"` (v2.13.0+). Factory workers MUST NOT invoke this skill pre-close under the default ownership model — the supervisor owns review timing. Dispatches 4 always-on reviewer personas (correctness, testing, maintainability, project-standards) plus fallow (dispatched only on JS/TS diffs) and any activated conditional personas (security, performance, adversarial) in parallel against the current diff, merges their structured findings through a deterministic pipeline, and routes results according to the invocation mode. Use `mode=interactive` for the standard supervisor-driven path, `mode=report-only` for read-only scans, `mode=headless` for skill-to-skill calls. The legacy `mode=autofix` path that fires inline at `task.close` is opt-in only and applies when a project sets `[code_review] owner = "worker"` in `.cas/config.toml`.
+description: "**CAS multi-persona factory review pipeline** — NOT the built-in `/code-review` slash command (which is a single-pass correctness scanner with effort levels). This skill dispatches 4–8 reviewer personas in parallel (correctness, testing, maintainability, project-standards, plus conditional security/performance/adversarial), merges structured findings through a deterministic pipeline, and routes them under the supervisor-owned timing model. Invoked by the supervisor at cherry-pick into the EPIC branch (per-task) and at EPIC→base merge (integration sweep) — default since v2.13.0+. Factory workers MUST NOT invoke this pre-close. Use `mode=interactive` for the standard supervisor-driven path, `mode=report-only` for read-only scans, `mode=headless` for skill-to-skill calls. The legacy `mode=autofix` path that fires inline at `task.close` is opt-in only and applies when a project sets `[code_review] owner = \"worker\"` in `.cas/config.toml`."
 managed_by: cas
 ---
 
 # cas-code-review — Multi-persona code review orchestrator
+
+> **Not to be confused with the built-in `/code-review`**, which is a single-pass correctness scanner with `--effort` levels and `--comment` for inline PR annotations. This skill is the CAS factory pipeline: 4–8 Sonnet reviewer sub-agents dispatched in parallel, supervisor-owned timing, and a structured findings schema.
 
 This skill is the orchestrator for CAS's Phase 1 multi-persona code review pipeline. It does **not** perform the review itself — each reviewer persona is a separate Sonnet sub-agent with its own prompt under `references/personas/`. Your job in this skill is to:
 
