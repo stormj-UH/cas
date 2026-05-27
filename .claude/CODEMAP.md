@@ -99,7 +99,7 @@ Binary entrypoint and the only crate users interact with directly. Contains ever
   - `components/`, `widgets/`, `markdown/`, `theme/`
 - `bridge/` — HTTP bridge server (web UI backend); `bridge/server/factory.rs` is the factory-start endpoint
 - `builtins.rs` + `builtins/` — embedded skills, agents, content
-  - `builtins/skills/` — Claude-variant SKILL.md files: cas-supervisor, cas-worker, cas-search, cas-brainstorm, cas-memory-management, cas-task-tracking, cas-code-review (5 always-on personas including `fallow.md`), cas-supervisor-checklist, cas-ideate, codemap, project-overview, fallow, session-learn, verify-before-claim, cas-playwright-debug, cas-seo-expert, cas-servers
+  - `builtins/skills/` — Claude-variant SKILL.md files: cas-supervisor, cas-worker, cas-search, cas-brainstorm, cas-memory-management, cas-task-tracking, cas-code-review (5 always-on personas including `fallow.md`), cas-supervisor-checklist, cas-ideate, codemap, project-overview, fallow, session-learn, verify-before-claim, cas-nuxt-playwright (Nuxt 3/4 + Playwright E2E; replaces cas-playwright-debug)
   - `builtins/codex/skills/` — Codex-variant mirror (full parity)
   - `builtins/agents/` — task-verifier, learning-reviewer, rule-reviewer, duplicate-detector, factory-supervisor, etc.
   - `builtins/codex/agents/` — Codex-variant mirror of agents
@@ -147,7 +147,7 @@ Planning artifacts only — product/domain content lives in `docs/PRODUCT_OVERVI
 
 - `brainstorms/` — `YYYY-MM-DD-<topic>-requirements.md` from the `cas-brainstorm` skill
 - `ideation/` — survivor lists from the `cas-ideate` skill
-- `requests/` — cross-team BUG/FEATURE inboxes; active: `BUG-worker-pane-mouse-wheel-alt-screen.md`, `team-memories-filter-policy.md`, `RESOLVED-api-me-deploy-failed-type-check.md`, `SHIPPED-user-team-membership-endpoint.md`, `RESPONSE-user-team-membership-endpoint.md`
+- `requests/` — cross-team BUG/FEATURE inboxes; active: `BUG-worker-pane-mouse-wheel-alt-screen.md`, `FEATURE-nuxt-playwright-skill.md`, `team-memories-filter-policy.md`, `RESOLVED-api-me-deploy-failed-type-check.md`, `SHIPPED-user-team-membership-endpoint.md`, `RESPONSE-user-team-membership-endpoint.md`
 - `requests/completed/` — archived closed work (bulk move 2026-05-18): cloud-client-404, cloud-push-skipped, factory-session-observations, factory-write-permission-deadlock, remember-defaults-to-personal, EPIC-mcp-server-robustness, FEATURE-global-team-config, FEATURE-cloud-sync-pull-team-memories, FEATURE-cloud-sync-pull-return-specs, BUG-session-observations-2026-05-18
 - `spikes/` — investigation outputs (e.g., `2026-05-01-factory-agent-teams-enrollment-spike.md`)
 - `onboarding/` — onboarding notes (`macbook-from-zero.md`, etc.)
