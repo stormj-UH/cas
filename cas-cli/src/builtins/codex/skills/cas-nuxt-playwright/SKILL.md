@@ -1,13 +1,13 @@
 ---
 name: cas-nuxt-playwright
-description: "Nuxt 3 + Playwright E2E Testing. Use when writing, debugging, or planning Playwright E2E tests in a Nuxt 3 project. Covers SSR/SPA detection, Firebase auth patterns (IndexedDB vs localStorage), Quasar selectors, hydration timing, route mock rules, and a diagnostic table for common failures. Trigger when editing files under tests/ in a project with nuxt.config.ts, when investigating Playwright test failures in a Nuxt 3 app, or when the cas-playwright-debug skill detects nuxt.config.ts."
+description: "Nuxt + Playwright E2E Testing. Use when writing, debugging, or planning Playwright E2E tests in a Nuxt 3 or 4 project. Covers SSR/SPA detection, Firebase auth patterns (IndexedDB vs localStorage), Quasar selectors, hydration timing, route mock rules, and a diagnostic table for common failures. Trigger when editing files under tests/ in a project with nuxt.config.ts, when investigating Playwright test failures in a Nuxt app, or when the cas-playwright-debug skill detects nuxt.config.ts."
 managed_by: cas
 user-invocable: true
 ---
 
-# Nuxt 3 + Playwright E2E Testing
+# Nuxt + Playwright E2E Testing
 
-Unified guide for writing and debugging Playwright E2E tests against Nuxt 3 apps with Firebase auth and Quasar UI. Grounded in real failures across production projects.
+Unified guide for writing and debugging Playwright E2E tests against Nuxt (3 & 4) apps with Firebase auth and Quasar UI. Grounded in real failures across production projects.
 
 ## Step 1: Detect the SSR mode
 
@@ -135,12 +135,12 @@ async function navigateTo(page: Page, path: string) {
 
 **When you DON'T need it:** `ssr: false` globally → `page.goto()` works everywhere.
 
-**Correct Nuxt 3 router access:**
+**Correct Nuxt 3+ router access:**
 - `window.__nuxt.$router` — correct
 - `document.querySelector('#__nuxt').__vue_app__.config.globalProperties.$router` — also correct
 
 **DO NOT use:**
-- `window.$nuxt` — **Nuxt 2 only.** Does not exist in Nuxt 3.
+- `window.$nuxt` — **Nuxt 2 only.** Does not exist in Nuxt 3+.
 - `window.__nuxt_app__` — not a real global.
 
 ## Route mock rules
@@ -204,14 +204,14 @@ await page.locator('.your-element').waitFor({ state: 'visible' });
 | Page stuck / never loads | Missing Firebase API mocks (addInitScript pattern) | Mock `securetoken.googleapis.com` and `identitytoolkit.googleapis.com` |
 | Tests pass serial, fail parallel | Shared mutable state between workers | `fullyParallel: false` or `test.describe.serial` |
 | Route mocks not intercepting | Origin mismatch (mocks `localhost:3001`, app hits Vercel URL) | Use origin-agnostic patterns (`**/api/...`) |
-| `window.$nuxt` is undefined | Nuxt 2 API in Nuxt 3 app | `window.__nuxt.$router` |
+| `window.$nuxt` is undefined | Nuxt 2 API in Nuxt 3+ app | `window.__nuxt.$router` |
 | storageState missing tokens | Saved before Firebase/Pinia persistence completed | `waitForFunction(() => !!localStorage.getItem('key'))` before saving |
 | `getByText('Foo')` strict mode error | Multiple elements match | Add `{ exact: true }` or use `.first()` |
 
 ## Anti-patterns
 
 - **Never `page.goto()` to a protected route on an SSR app** without the `navigateTo()` helper
-- **Never use `window.$nuxt`** — Nuxt 2 only, does not exist in Nuxt 3
+- **Never use `window.$nuxt`** — Nuxt 2 only, does not exist in Nuxt 3+
 - **Never hardcode backend URLs in route mocks** — origin-agnostic patterns always
 - **Never skip the Firebase/Pinia persistence wait** when building storageState
 - **Never leave Firebase keys in localStorage** when using addInitScript — SDK will hang
